@@ -82,26 +82,25 @@
             <h2 class="mb-4 text-lg font-black text-[#023b55]">السلع والمنتجات المطابقة لبحثك ('{{ $searchQuery }}')</h2>
             <div class="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
                 @foreach ($matchingItems as $item)
-                    <a href="{{ route('flyers.show', $item->flyer->slug) }}#item-{{ $item->id }}" class="group flex flex-col rounded-xl border border-slate-200 bg-white p-3 shadow-sm transition hover:border-[#039652] hover:shadow-md active:border-[#039652] active:shadow-md" aria-label="{{ $item->product_name }} - {{ $item->flyer->retailer->name }}">
-                        <span class="flex items-center justify-between gap-1.5">
-                            <a href="{{ route('retailers.show', $item->flyer->retailer->slug) }}" onclick="event.stopPropagation()" class="inline-flex items-center gap-1 rounded-full bg-[#023b55]/10 px-2 py-0.5 text-[10px] font-bold text-[#023b55] hover:bg-[#023b55] hover:text-white transition">
+                    <div class="group flex flex-col rounded-xl border border-slate-200 bg-white p-3 shadow-sm transition hover:border-[#039652] hover:shadow-md">
+                        <div class="flex items-center justify-between gap-1.5">
+                            <a href="{{ route('retailers.show', $item->flyer->retailer->slug) }}" class="inline-flex items-center gap-1 rounded-full bg-[#023b55]/10 px-2 py-0.5 text-[10px] font-bold text-[#023b55] hover:bg-[#023b55] hover:text-white transition">
                                 {{ $item->flyer->retailer->name }}
                             </a>
                             @if ($item->discount_percent)
                                 <span class="rounded-full bg-[#039652]/10 px-1.5 py-0.5 text-[10px] font-black text-[#039652]">-{{ round((float) $item->discount_percent) }}%</span>
                             @endif
-                        </span>
-                        <div class="mt-2 line-clamp-2 text-xs font-bold text-[#023b55] group-hover:text-[#039652] transition-colors">{{ $item->product_name }}</div>
-                        @if ($item->unit)
-                            <span class="mt-1 text-[10px] text-slate-500">{{ $item->unit }}</span>
-                        @endif
-                        <div class="mt-auto pt-2">
-                            @if ($item->old_price)
-                                <span class="text-[11px] text-slate-400 line-through">{{ number_format((float) $item->old_price, 2) }} ج.م</span>
-                            @endif
-                            <div class="text-sm font-black text-[#039652]">{{ number_format((float) $item->sale_price, 2) }} ج.م</div>
                         </div>
-                    </a>
+                        <a href="{{ route('flyers.show', $item->flyer->slug) }}#item-{{ $item->id }}" class="mt-2 flex flex-1 flex-col hover:text-[#039652]" aria-label="{{ $item->product_name }} - {{ $item->flyer->retailer->name }}">
+                            <div class="line-clamp-2 text-xs font-bold text-[#023b55] group-hover:text-[#039652] transition-colors">{{ $item->product_name }}</div>
+                            <div class="mt-auto pt-2">
+                                @if ($item->old_price)
+                                    <div class="text-[11px] text-slate-400 line-through">{{ number_format((float) $item->old_price, 2) }} ج.م</div>
+                                @endif
+                                <div class="text-sm font-black text-[#039652]">{{ number_format((float) $item->sale_price, 2) }} ج.م</div>
+                            </div>
+                        </a>
+                    </div>
                 @endforeach
             </div>
             <div class="mt-6">
@@ -197,7 +196,7 @@
         </div>
     </section>
 
-    <!-- جدول / بطاقات أقوى السلع المخفضة (Hot Items Spotlight) - Deep-linked clickable cards -->
+    <!-- جدول / بطاقات أقوى السلع المخفضة (Hot Items Spotlight) - Deep-linked -->
     @if ($hotItems->isNotEmpty())
         <section id="hot-deals" class="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm scroll-mt-20">
             <div class="mb-4 flex items-center justify-between">
@@ -206,26 +205,25 @@
             </div>
             <div class="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
                 @foreach ($hotItems as $item)
-                    <a href="{{ route('flyers.show', $item->flyer->slug) }}#item-{{ $item->id }}" class="group flex flex-col rounded-xl border border-slate-200 bg-white p-3 shadow-sm transition hover:border-[#039652] hover:shadow-md active:border-[#039652] active:shadow-md" aria-label="{{ $item->product_name }} - {{ $item->flyer->retailer->name }} بـ {{ number_format((float) $item->sale_price, 2) }} ج.م">
-                        <span class="flex items-center justify-between gap-1.5">
-                            <a href="{{ route('retailers.show', $item->flyer->retailer->slug) }}" onclick="event.stopPropagation()" class="inline-flex items-center gap-1 rounded-full bg-[#023b55]/10 px-2 py-0.5 text-[10px] font-bold text-[#023b55] hover:bg-[#023b55] hover:text-white transition">
+                    <div class="group flex flex-col rounded-xl border border-slate-200 bg-white p-3 shadow-sm transition hover:border-[#039652] hover:shadow-md">
+                        <div class="flex items-center justify-between gap-1.5">
+                            <a href="{{ route('retailers.show', $item->flyer->retailer->slug) }}" class="inline-flex items-center gap-1 rounded-full bg-[#023b55]/10 px-2 py-0.5 text-[10px] font-bold text-[#023b55] hover:bg-[#023b55] hover:text-white transition">
                                 {{ $item->flyer->retailer->name }}
                             </a>
                             @if ($item->discount_percent)
                                 <span class="rounded-full bg-[#039652]/10 px-1.5 py-0.5 text-[10px] font-black text-[#039652]">-{{ round((float) $item->discount_percent) }}%</span>
                             @endif
-                        </span>
-                        <div class="mt-2 font-bold text-[#023b55] text-xs line-clamp-2 group-hover:text-[#039652] transition-colors">{{ $item->product_name }}</div>
-                        <div class="mt-auto pt-2">
-                            @if ($item->old_price)
-                                <span class="text-[11px] text-slate-400 line-through">{{ number_format((float) $item->old_price, 2) }} ج.م</span>
-                            @endif
-                            <div class="text-sm font-black text-[#039652]">{{ number_format((float) $item->sale_price, 2) }} ج.م</div>
-                            @if ($item->unit)
-                                <span class="text-[10px] text-slate-500">{{ $item->unit }}</span>
-                            @endif
                         </div>
-                    </a>
+                        <a href="{{ route('flyers.show', $item->flyer->slug) }}#item-{{ $item->id }}" class="mt-2 flex flex-1 flex-col" aria-label="{{ $item->product_name }} - {{ $item->flyer->retailer->name }}">
+                            <div class="line-clamp-2 text-xs font-bold text-[#023b55] group-hover:text-[#039652] transition-colors">{{ $item->product_name }}</div>
+                            <div class="mt-auto pt-2">
+                                @if ($item->old_price)
+                                    <div class="text-[11px] text-slate-400 line-through">{{ number_format((float) $item->old_price, 2) }} ج.م</div>
+                                @endif
+                                <div class="text-sm font-black text-[#039652]">{{ number_format((float) $item->sale_price, 2) }} ج.م</div>
+                            </div>
+                        </a>
+                    </div>
                 @endforeach
             </div>
         </section>
