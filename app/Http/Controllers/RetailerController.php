@@ -6,11 +6,16 @@ namespace App\Http\Controllers;
 
 use App\Models\Retailer;
 use Carbon\Carbon;
+use Illuminate\Http\Request;
+use Illuminate\Http\Response;
 use Illuminate\View\View;
 
 final class RetailerController extends Controller
 {
-    public function show(Retailer $retailer): View
+    /**
+     * @return View|Response
+     */
+    public function show(Request $request, Retailer $retailer): View|Response
     {
         abort_unless($retailer->is_active, 404);
 
@@ -56,6 +61,26 @@ final class RetailerController extends Controller
         $seoTitle = "عروض {$retailer->name} مصر اليوم {$year} | أحدث مجلات الأسعار والتخفيضات";
         $seoDescription = "تصفح أحدث عروض {$retailer->name} في مصر اليوم {$year} - مجلات أسعار محدثة، خصومات حصرية ومقارنة أسعار السلع قبل الشراء.";
         $canonical = route('retailers.show', $retailer->slug);
+
+        $wantsMarkdown = $request->header('Accept') === 'text/markdown'
+            || str_contains((string) $request->header('Accept'), 'text/markdown')
+            || $request->query('_fmt') === 'md';
+
+        if ($wantsMarkdown) {
+            return response()
+                ->view('retailers.show-markdown', [
+                    'retailer' => $retailer,
+                    'activeFlyers' => $activeFlyers,
+                    'expiredFlyers' => $expiredFlyers,
+                    'activeCount' => $activeCount,
+                    'seoTitle' => $seoTitle,
+                    'seoDescription' => $seoDescription,
+                    'canonical' => $canonical,
+                ])
+                ->header('Content-Type', 'text/markdown; charset=UTF-8')
+                ->header('Vary', 'Accept')
+                ->header('X-Content-Type-Options', 'nosniff');
+        }
 
         return view('retailers.show', [
             'retailer' => $retailer,

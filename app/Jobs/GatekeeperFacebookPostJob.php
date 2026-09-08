@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Jobs;
 
 use App\Enums\FlyerStatus;
+use App\Jobs\PingIndexNowJob;
 use App\Models\Flyer;
 use App\Models\Retailer;
 use App\Services\FlyerSlugService;
@@ -209,8 +210,9 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
                             return;
                         }
 
-                        // Transition to pending_review
-                        $flyer->status = FlyerStatus::PendingReview;
+                        // Auto-publish toggle via .env — when true, publish immediately after OCR
+                        $autoPublish = (bool) config('app.auto_publish_flyers', true);
+                        $flyer->status = $autoPublish ? FlyerStatus::Published : FlyerStatus::PendingReview;
 
                         // Generate 2-sentence bluf_summary + editorial overview for SEO/GEO
                         $flyer->bluf_summary = self::buildBlufSummary($flyer);
@@ -218,13 +220,26 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
 
                         $flyer->save();
 
-                        Log::info('Flyer transitioned to pending_review with BLUF.', [
+                        Log::info($autoPublish ? 'Flyer auto-published with BLUF.' : 'Flyer transitioned to pending_review with BLUF.', [
                             'flyer_id' => $flyer->id,
                             'batch_id' => $batch->id,
+                            'status' => $flyer->status->value,
                             'bluf_summary' => $flyer->bluf_summary,
                         ]);
+
+                        // Ping IndexNow immediately when auto-published
+                        if ($autoPublish) {
+                            try {
+                                PingIndexNowJob::dispatch(route('flyers.show', $flyer->slug));
+                            } catch (Throwable $e) {
+                                Log::warning('Failed to dispatch IndexNow after auto-publish.', [
+                                    'flyer_id' => $flyer->id,
+                                    'error' => $e->getMessage(),
+                                ]);
+                            }
+                        }
                     } catch (Throwable $e) {
-                        Log::error('Failed in batch then() for flyer pending_review.', [
+                        Log::error('Failed in batch then() for flyer publish.', [
                             'flyer_id' => $flyerId,
                             'error' => $e->getMessage(),
                             'trace' => $e->getTraceAsString(),

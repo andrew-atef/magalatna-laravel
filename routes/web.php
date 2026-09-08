@@ -8,6 +8,7 @@ use App\Http\Controllers\PageController;
 use App\Http\Controllers\RetailerController;
 use App\Models\Flyer;
 use App\Models\Retailer;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Response;
 use Illuminate\Support\Facades\Route;
 
@@ -24,18 +25,22 @@ Route::get('/offers/{slug}', [FlyerController::class, 'show'])->name('flyers.sho
 Route::get('/flyer/{slug}', fn (string $slug) => redirect()->route('flyers.show', $slug, 301));
 Route::get('/flyers/{slug}', fn (string $slug) => redirect()->route('flyers.show', $slug, 301));
 
-// خريطة الموقع لمحركات البحث
+// خريطة الموقع لمحركات البحث — cached 1h, invalidated via observers
 Route::get('/sitemap.xml', function () {
-    $retailers = Retailer::where('is_active', true)->get();
-    $flyers = Flyer::where('status', 'published')
-        ->latest('updated_at')
-        ->limit(1000)
-        ->get();
+    $xml = Cache::remember('sitemap_xml_content', 3600, function () {
+        $retailers = Retailer::where('is_active', true)->get();
+        $flyers = Flyer::where('status', 'published')
+            ->latest('updated_at')
+            ->limit(1000)
+            ->get();
 
-    return Response::view('sitemap', [
-        'retailers' => $retailers,
-        'flyers' => $flyers,
-    ])->header('Content-Type', 'text/xml; charset=utf-8');
+        return view('sitemap', [
+            'retailers' => $retailers,
+            'flyers' => $flyers,
+        ])->render();
+    });
+
+    return Response::make($xml, 200, ['Content-Type' => 'text/xml; charset=utf-8']);
 })->name('sitemap');
 
 // Retailer Hub — SEO-optimized dedicated pages /{retailer:slug}

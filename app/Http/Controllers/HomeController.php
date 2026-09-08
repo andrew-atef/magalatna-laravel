@@ -10,11 +10,15 @@ use App\Models\Retailer;
 use App\Support\ArabicNormalizer;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
+use Illuminate\Http\Response;
 use Illuminate\View\View;
 
 final class HomeController extends Controller
 {
-    public function __invoke(Request $request): View
+    /**
+     * @return View|Response
+     */
+    public function __invoke(Request $request): View|Response
     {
         $cairoToday = Carbon::today('Africa/Cairo')->toDateString();
         $selectedRetailerSlug = $request->string('retailer')->toString();
@@ -73,6 +77,18 @@ final class HomeController extends Controller
                 ->orderByDesc('discount_percent')
                 ->limit(6)
                 ->get();
+        }
+
+        $wantsMarkdown = $request->header('Accept') === 'text/markdown'
+            || str_contains((string) $request->header('Accept'), 'text/markdown')
+            || $request->query('_fmt') === 'md';
+
+        if ($wantsMarkdown) {
+            return response()
+                ->view('home-markdown', compact('retailers', 'flyers', 'hotItems', 'matchingItems', 'searchQuery'))
+                ->header('Content-Type', 'text/markdown; charset=UTF-8')
+                ->header('Vary', 'Accept')
+                ->header('X-Content-Type-Options', 'nosniff');
         }
 
         return view('home', compact('retailers', 'flyers', 'hotItems', 'matchingItems', 'searchQuery'));

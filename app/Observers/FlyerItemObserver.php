@@ -29,6 +29,53 @@ class FlyerItemObserver
         }
     }
 
+    public function saved(FlyerItem $item): void
+    {
+        $this->touchParent($item, 'saved');
+    }
+
+    public function updated(FlyerItem $item): void
+    {
+        // saved already covers updated, keep for spec compliance without double touch
+    }
+
+    public function deleted(FlyerItem $item): void
+    {
+        $this->touchParent($item, 'deleted');
+    }
+
+    private function touchParent(FlyerItem $item, string $event): void
+    {
+        try {
+            // Touch the parent flyer so updated_at changes and FlyerObserver is fired
+            $flyer = $item->flyer()->first();
+            if ($flyer !== null) {
+                $flyer->touch();
+                Log::info('FlyerItemObserver: Touched parent flyer for cache purge.', [
+                    'flyer_item_id' => $item->id,
+                    'flyer_id' => $flyer->id,
+                    'event' => $event,
+                ]);
+            } else {
+                // Fallback via flyer_id if relation not loaded
+                $flyerId = $item->flyer_id;
+                if ($flyerId !== null) {
+                    try {
+                        \App\Models\Flyer::where('id', $flyerId)->touch();
+                    } catch (Throwable $e) {
+                        Log::warning('FlyerItemObserver: touch via flyer_id failed.', ['flyer_id' => $flyerId, 'error' => $e->getMessage()]);
+                    }
+                }
+            }
+        } catch (Throwable $e) {
+            Log::error('FlyerItemObserver: touchParent failed.', [
+                'flyer_item_id' => $item->id ?? 'unknown',
+                'event' => $event,
+                'error' => $e->getMessage(),
+            ]);
+        }
+    }
+
     private function populateNormalizedName(FlyerItem $item): void
     {
         try {

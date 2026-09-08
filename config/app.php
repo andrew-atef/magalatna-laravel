@@ -86,6 +86,18 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Flyers Auto Publish
+    |--------------------------------------------------------------------------
+    |
+    | When true, AI-ingested flyers are published immediately after OCR
+    | and IndexNow is pinged. When false, they remain pending_review
+    | for manual review in Filament. Toggle via AUTO_PUBLISH_FLYERS in .env
+    |
+    */
+    'auto_publish_flyers' => (bool) env('AUTO_PUBLISH_FLYERS', true),
+
+    /*
+    |--------------------------------------------------------------------------
     | Encryption Key
     |--------------------------------------------------------------------------
     |

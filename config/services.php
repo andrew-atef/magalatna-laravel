@@ -47,10 +47,21 @@ return [
     // flat key for spec compatibility: config('services.internal_api_key')
     'internal_api_key' => env('INTERNAL_API_KEY'),
 
+    'cloudflare' => [
+        'api_token' => env('CLOUDFLARE_CACHE_API_TOKEN'),
+        'zone_id' => env('CLOUDFLARE_ZONE_ID'),
+    ],
+
     'indexnow' => [
         'key' => env('INDEXNOW_KEY'),
+        'base_uri' => env('INDEXNOW_BASE_URI', 'https://api.indexnow.org/indexnow'),
     ],
 
     'indexnow_key' => env('INDEXNOW_KEY'),
+
+    'google_indexing' => [
+        'enabled' => env('GOOGLE_INDEXING_ENABLED', false),
+        'credentials_path' => storage_path((string) env('GOOGLE_INDEXING_CREDENTIALS_FILE', 'app/google-service-account.json')),
+    ],
 
 ];

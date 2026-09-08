@@ -6,11 +6,16 @@ namespace App\Http\Controllers;
 
 use App\Models\Flyer;
 use Carbon\Carbon;
+use Illuminate\Http\Request;
+use Illuminate\Http\Response;
 use Illuminate\View\View;
 
 final class FlyerController extends Controller
 {
-    public function show(string $slug): View
+    /**
+     * @return View|Response
+     */
+    public function show(Request $request, string $slug): View|Response
     {
         $flyer = Flyer::with([
             'retailer',
@@ -45,6 +50,18 @@ final class FlyerController extends Controller
             ->latest('valid_until')
             ->limit(3)
             ->get();
+
+        $wantsMarkdown = $request->header('Accept') === 'text/markdown'
+            || str_contains((string) $request->header('Accept'), 'text/markdown')
+            || $request->query('_fmt') === 'md';
+
+        if ($wantsMarkdown) {
+            return response()
+                ->view('flyers.show-markdown', compact('flyer', 'sameRetailerFlyers', 'competitorFlyers', 'archiveFlyers'))
+                ->header('Content-Type', 'text/markdown; charset=UTF-8')
+                ->header('Vary', 'Accept')
+                ->header('X-Content-Type-Options', 'nosniff');
+        }
 
         return view('flyers.show', compact('flyer', 'sameRetailerFlyers', 'competitorFlyers', 'archiveFlyers'));
     }
