@@ -18,7 +18,6 @@ use Filament\Tables\Table;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Support\Facades\Log;
-use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
 use Livewire\Features\SupportFileUploads\TemporaryUploadedFile;
 
@@ -152,32 +151,6 @@ final class FlyerResource extends Resource
                                     ->required()
                                     ->dehydrated(true)
                                     ->helperText(fn (): string => self::isR2Configured() ? 'Stored on R2 — سيتم ضغطه تلقائياً إلى WebP 1200px جودة 80.' : 'R2 not configured — stored locally (public/flyers/pages) كـ WebP.')
-                                    ->getUploadedFileUrlUsing(function (?string $file): ?string {
-                                        if (blank($file)) {
-                                            return null;
-                                        }
-
-                                        $path = ltrim((string) $file, '/');
-
-                                        // Guard: strip duplicate directory prefix if already present
-                                        // to avoid flyers/pages/flyers/pages/... on re-hydration
-                                        // FileUpload stores full relative path (e.g. flyers/pages/ulid.webp)
-                                        // When directory is set, Filament can prepend again — normalize here.
-                                        try {
-                                            return Storage::disk('r2')->url($path);
-                                        } catch (\Throwable $e) {
-                                            Log::warning('Failed to generate R2 preview URL, falling back to public disk.', [
-                                                'path' => $path,
-                                                'error' => $e->getMessage(),
-                                            ]);
-
-                                            try {
-                                                return Storage::disk('public')->url($path);
-                                            } catch (\Throwable $e2) {
-                                                return null;
-                                            }
-                                        }
-                                    })
                                     ->saveUploadedFileUsing(function (TemporaryUploadedFile $file): string {
                                         $disk = 'r2';
                                         /** @var ImageOptimizerService $optimizer */
