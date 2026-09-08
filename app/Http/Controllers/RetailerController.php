@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace App\Http\Controllers;
 
+use App\Enums\FlyerStatus;
+use App\Models\Flyer;
 use App\Models\Retailer;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
@@ -56,11 +58,19 @@ final class RetailerController extends Controller
             ->where('valid_until', '>=', $cairoToday)
             ->count();
 
-        // SEO metadata: canonical = /{retailer:slug}, targeted Arabic Title
+        // SEO metadata: canonical = /{retailer:slug}, targeted Arabic Title (smart clean_name to avoid مصر مصر stuttering)
         $year = Carbon::now('Africa/Cairo')->year;
-        $seoTitle = "عروض {$retailer->name} مصر اليوم {$year} | أحدث مجلات الأسعار والتخفيضات";
-        $seoDescription = "تصفح أحدث عروض {$retailer->name} في مصر اليوم {$year} - مجلات أسعار محدثة، خصومات حصرية ومقارنة أسعار السلع قبل الشراء.";
+        $seoTitle = "عروض {$retailer->clean_name} في مصر اليوم {$year} | أحدث المجلات والتخفيضات";
+        $seoDescription = "تصفح أحدث عروض {$retailer->clean_name} في مصر اليوم {$year} - مجلات أسعار محدثة، خصومات حصرية ومقارنة أسعار السلع قبل الشراء.";
         $canonical = route('retailers.show', $retailer->slug);
+
+        $otherActiveFlyers = Flyer::where('status', FlyerStatus::Published)
+            ->where('retailer_id', '!=', $retailer->id)
+            ->whereDate('valid_until', '>=', now('Africa/Cairo')->toDateString())
+            ->with('retailer')
+            ->latest('valid_from')
+            ->take(4)
+            ->get();
 
         $wantsMarkdown = $request->header('Accept') === 'text/markdown'
             || str_contains((string) $request->header('Accept'), 'text/markdown')
@@ -72,6 +82,7 @@ final class RetailerController extends Controller
                     'retailer' => $retailer,
                     'activeFlyers' => $activeFlyers,
                     'expiredFlyers' => $expiredFlyers,
+                    'otherActiveFlyers' => $otherActiveFlyers,
                     'activeCount' => $activeCount,
                     'seoTitle' => $seoTitle,
                     'seoDescription' => $seoDescription,
@@ -86,6 +97,7 @@ final class RetailerController extends Controller
             'retailer' => $retailer,
             'activeFlyers' => $activeFlyers,
             'expiredFlyers' => $expiredFlyers,
+            'otherActiveFlyers' => $otherActiveFlyers,
             'activeCount' => $activeCount,
             'seoTitle' => $seoTitle,
             'seoDescription' => $seoDescription,

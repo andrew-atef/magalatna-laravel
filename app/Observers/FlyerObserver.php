@@ -28,6 +28,7 @@ final class FlyerObserver
     {
         try {
             Cache::forget('sitemap_xml_content');
+            Cache::forget('llms_txt_content');
 
             // Delete all associated flyer_pages images from R2
             try {
@@ -73,6 +74,7 @@ final class FlyerObserver
     {
         try {
             Cache::forget('sitemap_xml_content');
+            Cache::forget('llms_txt_content');
 
             $urls = $this->collectUrls($flyer);
 
@@ -161,6 +163,15 @@ final class FlyerObserver
             $urls[] = $appSitemap;
         } catch (Throwable $e) {
             Log::warning('FlyerObserver: sitemap URL collection failed.', ['error' => $e->getMessage()]);
+        }
+
+        try {
+            // e. LLMs.txt
+            $urls[] = url('/llms.txt');
+            $appLlms = rtrim((string) config('app.url'), '/') . '/llms.txt';
+            $urls[] = $appLlms;
+        } catch (Throwable $e) {
+            Log::warning('FlyerObserver: llms URL collection failed.', ['error' => $e->getMessage()]);
         }
 
         // Deduplicate and normalize

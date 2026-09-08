@@ -163,6 +163,20 @@ final class CloudflareCacheService
             $normalized[] = $u;
         }
 
+        // Ensure llms.txt is purged alongside homepage/sitemap (spec: siteUrls)
+        $hasSiteUrl = false;
+        foreach ($normalized as $u) {
+            $trim = rtrim($u, '/');
+            if ($trim === rtrim((string) url('/'), '/') || $trim === rtrim((string) config('app.url'), '/') || str_ends_with($trim, '/sitemap.xml')) {
+                $hasSiteUrl = true;
+                break;
+            }
+        }
+        if ($hasSiteUrl) {
+            $normalized[] = url('/llms.txt');
+            $normalized[] = rtrim((string) config('app.url'), '/') . '/llms.txt';
+        }
+
         // Deduplicate
         $unique = array_values(array_unique($normalized));
 

@@ -74,4 +74,9 @@ class Retailer extends Model
             ->latest('valid_from')
             ->first();
     }
+
+    public function getCleanNameAttribute(): string
+    {
+        return trim((string) preg_replace('/\s+مصر$/u', '', (string) $this->name));
+    }
 }

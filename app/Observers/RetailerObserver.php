@@ -22,10 +22,32 @@ final class RetailerObserver
         // saved covers updated, keep for spec compliance without double dispatch
     }
 
+    public function deleted(Retailer $retailer): void
+    {
+        try {
+            Cache::forget('sitemap_xml_content');
+            Cache::forget('llms_txt_content');
+            $urls = $this->collectUrls($retailer);
+            if ($urls !== []) {
+                \App\Jobs\PurgeCloudflareCacheJob::dispatch($urls);
+                Log::info('RetailerObserver: Dispatched purge on deleted.', [
+                    'retailer_id' => $retailer->id,
+                    'urls_count' => count($urls),
+                ]);
+            }
+        } catch (Throwable $e) {
+            Log::error('RetailerObserver: deleted failed.', [
+                'retailer_id' => $retailer->id ?? 'unknown',
+                'error' => $e->getMessage(),
+            ]);
+        }
+    }
+
     private function handlePurge(Retailer $retailer, string $event): void
     {
         try {
             Cache::forget('sitemap_xml_content');
+            Cache::forget('llms_txt_content');
 
             $urls = $this->collectUrls($retailer);
 
@@ -79,8 +101,10 @@ final class RetailerObserver
             }
             $urls[] = url('/sitemap.xml');
             $urls[] = rtrim((string) config('app.url'), '/') . '/sitemap.xml';
+            $urls[] = url('/llms.txt');
+            $urls[] = rtrim((string) config('app.url'), '/') . '/llms.txt';
         } catch (Throwable $e) {
-            Log::warning('RetailerObserver: homepage/sitemap collection failed.', ['error' => $e->getMessage()]);
+            Log::warning('RetailerObserver: homepage/sitemap/llms collection failed.', ['error' => $e->getMessage()]);
         }
 
         $urls = array_values(array_unique(array_filter(array_map(static fn (string $u): string => trim($u), $urls), static fn (string $u): bool => $u !== '')));

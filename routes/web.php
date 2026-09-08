@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 use App\Http\Controllers\FlyerController;
 use App\Http\Controllers\HomeController;
+use App\Http\Controllers\LlmsTxtController;
 use App\Http\Controllers\PageController;
 use App\Http\Controllers\RetailerController;
 use App\Models\Flyer;
@@ -28,6 +29,8 @@ Route::get('/flyers/{slug}', fn (string $slug) => redirect()->route('flyers.show
 // Legacy retailer aliases -> canonical slugs (301 to preserve link equity)
 Route::permanentRedirect('/bim', '/bimmisr');
 Route::permanentRedirect('/carrefour', '/carrefouregypt');
+
+Route::get('/llms.txt', [LlmsTxtController::class, 'index'])->name('llms.txt');
 
 // خريطة الموقع لمحركات البحث — cached 6h, invalidated via observers (FlyerObserver::saved/deleted)
 Route::get('/sitemap.xml', function () {
@@ -59,5 +62,5 @@ Route::get('/sitemap.xml', function () {
 // Retailer Hub — SEO-optimized dedicated pages /{retailer:slug}
 // MUST be last to avoid conflict with /offers/{slug}, /admin, /sitemap.xml, /about-us etc.
 Route::get('/{retailer:slug}', [RetailerController::class, 'show'])
-    ->where('retailer', '^(?!offers$|flyer$|flyers$|admin$|api$|storage$|sitemap\.xml$|about-us$|privacy-policy$|terms-of-use$|contact-us$).*')
+    ->where('retailer', '^(?!offers$|flyer$|flyers$|admin$|api$|storage$|sitemap\.xml$|llms\.txt$|about-us$|privacy-policy$|terms-of-use$|contact-us$).*')
     ->name('retailers.show');

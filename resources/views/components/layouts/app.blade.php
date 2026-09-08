@@ -27,7 +27,13 @@
 
     <title>{{ $metaTitle ? $metaTitle . ' | ' . $siteName : $siteName . ' | مجلات وعروض السوبرماركت في مصر اليوم' }}</title>
     <meta name="description" content="{{ $metaDescription ?? 'تصفح أحدث مجلات وعروض كارفور، كازيون، بيم، هايبر وان، وفتح الله اليوم في مصر. قارن أسعار السلع قبل الشراء ووفر ميزانيتك.' }}">
-    <meta name="robots" content="{{ $robots }}">
+    @if(request()->has('q') || request()->has('page'))
+        <meta name="robots" content="noindex, follow">
+        <link rel="canonical" href="{{ request()->fullUrl() }}">
+    @else
+        <meta name="robots" content="{{ $robots ?? 'index, follow, max-image-size:large, max-snippet:-1, max-video-preview:-1' }}">
+        <link rel="canonical" href="{{ $canonicalUrl ?? url()->current() }}">
+    @endif
 
     <link rel="preload" href="/fonts/readex-pro.woff2" as="font" type="font/woff2" crossorigin>
 
@@ -50,7 +56,7 @@
     <meta name="twitter:description" content="{{ $ogDescription ?? ($metaDescription ?? '') }}">
     <meta name="twitter:image" content="{{ $ogImage ?: url('/img/og-cover.png') }}">
 
-    <link rel="canonical" href="{{ $canonicalUrl }}">
+    <link rel="alternate" type="text/plain" href="{{ url('/llms.txt') }}" title="LLMs.txt Manifest">
 
     @php
         $organizationSchema = [
