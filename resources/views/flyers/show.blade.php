@@ -219,19 +219,17 @@
     </div>
 
     @if (!empty($flyer->editorial_overview))
-    <!-- Editorial Overview — 150 words, 2 paragraphs, high-value - Navy/Green -->
+    <!-- Editorial Overview — Auto-linked contextual internal links -->
     <section class="mb-6 rounded-2xl border border-[#023b55]/10 bg-white p-5 sm:p-6 shadow-sm">
         <h2 class="mb-3 text-lg font-black text-[#023b55]">نظرة سريعة على العرض</h2>
         @php
             $cleanEditorial = trim((string) $flyer->editorial_overview);
-            // Normalize: remove trailing spaces, collapse 3+ newlines to 2, strip blank lines between bullets
             $cleanEditorial = (string) preg_replace("/[ \t]+\n/u", "\n", $cleanEditorial);
             $cleanEditorial = (string) preg_replace("/\n{3,}/u", "\n\n", $cleanEditorial);
-            // Collapse empty line between heading and first bullet: "العدد:\n\n- " -> "العدد:\n- "
             $cleanEditorial = (string) preg_replace("/:\n\n-/u", ":\n- ", $cleanEditorial);
         @endphp
-        <div class="prose prose-sm max-w-none text-[13px] leading-6 text-slate-700 prose-headings:text-[#023b55] prose-strong:text-[#023b55] prose-p:my-2 prose-ul:my-2 prose-li:my-1">
-            {!! nl2br(e($cleanEditorial)) !!}
+        <div class="prose prose-sm max-w-none text-[13px] leading-6 text-slate-700 prose-headings:text-[#023b55] prose-strong:text-[#023b55] prose-p:my-2 prose-ul:my-2 prose-li:my-1 prose-a:text-[#039652] prose-a:font-bold">
+            {!! app(\App\Services\AutoInternalLinkerService::class)->linkify($cleanEditorial, $flyer) !!}
         </div>
     </section>
     @endif
@@ -344,7 +342,13 @@
                 <tbody class="divide-y divide-slate-100 font-medium text-slate-800">
                     @forelse ($flyer->items as $item)
                         <tr id="item-{{ $item->id }}" class="hover:bg-[#039652]/5">
-                            <td class="p-3 font-bold text-[#023b55]">{{ $item->product_name }}</td>
+                            <td class="p-3 font-bold text-[#023b55]">
+                                <div>{{ $item->product_name }}</div>
+                                @php $compareQuery = $item->brand?->name ?: \Illuminate\Support\Str::words($item->product_name, 2, ''); $compareQuery = trim((string) $compareQuery); @endphp
+                                @if ($compareQuery !== '')
+                                    <a href="{{ route('home', ['q' => $compareQuery]) }}" class="mt-1 inline-flex items-center gap-1 rounded-full border border-[#039652]/20 bg-[#039652]/10 px-2 py-0.5 text-[10px] font-bold text-[#039652] hover:bg-[#039652] hover:text-white transition">قارن الأسعار 🔍</a>
+                                @endif
+                            </td>
                             <td class="p-3 text-slate-500">{{ $item->brand?->name ?: '—' }}</td>
                             <td class="p-3 text-slate-500">{{ $item->unit ?: 'قطعة' }}</td>
                             <td class="p-3 text-sm font-black text-[#039652]">{{ number_format((float) $item->sale_price, 2) }} ج.م</td>
@@ -375,4 +379,83 @@
             </table>
         </div>
     </section>
+
+    <!-- Dynamic Cross-Linking Widgets -->
+    @if (isset($sameRetailerFlyers) && $sameRetailerFlyers->isNotEmpty())
+    <section class="mt-10 rounded-2xl border border-[#023b55]/10 bg-white p-6 shadow-sm">
+        <div class="mb-4 flex items-center justify-between">
+            <h2 class="text-lg font-black text-[#023b55]">عروض أخرى سارية اليوم من {{ $flyer->retailer->name }}</h2>
+            <a href="{{ route('retailers.show', $flyer->retailer->slug) }}" class="text-xs font-bold text-[#039652] hover:underline">عرض الكل ←</a>
+        </div>
+        <div class="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4">
+            @foreach ($sameRetailerFlyers as $related)
+                @php $cov = $related->pages->first(); $u = $cov ? \App\Support\R2Url::asset($cov->image_path) : '/img/placeholder-flyer.png'; @endphp
+                <a href="{{ route('flyers.show', $related->slug) }}" class="group flex flex-col overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm transition hover:border-[#039652] hover:shadow-md">
+                    <div class="relative aspect-[3/4] overflow-hidden bg-slate-100">
+                        <img src="{{ $u }}" alt="{{ $related->title }}" width="400" height="530" loading="lazy" class="h-full w-full object-cover transition duration-300 group-hover:scale-[1.03]">
+                        <span class="absolute right-2 top-2 rounded-lg bg-[#023b55] px-2 py-1 text-[10px] font-bold text-white">{{ $related->total_pages }} صفحة</span>
+                    </div>
+                    <div class="p-3">
+                        <div class="text-[11px] font-bold text-[#039652]">{{ $related->retailer->name }}</div>
+                        <h3 class="mt-1 line-clamp-2 text-xs font-black text-[#023b55] group-hover:text-[#039652]">{{ $related->title }}</h3>
+                        <div class="mt-2 text-[11px] font-medium text-slate-500">حتى {{ \Carbon\Carbon::parse($related->valid_until)->format('d/m/Y') }}</div>
+                    </div>
+                </a>
+            @endforeach
+        </div>
+    </section>
+    @endif
+
+    @if (isset($competitorFlyers) && $competitorFlyers->isNotEmpty())
+    <section class="mt-6 rounded-2xl border border-[#023b55]/10 bg-white p-6 shadow-sm">
+        <div class="mb-4">
+            <h2 class="text-lg font-black text-[#023b55]">عروض سلاسل السوبرماركت الأخرى السارية اليوم بمصر</h2>
+            <p class="mt-1 text-xs text-slate-500">قارن عروض نفس الفترة من منافسين آخرين</p>
+        </div>
+        <div class="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4">
+            @foreach ($competitorFlyers as $comp)
+                @php $cov = $comp->pages->first(); $u = $cov ? \App\Support\R2Url::asset($cov->image_path) : '/img/placeholder-flyer.png'; @endphp
+                <a href="{{ route('flyers.show', $comp->slug) }}" class="group flex flex-col overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm transition hover:border-[#039652] hover:shadow-md">
+                    <div class="relative aspect-[3/4] overflow-hidden bg-slate-100">
+                        <img src="{{ $u }}" alt="{{ $comp->title }}" width="400" height="530" loading="lazy" class="h-full w-full object-cover transition duration-300 group-hover:scale-[1.03]">
+                        <span class="absolute left-2 top-2 rounded-full bg-white/90 px-2 py-0.5 text-[10px] font-black text-[#023b55] border border-slate-200">{{ $comp->retailer->name }}</span>
+                    </div>
+                    <div class="p-3">
+                        <h3 class="line-clamp-2 text-xs font-black text-[#023b55] group-hover:text-[#039652]">{{ $comp->title }}</h3>
+                        <div class="mt-1 text-[11px] text-slate-500">{{ \Carbon\Carbon::parse($comp->valid_from)->format('d/m') }} → {{ \Carbon\Carbon::parse($comp->valid_until)->format('d/m/Y') }}</div>
+                    </div>
+                </a>
+            @endforeach
+        </div>
+        <div class="mt-4 text-center">
+            <a href="{{ route('home') }}" class="inline-flex rounded-xl border border-[#023b55]/15 bg-[#023b55]/5 px-4 py-2 text-xs font-bold text-[#023b55] hover:bg-[#039652] hover:text-white hover:border-[#039652] transition">تصفح كل العروض السارية →</a>
+        </div>
+    </section>
+    @endif
+
+    @if (isset($archiveFlyers) && $archiveFlyers->isNotEmpty())
+    <section class="mt-6 rounded-2xl border border-[#e2e8f0] bg-slate-50 p-6 shadow-sm">
+        <div class="mb-4 flex items-center justify-between">
+            <h2 class="text-lg font-black text-[#023b55]">أرشيف عروض {{ $flyer->retailer->name }} السابقة</h2>
+            <span class="rounded-full bg-white border border-slate-200 px-2.5 py-1 text-[11px] font-bold text-slate-600">{{ $archiveFlyers->count() }} مجلة للسجل السعري</span>
+        </div>
+        <p class="mb-4 text-xs text-slate-500">للمقارنة ومعرفة تطور الأسعار قبل الشراء — توثيق تاريخي لآخر 30 يوم</p>
+        <div class="grid grid-cols-2 gap-4 sm:grid-cols-3">
+            @foreach ($archiveFlyers as $arc)
+                @php $cov = $arc->pages->first(); $u = $cov ? \App\Support\R2Url::asset($cov->image_path) : '/img/placeholder-flyer.png'; @endphp
+                <a href="{{ route('flyers.show', $arc->slug) }}" class="flex flex-col overflow-hidden rounded-xl border border-slate-200 bg-white opacity-95 hover:opacity-100 hover:border-[#023b55]/20 transition">
+                    <div class="relative aspect-[3/4] overflow-hidden bg-slate-100">
+                        <img src="{{ $u }}" alt="{{ $arc->title }}" width="400" height="530" loading="lazy" class="h-full w-full object-cover grayscale hover:grayscale-0 transition">
+                        <span class="absolute inset-0 bg-slate-900/5"></span>
+                        <span class="absolute right-2 top-2 rounded-lg bg-slate-700 px-2 py-1 text-[10px] font-bold text-white">منتهي {{ \Carbon\Carbon::parse($arc->valid_until)->format('d/m') }}</span>
+                    </div>
+                    <div class="p-3">
+                        <h3 class="line-clamp-2 text-xs font-bold text-slate-700">{{ $arc->title }}</h3>
+                        <div class="mt-1 text-[11px] text-slate-500">{{ \Carbon\Carbon::parse($arc->valid_from)->format('d/m/Y') }} → {{ \Carbon\Carbon::parse($arc->valid_until)->format('d/m/Y') }}</div>
+                    </div>
+                </a>
+            @endforeach
+        </div>
+    </section>
+    @endif
 </x-layouts.app>
