@@ -29,11 +29,7 @@
     <meta name="description" content="{{ $metaDescription ?? 'تصفح أحدث مجلات وعروض كارفور، كازيون، بيم، هايبر وان، وفتح الله اليوم في مصر. قارن أسعار السلع قبل الشراء ووفر ميزانيتك.' }}">
     <meta name="robots" content="{{ $robots }}">
 
-    <!-- Google Fonts: Readex Pro Preloaded لمنع الـ CLS -->
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=Readex+Pro:wght@300;400;500;600;700;800&display=optional">
-    <link href="https://fonts.googleapis.com/css2?family=Readex+Pro:wght@300;400;500;600;700;800&display=optional" rel="stylesheet" media="print" onload="this.media='all'">
+    <link rel="preload" href="/fonts/readex-pro.woff2" as="font" type="font/woff2" crossorigin>
 
     <!-- R2 CDN Preconnect -->
     @if ($r2Host)
@@ -105,10 +101,10 @@
                 <a href="{{ route('home') }}" class="hover:text-[#039652] transition-colors {{ request()->routeIs('home') && !request()->has('q') && !request()->has('type') ? 'text-[#039652]' : '' }}">الرئيسية</a>
                 @php $kazyon = $headerRetailers->firstWhere('slug','kazyon'); @endphp
                 <a href="{{ $kazyon ? route('retailers.show', $kazyon->slug) : route('retailers.show','kazyon') }}" class="hover:text-[#039652] transition-colors">كازيون</a>
-                @php $carrefour = $headerRetailers->firstWhere('slug','carrefour') ?? $headerRetailers->firstWhere('slug','carrefour-egypt'); @endphp
-                <a href="{{ $carrefour ? route('retailers.show', $carrefour->slug) : route('retailers.show','carrefour') }}" class="hover:text-[#039652] transition-colors">كارفور</a>
-                @php $bim = $headerRetailers->firstWhere('slug','bim') ?? $headerRetailers->firstWhere('slug','bim-egypt'); @endphp
-                <a href="{{ $bim ? route('retailers.show', $bim->slug) : route('retailers.show','bim') }}" class="hover:text-[#039652] transition-colors">بيم</a>
+                @php $carrefour = $headerRetailers->firstWhere('slug','carrefouregypt') ?? $headerRetailers->firstWhere('slug','carrefour'); @endphp
+                <a href="{{ $carrefour ? route('retailers.show', $carrefour->slug) : route('retailers.show','carrefouregypt') }}" class="hover:text-[#039652] transition-colors">كارفور</a>
+                @php $bim = $headerRetailers->firstWhere('slug','bimmisr') ?? $headerRetailers->firstWhere('slug','bim'); @endphp
+                <a href="{{ $bim ? route('retailers.show', $bim->slug) : route('retailers.show','bimmisr') }}" class="hover:text-[#039652] transition-colors">بيم</a>
                 <a href="{{ route('home', ['q' => 'اليوم الواحد']) }}" class="hover:text-[#039652] transition-colors">عروض اليوم الواحد</a>
                 <a href="{{ route('home', ['type' => 'magazines']) }}" class="hover:text-[#039652] transition-colors">جميع المجلات</a>
             </nav>

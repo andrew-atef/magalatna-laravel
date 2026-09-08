@@ -20,19 +20,36 @@
 >
     @push('schema')
         @php
-            $siteName = config('app.name', 'عروض نت');
+            $siteName = config('app.name', 'مجلاتنا');
             $organizationId = url('/') . '#organization';
+            $websiteId = url('/') . '#website';
             $breadcrumbId = $pageUrl . '#breadcrumb';
+            $eventId = $pageUrl . '#event';
+            $itemListId = $pageUrl . '#itemlist';
 
-            // Unified @graph with 4 entities cross-linked
             $graph = [
                 [
                     '@type' => 'Organization',
                     '@id' => $organizationId,
                     'name' => $siteName,
                     'url' => url('/'),
-                    'logo' => url('/favicon.svg'),
-                    'areaServed' => 'EG',
+                    'logo' => [
+                        '@type' => 'ImageObject',
+                        'url' => url('/favicon.svg'),
+                        'width' => 140,
+                        'height' => 36,
+                    ],
+                    'areaServed' => [
+                        '@type' => 'Country',
+                        'name' => 'EG',
+                    ],
+                ],
+                [
+                    '@type' => 'WebSite',
+                    '@id' => $websiteId,
+                    'url' => url('/'),
+                    'name' => $siteName,
+                    'publisher' => ['@id' => $organizationId],
                 ],
                 [
                     '@type' => 'BreadcrumbList',
@@ -43,43 +60,45 @@
                         ['@type' => 'ListItem', 'position' => 3, 'name' => $cleanTitle, 'item' => $pageUrl],
                     ],
                 ],
-                array_merge([
-                    '@type' => 'SpecialAnnouncement',
+                [
+                    '@type' => 'SaleEvent',
+                    '@id' => $eventId,
                     'name' => $cleanTitle,
-                    'text' => $bluf,
-                    'datePosted' => $flyer->created_at->toIso8601String(),
-                    'expires' => \Carbon\Carbon::parse($flyer->valid_until)->endOfDay()->toIso8601String(),
-                    'announcementLocation' => [
-                        '@type' => 'LocalBusiness',
-                        'name' => $flyer->retailer->name,
-                        'address' => ['@type' => 'PostalAddress', 'addressCountry' => 'EG'],
+                    'description' => $bluf,
+                    'startDate' => \Carbon\Carbon::parse($flyer->valid_from)->toIso8601String(),
+                    'endDate' => \Carbon\Carbon::parse($flyer->valid_until)->endOfDay()->toIso8601String(),
+                    'eventStatus' => 'https://schema.org/EventScheduled',
+                    'eventAttendanceMode' => 'https://schema.org/OfflineEventAttendanceMode',
+                    'location' => [
+                        '@type' => 'Place',
+                        'name' => 'فروع ' . $flyer->retailer->name . ' بمصر',
+                        'address' => [
+                            '@type' => 'PostalAddress',
+                            'addressCountry' => 'EG',
+                        ],
                     ],
                     'organizer' => ['@id' => $organizationId],
-                ], \Carbon\Carbon::parse($flyer->valid_from, 'Africa/Cairo')->isFuture() ? ['availabilityStarts' => \Carbon\Carbon::parse($flyer->valid_from, 'Africa/Cairo')->startOfDay()->toIso8601String()] : []),
+                ],
                 [
                     '@type' => 'ItemList',
+                    '@id' => $itemListId,
                     'name' => 'قائمة أسعار وسلع ' . $cleanTitle,
                     'numberOfItems' => $flyer->items->count(),
-                    'itemListElement' => $flyer->items->take(50)->values()->map(function ($item, $idx) use ($pageUrl, $flyer) {
-                        $hasOld = $item->old_price && (float)$item->old_price > (float)$item->sale_price;
-                        $fromForOffer = \Carbon\Carbon::parse($flyer->valid_from, 'Africa/Cairo');
-                        $untilForOffer = \Carbon\Carbon::parse($flyer->valid_until, 'Africa/Cairo');
-                        $availability = $fromForOffer->isFuture() ? 'https://schema.org/PreOrder' : ($untilForOffer->isPast() ? 'https://schema.org/OutOfStock' : 'https://schema.org/InStock');
+                    'itemListElement' => $flyer->items->take(50)->values()->map(function ($item, $idx) use ($pageUrl, $flyer, $coverImage) {
+                        $hasOld = $item->old_price && (float) $item->old_price > (float) $item->sale_price;
                         $offer = [
                             '@type' => 'Offer',
+                            'url' => $pageUrl . '#item-' . $item->id,
                             'price' => number_format((float) $item->sale_price, 2, '.', ''),
                             'priceCurrency' => 'EGP',
-                            'priceValidUntil' => $untilForOffer->format('Y-m-d'),
-                            'availability' => $availability,
+                            'priceValidUntil' => \Carbon\Carbon::parse($flyer->valid_until)->format('Y-m-d'),
+                            'availability' => 'https://schema.org/InStock',
                             'seller' => ['@type' => 'Organization', 'name' => $flyer->retailer->name],
                         ];
-                        if ($fromForOffer->isFuture()) {
-                            $offer['availabilityStarts'] = $fromForOffer->format('Y-m-d');
-                        }
                         if ($hasOld) {
                             $offer['priceSpecification'] = [
                                 '@type' => 'UnitPriceSpecification',
-                                'priceType' => 'https://schema.org/StrikethroughPrice',
+                                'priceType' => 'https://schema.org/ListPrice',
                                 'price' => number_format((float) $item->old_price, 2, '.', ''),
                                 'priceCurrency' => 'EGP',
                             ];
@@ -90,6 +109,7 @@
                             'item' => [
                                 '@type' => 'Product',
                                 'name' => $item->product_name,
+                                'image' => $coverImage,
                                 'url' => $pageUrl . '#item-' . $item->id,
                                 'brand' => ['@type' => 'Brand', 'name' => $item->brand?->name ?: $item->product_name],
                                 'offers' => $offer,
@@ -153,10 +173,27 @@
             </div>
         </div>
 
-        <!-- 2-Sentence BLUF Summary Box - Navy accent -->
-        <div class="mt-4 rounded-xl border border-[#023b55]/15 bg-white p-4 text-sm font-medium leading-relaxed text-slate-700">
-            <p class="font-bold text-[#023b55] mb-1">📌 خلاصة العرض (سريعة ومباشرة):</p>
-            <p>{{ $bluf }}</p>
+        <!-- 2-Sentence BLUF Summary Box - GEO chunk with right accent -->
+        @php
+            $blufHtml = e($bluf);
+            // Bold critical entities for LLM RAG
+            $storeName = e($flyer->retailer->name);
+            $blufHtml = str_replace($storeName, '<strong>' . $storeName . '</strong>', $blufHtml);
+            // Bold total pages
+            $pagesText = (string) $flyer->total_pages . ' صفحة';
+            $pagesTextAlt = (string) $flyer->total_pages . ' صفحات';
+            $blufHtml = str_replace($pagesText, '<strong>' . $pagesText . '</strong>', $blufHtml);
+            $blufHtml = str_replace($pagesTextAlt, '<strong>' . $pagesTextAlt . '</strong>', $blufHtml);
+            // Bold discount percentages like 42% or 42.39%
+            $blufHtml = (string) preg_replace('/(\d+(?:\.\d+)?%)/u', '<strong>$1</strong>', $blufHtml);
+            // Bold date spans (dd/mm/yyyy or Arabic dates)
+            $blufHtml = (string) preg_replace('/\d{1,2}\/\d{1,2}\/\d{4}/u', '<strong>$0</strong>', $blufHtml);
+            // Bold prices like 14.95 ج.م
+            $blufHtml = (string) preg_replace('/\d+(?:\.\d+)?\s*ج\.م/u', '<strong>$0</strong>', $blufHtml);
+        @endphp
+        <div class="mt-4 rounded-xl border border-slate-200 border-r-4 border-r-[#039652] bg-emerald-50/40 p-4 text-sm font-medium leading-relaxed text-slate-700">
+            <p class="font-bold text-[#023b55] mb-1">📌 تفاصيل وسريان العرض:</p>
+            <p>{!! $blufHtml !!}</p>
         </div>
     </article>
 
@@ -180,6 +217,7 @@
                             alt="{{ $cleanTitle }} - صفحة {{ $page->page_number }}"
                             width="1200"
                             height="1600"
+                            sizes="(max-width: 640px) 100vw, 768px"
                             @if ($loop->first) loading="eager" fetchpriority="high" decoding="async" @else loading="lazy" decoding="async" @endif
                             class="w-full object-contain"
                         >
@@ -346,7 +384,7 @@
                                 <div>{{ $item->product_name }}</div>
                                 @php $compareQuery = $item->brand?->name ?: \Illuminate\Support\Str::words($item->product_name, 2, ''); $compareQuery = trim((string) $compareQuery); @endphp
                                 @if ($compareQuery !== '')
-                                    <a href="{{ route('home', ['q' => $compareQuery]) }}" class="mt-1 inline-flex items-center gap-1 rounded-full border border-[#039652]/20 bg-[#039652]/10 px-2 py-0.5 text-[10px] font-bold text-[#039652] hover:bg-[#039652] hover:text-white transition">قارن الأسعار 🔍</a>
+                                    <a href="{{ route('home', ['q' => $compareQuery]) }}" rel="nofollow" class="mt-1 inline-flex items-center gap-1 rounded-full border border-[#039652]/20 bg-[#039652]/10 px-2 py-0.5 text-[10px] font-bold text-[#039652] hover:bg-[#039652] hover:text-white transition">قارن الأسعار 🔍</a>
                                 @endif
                             </td>
                             <td class="p-3 text-slate-500">{{ $item->brand?->name ?: '—' }}</td>

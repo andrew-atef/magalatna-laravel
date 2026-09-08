@@ -25,6 +25,10 @@ Route::get('/offers/{slug}', [FlyerController::class, 'show'])->name('flyers.sho
 Route::get('/flyer/{slug}', fn (string $slug) => redirect()->route('flyers.show', $slug, 301));
 Route::get('/flyers/{slug}', fn (string $slug) => redirect()->route('flyers.show', $slug, 301));
 
+// Legacy retailer aliases -> canonical slugs (301 to preserve link equity)
+Route::get('/bim', fn () => redirect()->route('retailers.show', 'bimmisr', 301));
+Route::get('/carrefour', fn () => redirect()->route('retailers.show', 'carrefouregypt', 301));
+
 // خريطة الموقع لمحركات البحث — cached 1h, invalidated via observers
 Route::get('/sitemap.xml', function () {
     $xml = Cache::remember('sitemap_xml_content', 3600, function () {

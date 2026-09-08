@@ -163,6 +163,9 @@ final class AutoInternalLinkerService
                 $a = $dom->createElement('a', $bestMatchText ?? $bestKeyword);
                 $a->setAttribute('href', $bestUrl);
                 $a->setAttribute('class', 'text-[#039652] hover:text-[#023b55] hover:underline font-bold');
+                if (str_contains($bestUrl, '?q=') || str_contains($bestUrl, '&q=')) {
+                    $a->setAttribute('rel', 'nofollow');
+                }
                 $parent->insertBefore($a, $textNode);
 
                 $linkedKeywords[$bestKeyword] = true;
