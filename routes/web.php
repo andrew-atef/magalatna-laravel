@@ -26,21 +26,30 @@ Route::get('/flyer/{slug}', fn (string $slug) => redirect()->route('flyers.show'
 Route::get('/flyers/{slug}', fn (string $slug) => redirect()->route('flyers.show', $slug, 301));
 
 // Legacy retailer aliases -> canonical slugs (301 to preserve link equity)
-Route::get('/bim', fn () => redirect()->route('retailers.show', 'bimmisr', 301));
-Route::get('/carrefour', fn () => redirect()->route('retailers.show', 'carrefouregypt', 301));
+Route::permanentRedirect('/bim', '/bimmisr');
+Route::permanentRedirect('/carrefour', '/carrefouregypt');
 
-// خريطة الموقع لمحركات البحث — cached 1h, invalidated via observers
+// خريطة الموقع لمحركات البحث — cached 6h, invalidated via observers (FlyerObserver::saved/deleted)
 Route::get('/sitemap.xml', function () {
-    $xml = Cache::remember('sitemap_xml_content', 3600, function () {
+    $xml = Cache::remember('sitemap_xml_content', 21600, function () {
         $retailers = Retailer::where('is_active', true)->get();
-        $flyers = Flyer::where('status', 'published')
+        $activeFlyers = Flyer::where('status', 'published')
+            ->with(['retailer', 'pages'])
             ->latest('updated_at')
             ->limit(1000)
+            ->get();
+        $expiredFlyers = Flyer::where('status', 'expired')
+            ->with(['retailer'])
+            ->latest('updated_at')
+            ->limit(200)
             ->get();
 
         return view('sitemap', [
             'retailers' => $retailers,
-            'flyers' => $flyers,
+            'activeFlyers' => $activeFlyers,
+            'expiredFlyers' => $expiredFlyers,
+            // Back-compat for older view variable name
+            'flyers' => $activeFlyers,
         ])->render();
     });
 

@@ -1,30 +1,53 @@
 {!! '<'.'?xml version="1.0" encoding="UTF-8"?'.'>' !!}
-<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-    <!-- الصفحة الرئيسية -->
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:image="http://www.google.com/schemas/sitemap-image/1.1">
+    <!-- Homepage -->
     <url>
         <loc>{{ url('/') }}</loc>
         <lastmod>{{ now()->toAtomString() }}</lastmod>
-        <changefreq>daily</changefreq>
+        <changefreq>hourly</changefreq>
         <priority>1.0</priority>
     </url>
 
-    <!-- صفحات المتاجر (Retailer Hubs) -->
+    <!-- Canonical Retailer Hubs -->
     @foreach ($retailers as $retailer)
         <url>
             <loc>{{ route('retailers.show', $retailer->slug) }}</loc>
             <lastmod>{{ $retailer->updated_at->toAtomString() }}</lastmod>
             <changefreq>daily</changefreq>
             <priority>0.8</priority>
+            @if ($retailer->logo_path)
+                <image:image>
+                    <image:loc>{{ rtrim((string) config('filesystems.disks.r2.url'), '/') . '/' . ltrim((string) $retailer->logo_path, '/') }}</image:loc>
+                    <image:title>{{ $retailer->name }}</image:title>
+                </image:image>
+            @endif
         </url>
     @endforeach
 
-    <!-- صفحات مجلات العروض السارية -->
-    @foreach ($flyers as $flyer)
+    <!-- Active Published Flyers -->
+    @foreach ($activeFlyers ?? $flyers ?? [] as $flyer)
         <url>
             <loc>{{ route('flyers.show', $flyer->slug) }}</loc>
             <lastmod>{{ $flyer->updated_at->toAtomString() }}</lastmod>
-            <changefreq>weekly</changefreq>
-            <priority>{{ \Carbon\Carbon::parse($flyer->valid_until)->isFuture() ? '0.9' : '0.4' }}</priority>
+            <changefreq>daily</changefreq>
+            <priority>0.9</priority>
+            @foreach ($flyer->pages->sortBy('page_number') as $page)
+                <image:image>
+                    <image:loc>{{ rtrim((string) config('filesystems.disks.r2.url'), '/') . '/' . ltrim((string) $page->image_path, '/') }}</image:loc>
+                    <image:title>{{ $flyer->title }} - صفحة {{ $page->page_number }}</image:title>
+                    <image:caption>أسعار وتخفيضات {{ $flyer->retailer->name }} في مصر - {{ $flyer->title }}</image:caption>
+                </image:image>
+            @endforeach
+        </url>
+    @endforeach
+
+    <!-- Recently Expired Flyers (Historical Archive) -->
+    @foreach ($expiredFlyers ?? [] as $flyer)
+        <url>
+            <loc>{{ route('flyers.show', $flyer->slug) }}</loc>
+            <lastmod>{{ $flyer->updated_at->toAtomString() }}</lastmod>
+            <changefreq>monthly</changefreq>
+            <priority>0.3</priority>
         </url>
     @endforeach
 </urlset>
