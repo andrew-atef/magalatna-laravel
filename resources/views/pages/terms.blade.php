@@ -1,16 +1,24 @@
 <x-layouts.app :meta-title="$metaTitle ?? 'شروط وأحكام الاستخدام'" :meta-description="$metaDescription ?? ''" og-type="website">
 @push('schema')
-<script type="application/ld+json">{!! json_encode(['@context'=>'https://schema.org','@type'=>'WebPage','name'=>'شروط الاستخدام — مجلاتنا','url'=>url()->current(),'isPartOf'=>['@type'=>'WebSite','name'=>config('app.name','مجلاتنا'),'url'=>url('/')]], JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES) !!}</script>
+<script type="application/ld+json">{!! json_encode(['@context'=>'https://schema.org','@type'=>'WebPage','name'=>'شروط الاستخدام — مجلاتنا','description'=>$metaDescription ?? '','url'=>url()->current(),'isPartOf'=>['@type'=>'WebSite','name'=>config('app.name','مجلاتنا'),'url'=>url('/')]], JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES) !!}</script>
 @endpush
+
+<nav class="mb-4 text-xs font-semibold text-slate-500" aria-label="Breadcrumb">
+    <ol class="flex items-center gap-1.5">
+        <li><a href="{{ route('home') }}" class="hover:text-[#039652]">الرئيسية</a></li>
+        <li>/</li>
+        <li class="text-[#023b55] font-bold" aria-current="page">شروط الاستخدام</li>
+    </ol>
+</nav>
+
+<section class="mb-6 rounded-2xl border border-[#023b55]/10 bg-white p-6 sm:p-8 shadow-sm">
+    <span class="inline-block rounded-full bg-[#023b55]/10 px-3 py-1 text-xs font-bold text-[#023b55]">سارية اعتباراً من: سبتمبر 2026</span>
+    <h1 class="mt-3 text-2xl font-black text-[#023b55] sm:text-3xl">شروط وأحكام الاستخدام</h1>
+    <p class="mt-2 text-sm text-slate-600">مرحباً بكم في <strong>مجلاتنا (magalatna.com)</strong>. دخولك وتصفحك للموقع يعني موافقتك الكاملة على البنود أدناه.</p>
+</section>
+
 <div class="mx-auto max-w-4xl rounded-2xl border border-slate-200 bg-white p-6 sm:p-8 shadow-sm">
-<article class="prose prose-slate max-w-none">
-    <h1>شروط وأحكام الاستخدام</h1>
-    <p class="text-xs text-slate-500">سارية اعتباراً من: سبتمبر 2026</p>
-
-    <p>
-        مرحباً بكم في منصة <strong>مجلاتنا (magalatna.com)</strong>. تحكم هذه الشروط والأحكام استخدامك للموقع وخدماته. يُعد دخولك وتصفحك للموقع موافقة صريحة وكاملة منك على الالتزام بكافة البنود المذكورة أدناه.
-    </p>
-
+<article class="prose prose-slate max-w-none prose-headings:text-[#023b55] prose-headings:font-black prose-a:text-[#039652] prose-strong:text-[#023b55]">
     <h2>1. طبيعة الخدمة المقدمة</h2>
     <p>
         يقدم موقع <strong>مجلاتنا</strong> خدمة إعلامية وإرشادية مجانية تهدف إلى عرض وتوثيق العروض الترويجية والأسعار الصادرة علناً عن السلاسل التجارية والمتاجر في جمهورية مصر العربية.

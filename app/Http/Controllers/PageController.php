@@ -11,7 +11,7 @@ final class PageController extends Controller
     public function about(): View
     {
         return view('pages.about', [
-            'metaTitle' => 'من نحن — منصة مجلاتنا',
+            'metaTitle' => 'من نحن',
             'metaDescription' => 'تعرف على منصة مجلاتنا — منصة رقمية مصرية مستقلة متخصصة في رصد وأرشفة مجلات عروض وتخفيضات كبرى سلاسل التجزئة في مصر.',
         ]);
     }

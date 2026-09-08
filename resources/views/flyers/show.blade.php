@@ -228,7 +228,25 @@
     </section>
     @endif
 
-    <style>#flyer-lightbox:not(.hidden){display:flex}#flyer-lightbox.hidden{display:none}</style>
+    <style>#flyer-lightbox:not(.hidden){display:flex}#flyer-lightbox.hidden{display:none} html{scroll-behavior:smooth} tr:target, tr.highlight-target{background-color:rgba(3,150,82,0.10)!important; transition:background-color .3s ease}</style>
+    <script>
+    // Deep-link highlight for #item-{id} from hot deals
+    document.addEventListener('DOMContentLoaded', function(){
+        function highlightHash(){
+            const hash = location.hash;
+            if(hash && hash.startsWith('#item-')){
+                const el = document.querySelector(hash);
+                if(el){
+                    el.classList.add('highlight-target');
+                    el.scrollIntoView({behavior:'smooth', block:'center'});
+                    setTimeout(function(){ el.classList.remove('highlight-target'); }, 2000);
+                }
+            }
+        }
+        highlightHash();
+        window.addEventListener('hashchange', highlightHash);
+    });
+    </script>
     <script>
     document.addEventListener('DOMContentLoaded', function(){
         const pages = @json($flyer->pages->sortBy('page_number')->values()->map(fn($p) => ['src' => \App\Support\R2Url::asset($p->image_path), 'alt' => $cleanTitle.' - صفحة '.$p->page_number]));

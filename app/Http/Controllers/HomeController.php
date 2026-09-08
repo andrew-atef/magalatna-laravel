@@ -44,17 +44,37 @@ final class HomeController extends Controller
 
         $flyers = $flyersQuery->paginate(12)->withQueryString();
 
-        // 3. أقوى السلع المخفضة اليوم (أكبر نسبة توفير)
-        $hotItems = FlyerItem::with('flyer.retailer')
-            ->whereHas('flyer', function ($q) use ($cairoToday) {
-                $q->where('status', 'published')->where('valid_until', '>=', $cairoToday);
-            })
-            ->whereNotNull('discount_percent')
-            ->where('discount_percent', '>', 10)
-            ->orderByDesc('discount_percent')
-            ->limit(6)
-            ->get();
+        // 3. Matching products for search (normalized) vs hot items for homepage
+        $matchingItems = null;
+        $hotItems = collect();
 
-        return view('home', compact('retailers', 'flyers', 'hotItems'));
+        if (! empty($searchQuery)) {
+            $normalizedQuery = ArabicNormalizer::normalize($searchQuery);
+
+            $matchingItems = FlyerItem::with('flyer.retailer')
+                ->where('normalized_name', 'like', "%{$normalizedQuery}%")
+                ->whereHas('flyer', function ($q) use ($cairoToday) {
+                    $q->where('status', 'published')->where('valid_until', '>=', $cairoToday);
+                })
+                ->latest('id')
+                ->paginate(12, ['*'], 'items_page')
+                ->withQueryString();
+
+            // When search is active, hide generic hotItems and only display matchingItems
+            $hotItems = collect();
+        } else {
+            // 3b. أقوى السلع المخفضة اليوم (أكبر نسبة توفير) - فقط عند عدم وجود بحث
+            $hotItems = FlyerItem::with('flyer.retailer')
+                ->whereHas('flyer', function ($q) use ($cairoToday) {
+                    $q->where('status', 'published')->where('valid_until', '>=', $cairoToday);
+                })
+                ->whereNotNull('discount_percent')
+                ->where('discount_percent', '>', 10)
+                ->orderByDesc('discount_percent')
+                ->limit(6)
+                ->get();
+        }
+
+        return view('home', compact('retailers', 'flyers', 'hotItems', 'matchingItems', 'searchQuery'));
     }
 }
