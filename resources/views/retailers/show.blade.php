@@ -1,6 +1,7 @@
 @php
-    $r2DiskUrl = rtrim((string) config('filesystems.disks.r2.url'), '/');
-    $logoUrl = $retailer->logo_path ? $r2DiskUrl . '/' . $retailer->logo_path : null;
+    use App\Support\R2Url;
+    $r2DiskUrl = R2Url::base();
+    $logoUrl = $retailer->logo_path ? R2Url::asset($retailer->logo_path) : null;
     $canonicalUrl = $canonical ?? route('retailers.show', $retailer->slug);
     $year = \Carbon\Carbon::now('Africa/Cairo')->year;
     $metaTitle = $seoTitle ?? "عروض {$retailer->name} مصر اليوم {$year} | أحدث مجلات الأسعار والتخفيضات";
@@ -112,7 +113,7 @@
                 @foreach ($activeFlyers as $flyer)
                     @php
                         $coverPage = $flyer->pages->first();
-                        $coverUrl = $coverPage ? $r2DiskUrl . '/' . $coverPage->image_path : '/img/placeholder-flyer.png';
+                        $coverUrl = $coverPage ? R2Url::asset($coverPage->image_path) : '/img/placeholder-flyer.png';
                     @endphp
                     @php
                             $today = \Carbon\Carbon::today('Africa/Cairo');
@@ -169,7 +170,7 @@
                 @foreach ($expiredFlyers as $flyer)
                     @php
                         $coverPage = $flyer->pages->first();
-                        $coverUrl = $coverPage ? $r2DiskUrl . '/' . $coverPage->image_path : '/img/placeholder-flyer.png';
+                        $coverUrl = $coverPage ? R2Url::asset($coverPage->image_path) : '/img/placeholder-flyer.png';
                     @endphp
                     <article class="flex flex-col overflow-hidden rounded-xl border border-slate-200 bg-slate-50 opacity-90">
                         <a href="{{ route('flyers.show', $flyer->slug) }}" class="relative aspect-[3/4] overflow-hidden bg-slate-100">

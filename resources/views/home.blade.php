@@ -1,8 +1,9 @@
 @php
+    use App\Support\R2Url;
     $siteName = config('app.name', 'عروض نت');
     $searchQuery = request('q', '');
     $selectedRetailerSlug = request('retailer');
-    $r2DiskUrl = rtrim((string) config('filesystems.disks.r2.url'), '/');
+    $r2DiskUrl = R2Url::base();
 @endphp
 
 <x-layouts.app
@@ -52,7 +53,7 @@
                     class="inline-flex shrink-0 items-center gap-2 rounded-full border px-3.5 py-1.5 text-xs font-bold transition border-slate-200 bg-white text-[#023b55] hover:border-[#039652]/30 hover:bg-slate-50"
                 >
                     @if ($ret->logo_path)
-                        <img src="{{ $r2DiskUrl . '/' . $ret->logo_path }}" alt="{{ $ret->name }}" class="h-4 w-4 rounded-full object-contain">
+                        <img src="{{ R2Url::asset($ret->logo_path) }}" alt="{{ $ret->name }}" class="h-4 w-4 rounded-full object-contain">
                     @endif
                     <span>{{ $ret->name }}</span>
                 </a>
@@ -71,7 +72,7 @@
             @forelse ($flyers as $flyer)
                 @php
                     $coverPage = $flyer->pages->first();
-                    $coverUrl = $coverPage ? $r2DiskUrl . '/' . $coverPage->image_path : '/img/placeholder-flyer.png';
+                    $coverUrl = $coverPage ? R2Url::asset($coverPage->image_path) : '/img/placeholder-flyer.png';
                 @endphp
                 <article class="group flex flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm transition hover:shadow-md">
                     <a href="{{ route('flyers.show', $flyer->slug) }}" class="relative aspect-[3/4] overflow-hidden bg-slate-100">

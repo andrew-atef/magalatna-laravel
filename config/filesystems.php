@@ -66,7 +66,21 @@ return [
             'secret' => env('CLOUDFLARE_R2_SECRET_ACCESS_KEY'),
             'region' => env('CLOUDFLARE_R2_REGION', 'auto'),
             'bucket' => env('CLOUDFLARE_R2_BUCKET'),
-            'url' => env('CLOUDFLARE_R2_PUBLIC_URL'),
+            'url' => (function (): ?string {
+                $url = env('CLOUDFLARE_R2_PUBLIC_URL');
+                if (blank($url)) {
+                    return $url;
+                }
+                $url = trim((string) $url);
+                // Normalize malformed https:cdn.magalatna.com -> https://cdn.magalatna.com
+                $url = (string) preg_replace('#^https:(?!//)#i', 'https://', $url);
+                $url = (string) preg_replace('#^http:(?!//)#i', 'http://', $url);
+                if (! str_starts_with(strtolower($url), 'http://') && ! str_starts_with(strtolower($url), 'https://')) {
+                    $url = 'https://' . ltrim($url, '/');
+                }
+
+                return rtrim($url, '/');
+            })(),
             'endpoint' => env('CLOUDFLARE_R2_ENDPOINT'),
             'use_path_style_endpoint' => false,
             'throw' => true,

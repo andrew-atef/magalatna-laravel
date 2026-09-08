@@ -1,7 +1,8 @@
 @php
-    $r2DiskUrl = rtrim((string) config('filesystems.disks.r2.url'), '/');
+    use App\Support\R2Url;
+    $r2DiskUrl = R2Url::base();
     $firstPage = $flyer->pages->first();
-    $coverImage = $firstPage ? $r2DiskUrl . '/' . $firstPage->image_path : url('/img/og-cover.png');
+    $coverImage = $firstPage ? R2Url::asset($firstPage->image_path) : url('/img/og-cover.png');
     $pageUrl = route('flyers.show', $flyer->slug);
     $cleanTitle = $flyer->title;
 
@@ -175,7 +176,7 @@
                     </div>
                     <button type="button" data-index="{{ $loop->index }}" aria-label="تكبير صفحة {{ $page->page_number }}" class="lightbox-trigger block w-full cursor-zoom-in focus:outline-none focus:ring-2 focus:ring-[#039652] focus:ring-offset-2">
                         <img
-                            src="{{ $r2DiskUrl . '/' . $page->image_path }}"
+                            src="{{ R2Url::asset($page->image_path) }}"
                             alt="{{ $cleanTitle }} - صفحة {{ $page->page_number }}"
                             width="1200"
                             height="1600"
@@ -230,7 +231,7 @@
     <style>#flyer-lightbox:not(.hidden){display:flex}#flyer-lightbox.hidden{display:none}</style>
     <script>
     document.addEventListener('DOMContentLoaded', function(){
-        const pages = @json($flyer->pages->sortBy('page_number')->values()->map(fn($p) => ['src' => $r2DiskUrl.'/'.$p->image_path, 'alt' => $cleanTitle.' - صفحة '.$p->page_number]));
+        const pages = @json($flyer->pages->sortBy('page_number')->values()->map(fn($p) => ['src' => \App\Support\R2Url::asset($p->image_path), 'alt' => $cleanTitle.' - صفحة '.$p->page_number]));
         if(!pages.length) return;
         let current = 0;
         let zoomed = false;

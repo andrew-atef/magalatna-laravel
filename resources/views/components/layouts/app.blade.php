@@ -128,6 +128,15 @@
         <div class="mx-auto max-w-7xl px-4 sm:px-6">
             <p class="font-bold text-white">جميع الأسعار والعروض تخضع لشروط السلاسل التجارية المعلنة وتاريخ سريانها في مصر.</p>
             <p class="mt-1 text-slate-300">العلامات التجارية والشعارات ملك لأصحابها وناشريها الرسميين.</p>
+            <div class="flex flex-wrap justify-center gap-4 text-xs text-slate-300 mt-4">
+                <a href="{{ route('pages.about') }}" class="hover:text-white transition">من نحن</a>
+                <span>•</span>
+                <a href="{{ route('pages.privacy') }}" class="hover:text-white transition">سياسة الخصوصية</a>
+                <span>•</span>
+                <a href="{{ route('pages.terms') }}" class="hover:text-white transition">شروط الاستخدام</a>
+                <span>•</span>
+                <a href="{{ route('pages.contact') }}" class="hover:text-white transition">اتصل بنا</a>
+            </div>
             <p class="mt-4 text-[#fcc023]/90">© {{ date('Y') }} {{ config('app.name', 'مجلاتنا') }} — منصة متابعة أسعار وتخفيضات السوبرماركت في مصر.</p>
         </div>
     </footer>
