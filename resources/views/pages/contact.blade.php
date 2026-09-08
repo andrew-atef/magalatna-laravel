@@ -18,31 +18,14 @@
 
 <div class="mx-auto max-w-4xl rounded-2xl border border-slate-200 bg-white p-6 sm:p-8 shadow-sm">
 <article class="prose prose-slate max-w-none prose-headings:text-[#023b55] prose-headings:font-black prose-a:text-[#039652] prose-strong:text-[#023b55]">
-    <div class="grid grid-cols-1 md:grid-cols-2 gap-6 my-8 not-prose">
-        <div class="bg-slate-50 p-6 rounded-2xl border border-slate-200">
-            <div class="w-10 h-10 bg-[#023b55] text-white rounded-xl flex items-center justify-center font-bold text-lg mb-4">✉️</div>
-            <h3 class="text-base font-black text-[#023b55] mb-1 not-prose">البريد الإلكتروني العام</h3>
-            <p class="text-xs text-slate-500 mb-3">للاستفسارات العامة والمقترحات والشكاوى:</p>
-            <a href="mailto:contact@magalatna.com" class="text-sm font-bold text-[#039652] hover:underline">contact@magalatna.com</a>
-        </div>
-        <div class="bg-slate-50 p-6 rounded-2xl border border-slate-200">
-            <div class="w-10 h-10 bg-[#023b55] text-white rounded-xl flex items-center justify-center font-bold text-lg mb-4">⚖️</div>
-            <h3 class="text-base font-black text-[#023b55] mb-1 not-prose">الشؤون القانونية وحقوق الملكية</h3>
-            <p class="text-xs text-slate-500 mb-3">لطلبات التدقيق أو إزالة المحتوى (DMCA):</p>
-            <a href="mailto:legal@magalatna.com" class="text-sm font-bold text-[#039652] hover:underline">legal@magalatna.com</a>
+    <div class="my-6 not-prose">
+        <div class="bg-slate-50 p-6 rounded-2xl border border-slate-200 text-center sm:text-right">
+            <div class="mx-auto sm:mx-0 w-10 h-10 bg-[#023b55] text-white rounded-xl flex items-center justify-center font-bold text-lg mb-4">✉️</div>
+            <h3 class="text-base font-black text-[#023b55] mb-1 not-prose">البريد الإلكتروني للتواصل</h3>
+            <p class="text-xs text-slate-500 mb-3">للاستفسارات والمقترحات:</p>
+            <a href="mailto:contact@magalatna.com" class="text-base font-bold text-[#039652] hover:underline">contact@magalatna.com</a>
         </div>
     </div>
-
-    <h2>قنوات التواصل المباشرة</h2>
-    <ul>
-        <li><strong>المقر الإداري:</strong> القاهرة، جمهورية مصر العربية.</li>
-        <li><strong>أوقات الرد:</strong> يقوم فريق العمل بالرد على كافة الرسائل والطلبات في غضون <strong>24 إلى 48 ساعة عمل</strong>.</li>
-    </ul>
-
-    <h2>الإبلاغ عن خطأ في الأسعار</h2>
-    <p>
-        إذا لاحظت وجود أي خطأ في تفريغ سعر سلعة معينة أو تاريخ سريان مجلة، يُرجى تزويدنا برابط الصفحة واسم السلعة وسيقوم الفريق التقني بتدقيقها وتعديلها فوراً لضمان مصداقية البيانات.
-    </p>
 </article>
 </div>
 </x-layouts.app>
