@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace App\Services;
 
+use App\Models\Flyer;
+use Carbon\Carbon;
 use Illuminate\Http\Client\Response;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
@@ -541,24 +543,34 @@ PROMPT;
     }
 
     /**
-     * Editorial Overview prompt — 150 words, 2 paragraphs, high-value fluff-free
+     * Editorial Overview prompt — Strict Structured Bulleted Highlights (150 words, no fluff, numerals only)
      */
     private function editorialPrompt(string $retailerName, string $title, string $validFrom, string $validUntil, array $heroDeals, string $discountRange): string
     {
-        $dealsText = $heroDeals !== [] ? implode("\n", array_map(fn ($d, $i) => ($i + 1).". {$d}", $heroDeals, array_keys($heroDeals))) : 'لا توجد بيانات منتجات';
+        $dealsText = $heroDeals !== [] ? implode("\n", array_map(static fn ($d, $i) => ($i + 1).". {$d}", $heroDeals, array_keys($heroDeals))) : 'لا توجد بيانات منتجات';
 
         return <<<PROMPT
-اكتب مقالاً افتتاحياً تسويقياً باللغة العربية الفصحى المبسطة (150 كلمة، فقرتان فقط) بدون أي كلمة إنجليزية لعرض {$title} من {$retailerName}.
+اكتب مقالاً تحريرياً باللغة العربية الفصحى المبسطة (150 كلمة، فقرتان) بدون أي حشو تسويقي أو نثر خيالي لعرض {$title} من {$retailerName}.
 
-الفقرة 1 (60-70 كلمة): لخص العرض مباشرة — اذكر اسم المتجر، فترة السريان الدقيقة بتوقيت القاهرة {$validFrom} حتى {$validUntil}، ومدى الخصومات العام {$discountRange}. لا مقدمات إنشائية.
+يُمنع منعاً باتاً:
+- العبارات الإنشائية والشاعرية مثل "يلتقي الذكاء الشرائي"، "الصفقات البطولية"، "دقات الساعة"
+- كتابة الأرقام بالحروف مثل "سبعة وأربعين جنيهاً" — يجب استخدام الأرقام العربية القياسية فقط مثل "47.95 ج.م"، "خصم 19%"، "توفير 11.00 ج.م"
 
-الفقرة 2 (80-90 كلمة): استعرض أبرز 3-4 صفقات بطولية بالأسعار الدقيقة قبل وبعد الخصم مع نسبة التوفير، مثال: "لانش بوكس بانانا 1.8 لتر بسعر 149.95 ج.م بدلاً من 220 ج.م بخصم 32%". استخدم البيانات التالية:
+الصيغة الصارمة — نقاط مرقمة:
+أبرز نقاط عرض {$retailerName} ({$validFrom} حتى {$validUntil}):
+- أعلى نسبة خصم: [اسم المنتج والوزن] بسعر [السعر الحالي] ج.م (خصم [النسبة]% وتوفير [مبلغ التوفير] ج.م).
+- [تصنيف السلع، مثل: سلع البقالة الأساسية / المنظفات / مستلزمات الأطفال]: [اسم المنتج] بسعر [السعر الحالي] ج.م (بدلاً من [السعر القديم] ج.م).
+- [منتجات مميزة أخرى]: [اسم المنتج] بسعر [السعر الحالي] ج.م بخصم [النسبة]%.
+- مدة العرض: [ساري اليوم فقط / من {$validFrom} حتى {$validUntil}] بجميع فروع {$retailerName} بمصر حتى نفاذ الكمية.
+
+استخدم البيانات التالية بدقة (الأسعار والنسب كما هي، بدون مسافات حول النقطة العشرية):
 {$dealsText}
+الخصومات العامة: {$discountRange}
 
 قواعد:
-- لا إنجليزية، لا AmanPrice، لا مواقع أخرى
-- نبرة مصرية طبيعية للمستهلك
-- لا تزد عن فقرتين
+- لا إنجليزية، لا مواقع أخرى، لا شعر
+- كل الأسعار والخصومات بالأرقام فقط: "47.95 ج.م" وليس "سبعة وأربعين"
+- التزم بالهيكل النقطي أعلاه حرفياً
 PROMPT;
     }
 
@@ -567,13 +579,13 @@ PROMPT;
      *
      * @throws RuntimeException
      */
-    public function generateEditorialOverview(\App\Models\Flyer $flyer): string
+    public function generateEditorialOverview(Flyer $flyer): string
     {
         $apiKey = $this->apiKey();
         $retailerName = $flyer->retailer?->name ?? $flyer->retailer()->first()?->name ?? 'المتجر';
         $title = $flyer->title ?? 'العرض';
-        $validFrom = $flyer->valid_from instanceof \Carbon\Carbon ? $flyer->valid_from->format('Y-m-d') : (string) $flyer->valid_from;
-        $validUntil = $flyer->valid_until instanceof \Carbon\Carbon ? $flyer->valid_until->format('Y-m-d') : (string) $flyer->valid_until;
+        $validFrom = $flyer->valid_from instanceof Carbon ? $flyer->valid_from->format('Y-m-d') : (string) $flyer->valid_from;
+        $validUntil = $flyer->valid_until instanceof Carbon ? $flyer->valid_until->format('Y-m-d') : (string) $flyer->valid_until;
 
         // Build hero deals with exact prices
         $heroDeals = $flyer->items()->orderByDesc('discount_percent')->limit(4)->get()->map(function ($item) {
@@ -581,6 +593,7 @@ PROMPT;
             $sale = number_format((float) $item->sale_price, 2, '.', '').' ج.م';
             $discount = $item->discount_percent ? round((float) $item->discount_percent).'%' : '';
             $oldPart = $old ? " بدلاً من {$old} بخصم {$discount}" : '';
+
             return "{$item->product_name} بسعر {$sale}{$oldPart}";
         })->all();
 

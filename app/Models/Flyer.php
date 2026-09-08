@@ -148,12 +148,23 @@ class Flyer extends Model
             $until = Carbon::parse($this->valid_until)->locale('ar')->isoFormat('D MMMM YYYY');
             $discount = number_format((float) ($this->relationLoaded('items') ? $this->items->max('discount_percent') : $this->items()->max('discount_percent') ?? 0), 2, '.', '');
             $discount = rtrim(rtrim($discount, '0'), '.');
-            $top = $this->relationLoaded('items') ? $this->items->take(4)->pluck('product_name')->filter()->implode('، ') : $this->items()->limit(4)->pluck('product_name')->implode('، ');
-            $top = $top !== '' ? $top : 'سلع متنوعة';
-            $p1 = "تقدم مجلة {$this->title} من " . ($this->retailer?->name ?? 'المتجر') . " عروضاً حصرية سارية في مصر من {$from} حتى {$until}، بخصومات {$discount}% على تشكيلة واسعة.";
-            $p2 = "يشمل العرض أبرز الصفقات: {$top} بأسعار مخفضة بجميع الفروع وحتى نفاذ الكمية. قارن الأسعار ووفر ميزانيتك.";
-            $text = $p1 . "\n\n" . $p2;
+            $topItems = $this->relationLoaded('items') ? $this->items->take(4) : $this->items()->limit(4)->get();
+            if ($topItems->isEmpty()) {
+                $topBullets = "- سلع غذائية متنوعة بأسعار مخفضة بجميع الفروع\n- منتجات ألبان ومخبوزات بعروض حصرية\n- منظفات ومستلزمات منزلية بخصومات قوية\n- تخفيضات على اللحوم والدواجن الطازجة";
+            } else {
+                $topBullets = $topItems->map(function ($item): string {
+                    $sale = number_format((float) $item->sale_price, 2, '.', '').' ج.م';
+                    $sale = rtrim(rtrim($sale, '0'), '.');
+                    $discount = $item->discount_percent ? ' (خصم '.round((float) $item->discount_percent).'%)' : '';
+
+                    return "- {$item->product_name} بسعر {$sale}{$discount}";
+                })->implode("\n");
+            }
+            $p1 = "تقدم مجلة {$this->title} من ".($this->retailer?->name ?? 'المتجر')." عروضاً حصرية سارية في مصر من {$from} حتى {$until}، بخصومات {$discount}% على تشكيلة واسعة من السلع الغذائية والمستلزمات المنزلية.";
+            $p2 = "أبرز الصفقات في هذا العدد:\n{$topBullets}";
+            $text = $p1."\n\n".$p2;
             $text = (string) preg_replace('/(\d+)\.\s+(\d+%)/u', '$1.$2', $text);
+
             return $text;
         } catch (\Throwable $e) {
             return null;

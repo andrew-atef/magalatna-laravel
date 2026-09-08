@@ -20,13 +20,13 @@
     <meta name="theme-color" content="#023b55">
 
     @php
-        $siteName = config('app.name', 'عروض نت مصر');
+        $siteName = config('app.name', 'مجلاتنا');
         $canonicalUrl = url()->current();
         $r2Url = (string) config('filesystems.disks.r2.url');
         $r2Host = parse_url($r2Url, PHP_URL_HOST);
     @endphp
 
-    <title>{{ $metaTitle ? $metaTitle . ' | ' . $siteName : $siteName . ' | عروض وتخفيضات السوبرماركت في مصر اليوم' }}</title>
+    <title>{{ $metaTitle ? $metaTitle . ' | ' . $siteName : $siteName . ' | مجلات وعروض السوبرماركت في مصر اليوم' }}</title>
     <meta name="description" content="{{ $metaDescription ?? 'تصفح أحدث مجلات وعروض كارفور، كازيون، بيم، هايبر وان، وفتح الله اليوم في مصر. قارن أسعار السلع قبل الشراء ووفر ميزانيتك.' }}">
     <meta name="robots" content="{{ $robots }}">
 
@@ -91,10 +91,10 @@
     <!-- Header - Deep Petrol Navy structure -->
     <header class="sticky top-0 z-40 border-b-2 border-[#023b55]/10 bg-white/95 backdrop-blur">
         <div class="mx-auto flex max-w-7xl items-center justify-between px-4 py-3 sm:px-6">
-            <a href="/" class="flex items-center gap-2 no-underline">
-                <img src="/logo.webp" alt="{{ config('app.name', 'عروض نت') }}" class="h-9 w-auto rounded-xl object-contain bg-white p-0.5 shadow-sm" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'">
+            <a href="/" class="flex items-center gap-2 no-underline" aria-label="{{ config('app.name', 'مجلاتنا') }} - الرئيسية">
+                <img src="/logo.webp" alt="مجلاتنا - عروض وتخفيضات السوبرماركت في مصر" width="140" height="36" class="h-9 w-auto object-contain" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'">
                 <span class="hidden h-9 w-9 items-center justify-center rounded-xl bg-[#023b55] text-white font-black text-xl shadow-md shadow-[#023b55]/20 border border-[#039652]/30">ع</span>
-                <span class="text-xl font-black text-[#023b55]">{{ config('app.name', 'عروض نت') }}</span>
+                <span class="sr-only">{{ config('app.name', 'مجلاتنا') }}</span>
             </a>
 
             <!-- نموذج البحث السريع -->
@@ -128,7 +128,7 @@
         <div class="mx-auto max-w-7xl px-4 sm:px-6">
             <p class="font-bold text-white">جميع الأسعار والعروض تخضع لشروط السلاسل التجارية المعلنة وتاريخ سريانها في مصر.</p>
             <p class="mt-1 text-slate-300">العلامات التجارية والشعارات ملك لأصحابها وناشريها الرسميين.</p>
-            <p class="mt-4 text-[#fcc023]/90">© {{ date('Y') }} {{ config('app.name', 'عروض نت') }} — منصة متابعة أسعار وتخفيضات السوبرماركت في مصر.</p>
+            <p class="mt-4 text-[#fcc023]/90">© {{ date('Y') }} {{ config('app.name', 'مجلاتنا') }} — منصة متابعة أسعار وتخفيضات السوبرماركت في مصر.</p>
         </div>
     </footer>
 

@@ -458,6 +458,7 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
             $discount = rtrim(rtrim($discount, '0'), '.');
             $topProducts = $flyer->items()->limit(5)->pluck('product_name')->filter()->implode('، ');
             $topProducts = $topProducts !== '' ? $topProducts : 'سلع متنوعة';
+
             return "تصفح {$titleForBluf} الساري في مصر حتى {$untilText}، بخصومات تصل إلى {$discount}%. يشمل العرض تخفيضات قوية على {$topProducts} بجميع الفروع وحتى نفاذ الكمية.";
         } catch (Throwable $e) {
             Log::warning('Failed to generate BLUF summary, using ultimate fallback.', [
@@ -484,6 +485,7 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
                     // Fix space bugs
                     $text = (string) preg_replace('/(\d+)\.\s+(\d+%)/u', '$1.$2', $text);
                     $text = (string) preg_replace('/(\d+)\s+%/u', '$1%', $text);
+
                     return $text;
                 }
             } catch (Throwable $e) {
@@ -525,6 +527,7 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
                 if ($old) {
                     return "{$item->product_name} بسعر {$sale} بدلاً من {$old} بخصم {$discount}";
                 }
+
                 return "{$item->product_name} بسعر {$sale}";
             })->implode('، ');
 
@@ -533,7 +536,19 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
             }
 
             $para1 = "تقدم مجلة {$title} من {$retailerName} عروضاً حصرية سارية في مصر من {$from} حتى {$until}، بخصومات {$discountRange} على تشكيلة واسعة من السلع الغذائية والمستلزمات المنزلية.";
-            $para2 = "يشمل العرض أبرز الصفقات: {$heroText} بجميع الفروع وحتى نفاذ الكمية. قارن الأسعار ووفر ميزانيتك مع تحديث يومي للأسعار.";
+            if ($heroDeals->isNotEmpty()) {
+                $bullets = $heroDeals->map(function ($item): string {
+                    $sale = number_format((float) $item->sale_price, 2, '.', '').' ج.م';
+                    $sale = rtrim(rtrim($sale, '0'), '.');
+                    $discount = $item->discount_percent ? ' (خصم '.round((float) $item->discount_percent).'%)' : '';
+                    $old = $item->old_price ? ' بدلاً من '.rtrim(rtrim(number_format((float) $item->old_price, 2, '.', '').' ج.م', '0'), '.') : '';
+
+                    return "- {$item->product_name} بسعر {$sale}{$old}{$discount}";
+                })->implode("\n");
+                $para2 = "أبرز الصفقات في هذا العدد:\n{$bullets}";
+            } else {
+                $para2 = "أبرز الصفقات في هذا العدد:\n- سلع غذائية متنوعة بأسعار مخفضة بجميع الفروع\n- منتجات ألبان ومخبوزات بعروض حصرية\n- منظفات ومستلزمات منزلية بخصومات قوية\n- تخفيضات على اللحوم والدواجن الطازجة";
+            }
 
             $text = $para1."\n\n".$para2;
             $text = (string) preg_replace('/(\d+)\.\s+(\d+%)/u', '$1.$2', $text);
@@ -542,7 +557,7 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
         } catch (Throwable $e) {
             Log::warning('Failed to generate editorial overview, using ultimate fallback.', ['flyer_id' => $flyer->id, 'error' => $e->getMessage()]);
 
-            return "تقدم مجلة {$flyer->title} عروضاً مميزة من ".($flyer->retailer?->name ?? 'المتجر')." سارية في مصر. تشمل المجلة تخفيضات على سلع متنوعة بأسعار تنافسية.";
+            return "تقدم مجلة {$flyer->title} عروضاً مميزة من ".($flyer->retailer?->name ?? 'المتجر').' سارية في مصر. تشمل المجلة تخفيضات على سلع متنوعة بأسعار تنافسية.';
         }
     }
 }

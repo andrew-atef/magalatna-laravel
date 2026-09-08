@@ -18,6 +18,7 @@ use Filament\Tables\Table;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
 use Livewire\Features\SupportFileUploads\TemporaryUploadedFile;
 
@@ -100,6 +101,13 @@ final class FlyerResource extends Resource
                             ->helperText('2-sentence Bottom Line Up Front for search and GEO.')
                             ->columnSpanFull(),
 
+                        Forms\Components\Textarea::make('editorial_overview')
+                            ->label('نص المقال التحريري ونقاط التوفير (مستخرج بالذكاء الاصطناعي - قابل للتعديل بالكامل)')
+                            ->rows(8)
+                            ->helperText('يمكنك تعديل أي نقطة أو رقم أو إضافة ملاحظات قبل النشر.')
+                            ->columnSpanFull()
+                            ->placeholder('سيتم توليده تلقائياً عبر Gemini بصيغة نقطية منظمة، يمكنك تعديله هنا...'),
+
                         Forms\Components\Select::make('applicable_governorates')
                             ->label('Applicable Governorates')
                             ->multiple()
@@ -132,27 +140,62 @@ final class FlyerResource extends Resource
                             ->schema([
                                 Forms\Components\FileUpload::make('image_path')
                                     ->label('Page Image')
-                                    ->disk(self::storageDisk())
+                                    ->disk('r2')
                                     ->directory('flyers/pages')
                                     ->visibility('public')
                                     ->image()
-                                    ->imagePreviewHeight('150')
+                                    ->openable()
+                                    ->downloadable()
+                                    ->imagePreviewHeight('250')
                                     ->maxSize(5120)
                                     ->acceptedFileTypes(['image/jpeg', 'image/png', 'image/webp', 'image/avif', 'image/jpg'])
                                     ->required()
+                                    ->dehydrated(true)
                                     ->helperText(fn (): string => self::isR2Configured() ? 'Stored on R2 — سيتم ضغطه تلقائياً إلى WebP 1200px جودة 80.' : 'R2 not configured — stored locally (public/flyers/pages) كـ WebP.')
+                                    ->getUploadedFileUrlUsing(function (?string $file): ?string {
+                                        if (blank($file)) {
+                                            return null;
+                                        }
+
+                                        $path = ltrim((string) $file, '/');
+
+                                        // Guard: strip duplicate directory prefix if already present
+                                        // to avoid flyers/pages/flyers/pages/... on re-hydration
+                                        // FileUpload stores full relative path (e.g. flyers/pages/ulid.webp)
+                                        // When directory is set, Filament can prepend again — normalize here.
+                                        try {
+                                            return Storage::disk('r2')->url($path);
+                                        } catch (\Throwable $e) {
+                                            Log::warning('Failed to generate R2 preview URL, falling back to public disk.', [
+                                                'path' => $path,
+                                                'error' => $e->getMessage(),
+                                            ]);
+
+                                            try {
+                                                return Storage::disk('public')->url($path);
+                                            } catch (\Throwable $e2) {
+                                                return null;
+                                            }
+                                        }
+                                    })
                                     ->saveUploadedFileUsing(function (TemporaryUploadedFile $file): string {
-                                        $disk = self::storageDisk();
+                                        $disk = 'r2';
                                         /** @var ImageOptimizerService $optimizer */
                                         $optimizer = app(ImageOptimizerService::class);
                                         try {
                                             return $optimizer->processUploadedFile($file, 'flyers/pages', $disk);
                                         } catch (\Throwable $e) {
                                             Log::warning('WebP conversion failed, storing original.', ['error' => $e->getMessage()]);
-                                            // Fallback: store original as-is
+                                            // Fallback: store original as-is with canonical directory
                                             $path = $file->store('flyers/pages', $disk);
 
-                                            return is_string($path) ? $path : 'flyers/pages/'.$file->getClientOriginalName();
+                                            $resolved = is_string($path) ? $path : 'flyers/pages/'.$file->getClientOriginalName();
+
+                                            // Normalize duplicate prefix if any
+                                            $resolved = ltrim($resolved, '/');
+                                            $resolved = (string) preg_replace('#^flyers/pages/flyers/pages/#', 'flyers/pages/', $resolved);
+
+                                            return $resolved;
                                         }
                                     }),
 
