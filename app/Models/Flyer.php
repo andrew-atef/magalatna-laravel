@@ -92,40 +92,104 @@ class Flyer extends Model
         $raw = $this->attributes['bluf_summary'] ?? null;
 
         if (is_string($raw) && trim($raw) !== '') {
-            // فك أي ترميز مزدوج سابق (Double Escaping) وتحويل &quot; إلى نص صافي
             $decoded = html_entity_decode($raw, ENT_QUOTES | ENT_HTML5, 'UTF-8');
-            // إزالة علامات الاقتباس الإنجليزية المسببة لـ &quot; واستبدالها بفاصلة عربية أو بدونها
             $decoded = str_replace(['"', '"', '"', '&quot;', '&#34;'], '', $decoded);
             $decoded = trim($decoded);
-            if ($decoded !== '' && ! preg_match('/[a-zA-Z]/', $decoded)) {
+            // Strict check: must be 2 sentences, contain discount and no English, not just title
+            $isTwoSentences = count(preg_split('/[.!؟]+/u', $decoded, -1, PREG_SPLIT_NO_EMPTY)) >= 2;
+            $hasDiscount = str_contains($decoded, '%') && str_contains($decoded, 'بخصومات');
+            $isShallowTitle = $decoded === $this->attributes['title'] ?? '' || mb_strlen($decoded) < 30;
+            if ($decoded !== '' && ! preg_match('/[a-zA-Z]/', $decoded) && $isTwoSentences && $hasDiscount && ! $isShallowTitle) {
                 return $decoded;
             }
         }
 
-        // Fallback determinist عربي 100% بدون إنجليزية
-        $retailerName = $this->retailer?->name ?? $this->retailer()->first()?->name ?? 'المتجر';
-        $title = $this->title ?? 'العرض';
-        $from = $this->valid_from instanceof Carbon ? $this->valid_from->format('d/m/Y') : (string) $this->valid_from;
-        $until = $this->valid_until instanceof Carbon ? $this->valid_until->format('d/m/Y') : (string) $this->valid_until;
-        $pages = $this->total_pages ?? 1;
-
-        // Ensure valid_from/until are Carbon for format
+        // Fallback high-CTR atomic 2-sentence — 2026 SEO
+        $titleForBluf = $this->title ?? 'العرض';
         try {
-            $from = Carbon::parse($this->valid_from)->format('d/m/Y');
-            $until = Carbon::parse($this->valid_until)->format('d/m/Y');
+            $untilCarbon = Carbon::parse($this->valid_until);
+            $untilText = $untilCarbon->locale('ar')->isoFormat('dddd D MMMM YYYY');
+            if (! preg_match('/[\x{0600}-\x{06FF}]/u', $untilText)) {
+                $untilText = $this->arabicDayName($untilCarbon).' '.$untilCarbon->day.' '.$this->arabicMonthName((int) $untilCarbon->month).' '.$untilCarbon->year;
+            }
         } catch (\Throwable $e) {
-            // keep as is
+            $untilText = (string) $this->valid_until;
+        }
+        $maxDiscount = $this->relationLoaded('items') ? $this->items->max('discount_percent') : $this->items()->max('discount_percent');
+        $discount = number_format((float) ($maxDiscount ?? 0), 2, '.', '');
+        $discount = rtrim(rtrim($discount, '0'), '.');
+        $topProducts = $this->relationLoaded('items')
+            ? $this->items->take(5)->pluck('product_name')->filter()->implode('، ')
+            : $this->items()->limit(5)->pluck('product_name')->implode('، ');
+        $topProducts = $topProducts !== '' ? $topProducts : 'سلع متنوعة';
+
+        return "تصفح {$titleForBluf} الساري في مصر حتى {$untilText}، بخصومات تصل إلى {$discount}%. يشمل العرض تخفيضات قوية على {$topProducts} بجميع الفروع وحتى نفاذ الكمية.";
+    }
+
+    public function getEditorialOverviewAttribute(): ?string
+    {
+        $raw = $this->attributes['editorial_overview'] ?? null;
+        if (is_string($raw) && trim($raw) !== '' && ! preg_match('/[a-zA-Z]/', $raw)) {
+            $decoded = html_entity_decode($raw, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+            $decoded = str_replace(['"', '"', '"', '&quot;'], '', $decoded);
+            $decoded = (string) preg_replace('/(\d+)\.\s+(\d+%)/u', '$1.$2', $decoded);
+            if (trim($decoded) !== '' && ! preg_match('/[a-zA-Z]/', $decoded)) {
+                return $decoded;
+            }
         }
 
-        $count = $this->relationLoaded('items') ? $this->items->count() : $this->items()->count();
-        $maxDiscount = $this->relationLoaded('items') ? $this->items->max('discount_percent') : $this->items()->max('discount_percent');
+        // Fallback 150-word 2 paragraphs if not yet generated
+        if (empty($this->title) || empty($this->valid_from) || empty($this->valid_until)) {
+            return null;
+        }
 
-        // أهم 3 سلع للـ CTR بدون رموز HTML
-        $topProducts = $this->relationLoaded('items')
-            ? $this->items->take(3)->pluck('product_name')->filter()->implode('، ')
-            : $this->items()->limit(3)->pluck('product_name')->implode('، ');
-        $productsPart = $topProducts !== '' ? " وأبرزها {$topProducts}" : '';
+        try {
+            $from = Carbon::parse($this->valid_from)->locale('ar')->isoFormat('D MMMM YYYY');
+            $until = Carbon::parse($this->valid_until)->locale('ar')->isoFormat('D MMMM YYYY');
+            $discount = number_format((float) ($this->relationLoaded('items') ? $this->items->max('discount_percent') : $this->items()->max('discount_percent') ?? 0), 2, '.', '');
+            $discount = rtrim(rtrim($discount, '0'), '.');
+            $top = $this->relationLoaded('items') ? $this->items->take(4)->pluck('product_name')->filter()->implode('، ') : $this->items()->limit(4)->pluck('product_name')->implode('، ');
+            $top = $top !== '' ? $top : 'سلع متنوعة';
+            $p1 = "تقدم مجلة {$this->title} من " . ($this->retailer?->name ?? 'المتجر') . " عروضاً حصرية سارية في مصر من {$from} حتى {$until}، بخصومات {$discount}% على تشكيلة واسعة.";
+            $p2 = "يشمل العرض أبرز الصفقات: {$top} بأسعار مخفضة بجميع الفروع وحتى نفاذ الكمية. قارن الأسعار ووفر ميزانيتك.";
+            $text = $p1 . "\n\n" . $p2;
+            $text = (string) preg_replace('/(\d+)\.\s+(\d+%)/u', '$1.$2', $text);
+            return $text;
+        } catch (\Throwable $e) {
+            return null;
+        }
+    }
 
-        return "تصفح عروض {$retailerName} {$title} السارية في مصر من {$from} حتى {$until} بـ {$pages} صفحات{$productsPart}. تشمل المجلة {$count} عرضاً بتخفيضات تصل إلى ".round((float) ($maxDiscount ?? 0)).'% على أبرز السلع والمستلزمات.';
+    private function arabicMonthName(int $month): string
+    {
+        return match ($month) {
+            1 => 'يناير',
+            2 => 'فبراير',
+            3 => 'مارس',
+            4 => 'أبريل',
+            5 => 'مايو',
+            6 => 'يونيو',
+            7 => 'يوليو',
+            8 => 'أغسطس',
+            9 => 'سبتمبر',
+            10 => 'أكتوبر',
+            11 => 'نوفمبر',
+            12 => 'ديسمبر',
+            default => 'يناير',
+        };
+    }
+
+    private function arabicDayName(Carbon $date): string
+    {
+        return match ((int) $date->dayOfWeek) {
+            0 => 'الأحد',
+            1 => 'الإثنين',
+            2 => 'الثلاثاء',
+            3 => 'الأربعاء',
+            4 => 'الخميس',
+            5 => 'الجمعة',
+            6 => 'السبت',
+            default => $date->locale('ar')->isoFormat('dddd'),
+        };
     }
 }

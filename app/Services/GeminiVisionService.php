@@ -36,7 +36,7 @@ final class GeminiVisionService
      *
      * @throws RuntimeException
      */
-    public function classifyPost(string $postText, ?string $firstImageUrl = null): array
+    public function classifyPost(string $postText, ?string $firstImageUrl = null, int $imageCount = 1): array
     {
         try {
             $apiKey = $this->apiKey();
@@ -55,11 +55,11 @@ final class GeminiVisionService
 
             $parts = [];
 
-            $systemInstruction = $this->classificationPrompt();
+            $systemInstruction = $this->classificationPrompt($imageCount);
 
-            // Post text part
+            // Post text part — inject TOTAL_IMAGES_IN_POST for Flash 1-Day detection
             $parts[] = [
-                'text' => $systemInstruction."\n\nPOST_TEXT:\n".$postText,
+                'text' => $systemInstruction."\n\nTOTAL_IMAGES_IN_POST: {$imageCount}\nPOST_TEXT:\n".$postText,
             ];
 
             // Optional first image for multimodal classification
@@ -465,15 +465,26 @@ final class GeminiVisionService
     }
 
     /**
-     * BLUF Summary prompt — strict Arabic only, 2 sentences, consumer-focused.
+     * BLUF Summary prompt — strict Arabic only, 2 sentences, high-CTR atomic quotable (2026 SEO).
      */
     private function blufPrompt(string $retailerName, string $title, string $validFrom, string $validUntil, array $topProducts, float $maxDiscount, ?string $occasion = null): string
     {
         $productsList = $topProducts !== [] ? implode('، ', array_slice($topProducts, 0, 5)) : 'سلع متنوعة';
-        $occasionText = $occasion !== null && trim($occasion) !== '' ? " المناسبة {$occasion}،" : '';
+        // Occasion is ignored for strict 2-sentence schema — theme is already in title
 
         return <<<PROMPT
-اكتب ملخصاً صحفياً تسويقياً باللغة العربية الفصحى المبسطة في جملتين فقط (BLUF Summary) موجه للمستهلك المصري. اذكر اسم السلسلة {$retailerName}، تاريخ السريان {$validFrom} حتى {$validUntil}،{$occasionText} وأبرز السلع والماركات المذكورة مثل ({$productsList}) ونسبة التخفيض الأعلى {$maxDiscount}%. يُمنع منعاً باتاً كتابة أي كلمة بالإنجليزية أو ذكر أي مواقع أخرى.
+اكتب ملخصاً صحفياً تسويقياً باللغة العربية الفصحى المبسطة في جملتين فقط (BLUF Summary) موجه للمستهلك المصري يحقق أعلى CTR لـ Google AI Overviews و Perplexity.
+
+الصيغة الصارمة — جملتان فقط:
+الجملة 1: "تصفح {$title} الساري في مصر حتى {$validUntil}، بخصومات تصل إلى {$maxDiscount}%."
+الجملة 2: "يشمل العرض تخفيضات قوية على {$productsList} بجميع الفروع وحتى نفاذ الكمية."
+
+قواعد صارمة:
+- استخدم التاريخ باليوم والشهر العربي كما هو: {$validUntil}
+- اذكر نسبة الخصم {$maxDiscount}% بدقة
+- اذكر 3-5 منتجات استراتيجية بالاسم من: {$productsList}
+- يُمنع منعاً باتاً كتابة أي كلمة بالإنجليزية، أي أرقام إنجليزية إضافية خارج التاريخ والنسبة، أو ذكر أي مواقع/منافسين
+- لا تزد عن جملتين، كل جملة تنتهي بنقطة
 PROMPT;
     }
 
@@ -522,9 +533,89 @@ PROMPT;
             $text = implode('. ', array_slice($sentences, 0, 2)).'.';
         }
 
+        // Fix space bugs in numbers: "37. 55%" -> "37.55%"
+        $text = (string) preg_replace('/(\d+)\.\s+(\d+%)/u', '$1.$2', $text);
+        $text = (string) preg_replace('/(\d+)\s+%/u', '$1%', $text);
+
         return $text;
     }
 
+    /**
+     * Editorial Overview prompt — 150 words, 2 paragraphs, high-value fluff-free
+     */
+    private function editorialPrompt(string $retailerName, string $title, string $validFrom, string $validUntil, array $heroDeals, string $discountRange): string
+    {
+        $dealsText = $heroDeals !== [] ? implode("\n", array_map(fn ($d, $i) => ($i + 1).". {$d}", $heroDeals, array_keys($heroDeals))) : 'لا توجد بيانات منتجات';
+
+        return <<<PROMPT
+اكتب مقالاً افتتاحياً تسويقياً باللغة العربية الفصحى المبسطة (150 كلمة، فقرتان فقط) بدون أي كلمة إنجليزية لعرض {$title} من {$retailerName}.
+
+الفقرة 1 (60-70 كلمة): لخص العرض مباشرة — اذكر اسم المتجر، فترة السريان الدقيقة بتوقيت القاهرة {$validFrom} حتى {$validUntil}، ومدى الخصومات العام {$discountRange}. لا مقدمات إنشائية.
+
+الفقرة 2 (80-90 كلمة): استعرض أبرز 3-4 صفقات بطولية بالأسعار الدقيقة قبل وبعد الخصم مع نسبة التوفير، مثال: "لانش بوكس بانانا 1.8 لتر بسعر 149.95 ج.م بدلاً من 220 ج.م بخصم 32%". استخدم البيانات التالية:
+{$dealsText}
+
+قواعد:
+- لا إنجليزية، لا AmanPrice، لا مواقع أخرى
+- نبرة مصرية طبيعية للمستهلك
+- لا تزد عن فقرتين
+PROMPT;
+    }
+
+    /**
+     * Generate Editorial Overview via Gemini — 150 words, 2 paragraphs
+     *
+     * @throws RuntimeException
+     */
+    public function generateEditorialOverview(\App\Models\Flyer $flyer): string
+    {
+        $apiKey = $this->apiKey();
+        $retailerName = $flyer->retailer?->name ?? $flyer->retailer()->first()?->name ?? 'المتجر';
+        $title = $flyer->title ?? 'العرض';
+        $validFrom = $flyer->valid_from instanceof \Carbon\Carbon ? $flyer->valid_from->format('Y-m-d') : (string) $flyer->valid_from;
+        $validUntil = $flyer->valid_until instanceof \Carbon\Carbon ? $flyer->valid_until->format('Y-m-d') : (string) $flyer->valid_until;
+
+        // Build hero deals with exact prices
+        $heroDeals = $flyer->items()->orderByDesc('discount_percent')->limit(4)->get()->map(function ($item) {
+            $old = $item->old_price ? number_format((float) $item->old_price, 2, '.', '').' ج.م' : null;
+            $sale = number_format((float) $item->sale_price, 2, '.', '').' ج.م';
+            $discount = $item->discount_percent ? round((float) $item->discount_percent).'%' : '';
+            $oldPart = $old ? " بدلاً من {$old} بخصم {$discount}" : '';
+            return "{$item->product_name} بسعر {$sale}{$oldPart}";
+        })->all();
+
+        $discountRange = 'تصل إلى '.number_format((float) ($flyer->items()->max('discount_percent') ?? 0), 2, '.', '').'%';
+        $discountRange = rtrim(rtrim($discountRange, '0'), '.');
+        // Fix space bug
+        $discountRange = str_replace('. ', '.', $discountRange);
+
+        $prompt = $this->editorialPrompt($retailerName, $title, $validFrom, $validUntil, $heroDeals, $discountRange);
+
+        $payload = [
+            'contents' => [['role' => 'user', 'parts' => [['text' => $prompt]]]],
+            'generationConfig' => ['temperature' => 0.7, 'topP' => 0.95, 'topK' => 40, 'responseMimeType' => 'text/plain'],
+        ];
+
+        $raw = $this->callGeminiRawText($payload, $apiKey);
+        $text = trim(html_entity_decode($raw, ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+        $text = str_replace(['"', '"', '"', '&quot;'], '', $text);
+        if (preg_match('/[a-zA-Z]/', $text)) {
+            throw new RuntimeException('Editorial contains English');
+        }
+        // Ensure 2 paragraphs
+        $paragraphs = preg_split('/\n\s*\n/u', $text, -1, PREG_SPLIT_NO_EMPTY);
+        if (count($paragraphs) > 2) {
+            $text = implode("\n\n", array_slice($paragraphs, 0, 2));
+        }
+        // Fix number spaces
+        $text = (string) preg_replace('/(\d+)\.\s+(\d+%)/u', '$1.$2', $text);
+
+        return $text;
+    }
+
+    /**
+     * Editorial Overview prompt — 150 words, 2 paragraphs, fluff-free
+     */
     /**
      * Raw text call without JSON schema (for BLUF).
      *
@@ -552,9 +643,9 @@ PROMPT;
     }
 
     /**
-     * Classification prompt with Egyptian retail domain knowledge.
+     * Classification prompt with Egyptian retail domain knowledge — Flash 1-Day aware, teaser-proof, no date invention.
      */
-    private function classificationPrompt(): string
+    private function classificationPrompt(int $imageCount = 1): string
     {
         $today = now('Africa/Cairo')->format('Y-m-d');
 
@@ -562,25 +653,43 @@ PROMPT;
 You are the Gatekeeper for عروض نت (Egyptian retail flyer aggregator).
 
 Current date (Africa/Cairo): {$today}. Assume year 2026 if year not explicitly visible in post/image.
+TOTAL_IMAGES_IN_POST is provided alongside POST_TEXT — use it for Flash 1-Day detection.
 
-Classify the POST_TEXT (and optional image) as either a real retail flyer/catalog or NOT.
+Classify the POST_TEXT (and optional first image) as either a real retail flyer/catalog or NOT.
 
 A REAL FLYER = A supermarket / hypermarket / pharmacy / electronics retailer catalog that contains:
 - Multiple product offers with prices (e.g., Carrefour, Hyperone, Kazyon, BIM, Panda, Seoudi, Spinneys)
 - Titles like "عروض", "كتالوج", "مجلة العروض", "Offers", "Savings"
-- Valid date ranges (e.g., "من 10 سبتمبر حتى 20 سبتمبر", "valid from/to")
+- Valid date ranges (e.g., "من 10 سبتمبر حتى 20 سبتمبر", "valid from/to") OR a single specific day for Flash deals (see below)
 - Sometimes governorate-specific availability.
 
-NOT A FLYER = Contest / giveaway ("مسابقة", "اربح", "جائزة"), recipe ("وصفة"), branch opening/announcement ("افتتاح فرع جديد", "مواعيد العمل"), meme/joke, job ad, political/news, single product ad without catalog context.
+Flash 1-Day Deals / عرض اليوم الواحد / عروض طازج — VALID FLYER DEFINITION:
+An album with multiple images (TOTAL_IMAGES_IN_POST >= 2) where each image features a discounted staple commodity for a single specific day (e.g., "ساري يوم الأربعاء 9 سبتمبر فقط" or "عرض الإثنين 7 سبتمبر" or "عروض طازج اليوم") IS A VALID FLYER (is_flyer = true). This is NOT a single product ad — the album as a whole is the catalog. For single-day offers, set both valid_from and valid_until to that exact same date (e.g., "الأربعاء 9 سبتمبر" => valid_from=2026-09-09 and valid_until=2026-09-09).
+
+NOT A FLYER = Contest / giveaway ("مسابقة", "اربح", "جائزة"), recipe ("وصفة"), branch opening/announcement ("افتتاح فرع جديد", "مواعيد العمل"), meme/joke, job ad, political/news, single product ad without catalog context (single image with one product and no date range, unless it is part of a multi-image Flash album as defined above).
+
+STRICTLY REJECT Teaser/Reminder spam — MUST return is_flyer = false:
+- Any post that says "قبل ما العروض والكميات تخلص", "قبل ما العروض تخلص", "فاضلك ايه", "فاضل ايه", "اشتري اللي ناقصك", "الحق العروض", "قبل ما تخلص"
+- Any post that links to an older post for remaining offers: "باقي العروض في البوست ده", "باقي العروض هنا", "شوف باقي العروض", "البوست ده فيه باقي"
+- Any reminder that contains no new explicit validity dates and only urges to buy before expiry — even if it mentions a retailer name.
 
 Instructions:
-- is_flyer = true ONLY if this is a genuine multi-product price catalog.
-- reason = concise Arabic or English explanation (1 sentence) why you classified as flyer or not.
-- flyer_title = short clean title from post if is_flyer, else null. Extract from post header (e.g., "عروض كارفور من 12 إلى 20 سبتمبر").
-- valid_from / valid_until = Extract dates mentioned in post/image. Normalize to YYYY-MM-DD. CRITICAL: If year not visible, use 2026 (current year). Today is {$today}. Example: "8 سبتمبر حتى 14 سبتمبر" => 2026-09-08 to 2026-09-14. If not found and is_flyer=true, estimate 7-day window from {$today}; if is_flyer=false, return null. Always return string "YYYY-MM-DD" or null.
+- is_flyer = true ONLY if this is a genuine multi-product price catalog OR a Flash 1-Day album (TOTAL_IMAGES_IN_POST >=2 with single-day staple offers) as defined above.
+- reason = concise Arabic explanation (1 sentence) why you classified as flyer or not.
+- flyer_title = STRICTLY ENFORCE Egyptian SEO Title Formulas (ANTI-CANNIBALIZATION):
+  * FORMULA A (Single-Day / Flash Deals):
+    "عروض [اسم المتجر] [اسم اليوم بالعربية] [رقم اليوم] [اسم الشهر بالعربية] [السنة] | عرض اليوم الواحد"
+    Example: "عروض كازيون الأربعاء 9 سبتمبر 2026 | عرض اليوم الواحد"
+  * FORMULA B (Multi-Day / Weekly Magazine):
+    "عروض [اسم المتجر] من [يوم البداية] حتى [يوم النهاية] [اسم الشهر بالعربية] [السنة] | [اسم المجلة/المناسبة إن وجدت]"
+    Example: "عروض كازيون من 8 حتى 15 سبتمبر 2026 | مجلة العودة للمدارس"
+    Example without specific theme: "عروض كارفور من 10 حتى 20 سبتمبر 2026 | مجلة العروض والتوفير"
+  * Hard Constraint: NEVER return shallow titles like "عروض كازيون" or "عروض المدرسة". The title MUST include the exact dates and month in Arabic. Keep under 65 chars where possible, front-load brand and dates.
+- valid_from / valid_until = Extract ONLY explicit, verifiable dates stated in caption or image. Normalize to YYYY-MM-DD. CRITICAL: If year not visible, use 2026 (current year). Today is {$today}. Examples: "8 سبتمبر حتى 14 سبتمبر" => 2026-09-08 to 2026-09-14; "الأربعاء 9 سبتمبر فقط" => 2026-09-09 to 2026-09-09. NEVER invent, estimate, or hallucinate dates. If no explicit, verifiable date range or specific single day is stated, you MUST return is_flyer = false, valid_from = null, and valid_until = null.
+- Applicable only if is_flyer = true and an explicit date is present. Otherwise is_flyer must be false.
 - applicable_governorates = List of Egyptian governorates mentioned (Arabic names e.g., "القاهرة", "الجيزة", "الإسكندرية" or English "Cairo","Giza"). Return [] if applies to all Egypt / no restriction mentioned.
 
-Be strict: If unsure, prefer is_flyer=false.
+Be strict: If unsure, or if no explicit date is verifiable, prefer is_flyer=false. Never invent dates.
 PROMPT;
     }
 

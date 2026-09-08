@@ -17,7 +17,7 @@
 
     <link rel="icon" type="image/svg+xml" href="/favicon.svg">
     <link rel="alternate icon" href="/favicon.ico">
-    <meta name="theme-color" content="#0284c7">
+    <meta name="theme-color" content="#023b55">
 
     @php
         $siteName = config('app.name', 'عروض نت مصر');
@@ -73,7 +73,9 @@
             ],
         ];
     @endphp
-    <script type="application/ld+json">{!! json_encode($organizationSchema, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) !!}</script>
+    @if (! request()->routeIs('flyers.show'))
+        <script type="application/ld+json">{!! json_encode($organizationSchema, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) !!}</script>
+    @endif
 
     @vite(['resources/css/app.css', 'resources/js/app.js'])
 
@@ -84,14 +86,15 @@
     @stack('head_meta')
     @stack('schema')
 </head>
-<body class="min-h-screen bg-slate-50 text-slate-900 antialiased selection:bg-sky-600 selection:text-white">
+<body class="min-h-screen bg-[#f8fafc] text-slate-900 antialiased selection:bg-[#039652] selection:text-white">
 
-    <!-- Header -->
-    <header class="sticky top-0 z-40 border-b border-slate-200 bg-white/95 backdrop-blur">
+    <!-- Header - Deep Petrol Navy structure -->
+    <header class="sticky top-0 z-40 border-b-2 border-[#023b55]/10 bg-white/95 backdrop-blur">
         <div class="mx-auto flex max-w-7xl items-center justify-between px-4 py-3 sm:px-6">
             <a href="/" class="flex items-center gap-2 no-underline">
-                <span class="flex h-9 w-9 items-center justify-center rounded-xl bg-sky-600 text-white font-black text-xl shadow-md shadow-sky-600/20">ع</span>
-                <span class="text-xl font-black text-slate-900">{{ config('app.name', 'عروض نت') }}</span>
+                <img src="/logo.webp" alt="{{ config('app.name', 'عروض نت') }}" class="h-9 w-auto rounded-xl object-contain bg-white p-0.5 shadow-sm" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'">
+                <span class="hidden h-9 w-9 items-center justify-center rounded-xl bg-[#023b55] text-white font-black text-xl shadow-md shadow-[#023b55]/20 border border-[#039652]/30">ع</span>
+                <span class="text-xl font-black text-[#023b55]">{{ config('app.name', 'عروض نت') }}</span>
             </a>
 
             <!-- نموذج البحث السريع -->
@@ -101,16 +104,16 @@
                     name="q"
                     value="{{ request('q') }}"
                     placeholder="ابحث عن سلعة (أرز، زيت، جبنة، كارفور...)"
-                    class="w-full rounded-xl border border-slate-200 bg-slate-50 px-4 py-2 pr-10 text-xs font-medium focus:border-sky-500 focus:bg-white focus:outline-none"
+                    class="w-full rounded-xl border border-slate-200 bg-slate-50 px-4 py-2 pr-10 text-xs font-medium text-[#023b55] placeholder:text-slate-400 focus:border-[#039652] focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#039652]/20"
                 >
-                <button type="submit" class="absolute right-3 top-2.5 text-slate-400 hover:text-sky-600">
+                <button type="submit" class="absolute right-3 top-2.5 text-slate-400 hover:text-[#039652] transition-colors">
                     <svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/></svg>
                 </button>
             </form>
 
-            <nav class="flex items-center gap-3 text-xs font-bold text-slate-600">
-                <a href="{{ route('home') }}" class="hover:text-sky-600">الرئيسية</a>
-                <a href="{{ route('home', ['type' => 'magazines']) }}" class="hover:text-sky-600">المجلات الكاملة</a>
+            <nav class="flex items-center gap-3 text-xs font-bold text-[#023b55]">
+                <a href="{{ route('home') }}" class="hover:text-[#039652] transition-colors">الرئيسية</a>
+                <a href="{{ route('home', ['type' => 'magazines']) }}" class="hover:text-[#039652] transition-colors">المجلات الكاملة</a>
             </nav>
         </div>
     </header>
@@ -120,12 +123,12 @@
         {{ $slot }}
     </main>
 
-    <!-- Footer -->
-    <footer class="mt-16 border-t border-slate-200 bg-white py-10 text-center text-xs text-slate-500">
+    <!-- Footer - Deep Petrol Navy -->
+    <footer class="mt-16 border-t-2 border-[#023b55]/15 bg-[#023b55] py-10 text-center text-xs">
         <div class="mx-auto max-w-7xl px-4 sm:px-6">
-            <p class="font-bold text-slate-700">جميع الأسعار والعروض تخضع لشروط السلاسل التجارية المعلنة وتاريخ سريانها في مصر.</p>
-            <p class="mt-1">العلامات التجارية والشعارات ملك لأصحابها وناشريها الرسميين.</p>
-            <p class="mt-4">© {{ date('Y') }} {{ config('app.name', 'عروض نت') }} — منصة متابعة أسعار وتخفيضات السوبرماركت في مصر.</p>
+            <p class="font-bold text-white">جميع الأسعار والعروض تخضع لشروط السلاسل التجارية المعلنة وتاريخ سريانها في مصر.</p>
+            <p class="mt-1 text-slate-300">العلامات التجارية والشعارات ملك لأصحابها وناشريها الرسميين.</p>
+            <p class="mt-4 text-[#fcc023]/90">© {{ date('Y') }} {{ config('app.name', 'عروض نت') }} — منصة متابعة أسعار وتخفيضات السوبرماركت في مصر.</p>
         </div>
     </footer>
 

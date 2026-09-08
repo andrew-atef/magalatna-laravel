@@ -51,12 +51,12 @@
         <script type="application/ld+json">{!! json_encode($collectionSchema, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) !!}</script>
     @endpush
 
-    <!-- Breadcrumb -->
+    <!-- Breadcrumb - Navy -->
     <nav class="mb-4 text-xs font-semibold text-slate-500" aria-label="Breadcrumb">
         <ol class="flex items-center gap-1.5">
-            <li><a href="{{ route('home') }}" class="hover:text-sky-600">الرئيسية</a></li>
+            <li><a href="{{ route('home') }}" class="hover:text-[#039652]">الرئيسية</a></li>
             <li>/</li>
-            <li class="text-slate-900">{{ $retailer->name }}</li>
+            <li class="text-[#023b55] font-bold">{{ $retailer->name }}</li>
         </ol>
     </nav>
 
@@ -67,37 +67,37 @@
                 @if ($logoUrl)
                     <img src="{{ $logoUrl }}" alt="{{ $retailer->name }}" class="h-full w-full object-contain p-2">
                 @else
-                    <span class="text-2xl font-black text-sky-600">{{ mb_substr($retailer->name, 0, 1) }}</span>
+                    <span class="text-2xl font-black text-[#039652]">{{ mb_substr($retailer->name, 0, 1) }}</span>
                 @endif
             </div>
             <div class="flex-1">
-                <h1 class="text-2xl font-black text-slate-900 sm:text-3xl">عروض {{ $retailer->name }} مصر اليوم</h1>
+                <h1 class="text-2xl font-black text-[#023b55] sm:text-3xl">عروض {{ $retailer->name }} مصر اليوم</h1>
                 <p class="mt-2 max-w-3xl text-sm leading-relaxed text-slate-600">
-                    تابع أحدث مجلات وعروض <span class="font-bold text-slate-900">{{ $retailer->name }}</span> في مصر —更新 يومي لأسعار السلع، الخصومات الحصرية ومقارنة الأسعار قبل الشراء. 
+                    تابع أحدث مجلات وعروض <span class="font-bold text-[#023b55]">{{ $retailer->name }}</span> في مصر — تحديث يومي لأسعار السلع، الخصومات الحصرية ومقارنة الأسعار قبل الشراء.
                     @if ($retailer->website_url)
-                        <a href="{{ $retailer->website_url }}" target="_blank" rel="noopener" class="text-sky-600 hover:underline">الموقع الرسمي</a>
+                        <a href="{{ $retailer->website_url }}" target="_blank" rel="noopener" class="text-[#039652] hover:underline">الموقع الرسمي</a>
                     @endif
                 </p>
                 <div class="mt-4 flex flex-wrap gap-2">
-                    <span class="inline-flex items-center gap-1.5 rounded-full bg-emerald-50 px-3 py-1 text-xs font-bold text-emerald-700">
-                        <span class="h-2 w-2 rounded-full bg-emerald-500"></span>
+                    <span class="inline-flex items-center gap-1.5 rounded-full bg-[#039652]/10 px-3 py-1 text-xs font-bold text-[#039652] border border-[#039652]/20">
+                        <span class="h-2 w-2 rounded-full bg-[#039652]"></span>
                         {{ $activeCount }} مجلة سارية الآن
                     </span>
                     <span class="inline-flex items-center rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold text-slate-600">
                         آخر تحديث: {{ $retailer->updated_at->format('d/m/Y') }}
                     </span>
                     @if ($retailer->is_active)
-                        <span class="inline-flex items-center rounded-full bg-sky-50 px-3 py-1 text-xs font-bold text-sky-700">متجر نشط</span>
+                        <span class="inline-flex items-center rounded-full bg-[#023b55]/10 px-3 py-1 text-xs font-bold text-[#023b55] border border-[#023b55]/15">متجر نشط</span>
                     @endif
                 </div>
             </div>
         </div>
     </section>
 
-    <!-- Active Flyers Grid -->
+    <!-- Active Flyers Grid - Navy headings -->
     <section class="mb-12">
         <div class="mb-4 flex items-center justify-between">
-            <h2 class="text-lg font-black text-slate-900 sm:text-xl">مجلات {{ $retailer->name }} السارية الآن</h2>
+            <h2 class="text-lg font-black text-[#023b55] sm:text-xl">مجلات {{ $retailer->name }} السارية الآن</h2>
             <span class="text-xs font-semibold text-slate-500">{{ $activeFlyers->total() }} مجلة</span>
         </div>
 
@@ -105,7 +105,7 @@
             <div class="rounded-2xl border border-dashed border-slate-300 bg-white p-12 text-center">
                 <p class="text-sm font-bold text-slate-700">لا توجد مجلات سارية حالياً لـ {{ $retailer->name }}.</p>
                 <p class="mt-1 text-xs text-slate-500">تابعنا قريباً — نحدّث العروض فور صدورها.</p>
-                <a href="{{ route('home') }}" class="mt-4 inline-flex rounded-xl bg-sky-600 px-4 py-2 text-xs font-bold text-white hover:bg-sky-700">تصفح كل العروض</a>
+                <a href="{{ route('home') }}" class="mt-4 inline-flex rounded-xl bg-[#039652] px-4 py-2 text-xs font-bold text-white hover:bg-[#027a42]">تصفح كل العروض</a>
             </div>
         @else
             <div class="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4">
@@ -125,26 +125,26 @@
                         <a href="{{ route('flyers.show', $flyer->slug) }}" class="relative aspect-[3/4] overflow-hidden bg-slate-100">
                             <img src="{{ $coverUrl }}" alt="{{ $flyer->title }}" width="600" height="800" loading="lazy" class="h-full w-full object-cover transition duration-300 group-hover:scale-105">
                             @if ($isFuture)
-                                <span class="absolute right-2 top-2 rounded-lg bg-amber-500 px-2 py-1 text-[11px] font-bold text-white shadow">يبدأ {{ $from->format('d/m') }}</span>
+                                <span class="absolute right-2 top-2 rounded-lg bg-[#fcc023] px-2 py-1 text-[11px] font-bold text-slate-900 shadow">يبدأ {{ $from->format('d/m') }}</span>
                             @elseif ($isPast)
                                 <span class="absolute right-2 top-2 rounded-lg bg-slate-600 px-2 py-1 text-[11px] font-bold text-white shadow">منتهي</span>
                             @else
-                                <span class="absolute right-2 top-2 rounded-lg bg-emerald-600 px-2 py-1 text-[11px] font-bold text-white shadow">سارٍ حتى {{ $until->format('d/m') }}</span>
+                                <span class="absolute right-2 top-2 rounded-lg bg-[#039652] px-2 py-1 text-[11px] font-bold text-white shadow">سارٍ حتى {{ $until->format('d/m') }}</span>
                             @endif
                             <span class="absolute left-2 top-2 rounded-lg bg-slate-900/80 px-2 py-1 text-[11px] font-bold text-white backdrop-blur">{{ $flyer->total_pages }} صفحة</span>
                         </a>
                         <div class="flex flex-1 flex-col p-4">
-                            <h3 class="line-clamp-2 text-sm font-bold text-slate-900 group-hover:text-sky-600">
+                            <h3 class="line-clamp-2 text-sm font-bold text-[#023b55] group-hover:text-[#039652]">
                                 <a href="{{ route('flyers.show', $flyer->slug) }}">{{ $flyer->title }}</a>
                             </h3>
                             <div class="mt-3 flex items-center justify-between border-t border-slate-100 pt-3 text-[11px]">
                                 <span class="text-slate-500">{{ $from->format('d/m') }} → {{ $until->format('d/m/Y') }}</span>
                                 @if ($isFuture)
-                                    <span class="rounded bg-amber-50 px-2 py-0.5 text-[10px] font-bold text-amber-700">يبدأ قريباً {{ $from->format('d/m') }}</span>
+                                    <span class="rounded bg-[#fcc023]/20 px-2 py-0.5 text-[10px] font-bold text-slate-900">يبدأ قريباً {{ $from->format('d/m') }}</span>
                                 @elseif ($isPast)
                                     <span class="rounded bg-slate-100 px-2 py-0.5 text-[10px] font-bold text-slate-500">منتهي</span>
                                 @else
-                                    <span class="font-bold text-emerald-600">سارٍ الآن</span>
+                                    <span class="rounded bg-[#039652]/10 px-2 py-0.5 font-bold text-[#039652]">سارٍ الآن</span>
                                 @endif
                             </div>
                         </div>
@@ -157,11 +157,11 @@
         @endif
     </section>
 
-    <!-- Recently Expired (Price History) -->
+    <!-- Recently Expired (Price History) - Navy -->
     @if ($expiredFlyers->isNotEmpty())
         <section class="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
             <div class="mb-4 flex items-center justify-between">
-                <h2 class="text-lg font-black text-slate-900">مجلات منتهية حديثاً — أرشيف أسعار {{ $retailer->name }} (آخر 30 يوم)</h2>
+                <h2 class="text-lg font-black text-[#023b55]">مجلات منتهية حديثاً — أرشيف أسعار {{ $retailer->name }} (آخر 30 يوم)</h2>
                 <span class="text-xs font-semibold text-slate-500">{{ $expiredFlyers->count() }} مجلة</span>
             </div>
             <p class="mb-4 text-xs text-slate-500">للمقارنة ومعرفة تاريخ الأسعار قبل الشراء.</p>
