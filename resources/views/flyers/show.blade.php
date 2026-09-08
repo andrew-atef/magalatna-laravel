@@ -168,7 +168,7 @@
         </div>
 
         {{-- Single focused column max-w-3xl for legibility: A4 vertical pages need full width on desktop --}}
-        <div class="grid grid-cols-1 gap-6 max-w-3xl mx-auto">
+        <div class="grid grid-cols-1 gap-4 max-w-3xl mx-auto">
             @foreach ($flyer->pages->sortBy('page_number') as $page)
                 <div class="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
                     <div class="border-b border-slate-100 bg-slate-50 px-4 py-2 text-xs font-bold text-slate-600">
@@ -180,7 +180,7 @@
                             alt="{{ $cleanTitle }} - صفحة {{ $page->page_number }}"
                             width="1200"
                             height="1600"
-                            loading="lazy"
+                            @if ($loop->first) loading="eager" fetchpriority="high" decoding="async" @else loading="lazy" decoding="async" @endif
                             class="w-full object-contain"
                         >
                     </button>
@@ -220,10 +220,18 @@
 
     @if (!empty($flyer->editorial_overview))
     <!-- Editorial Overview — 150 words, 2 paragraphs, high-value - Navy/Green -->
-    <section class="mb-8 rounded-2xl border border-[#023b55]/10 bg-white p-6 shadow-sm">
+    <section class="mb-6 rounded-2xl border border-[#023b55]/10 bg-white p-5 sm:p-6 shadow-sm">
         <h2 class="mb-3 text-lg font-black text-[#023b55]">نظرة سريعة على العرض</h2>
-        <div class="prose prose-sm max-w-none text-sm leading-relaxed text-slate-700 prose-headings:text-[#023b55] prose-strong:text-[#023b55]" style="white-space: pre-line;">
-            {!! nl2br(e($flyer->editorial_overview)) !!}
+        @php
+            $cleanEditorial = trim((string) $flyer->editorial_overview);
+            // Normalize: remove trailing spaces, collapse 3+ newlines to 2, strip blank lines between bullets
+            $cleanEditorial = (string) preg_replace("/[ \t]+\n/u", "\n", $cleanEditorial);
+            $cleanEditorial = (string) preg_replace("/\n{3,}/u", "\n\n", $cleanEditorial);
+            // Collapse empty line between heading and first bullet: "العدد:\n\n- " -> "العدد:\n- "
+            $cleanEditorial = (string) preg_replace("/:\n\n-/u", ":\n- ", $cleanEditorial);
+        @endphp
+        <div class="prose prose-sm max-w-none text-[13px] leading-6 text-slate-700 prose-headings:text-[#023b55] prose-strong:text-[#023b55] prose-p:my-2 prose-ul:my-2 prose-li:my-1">
+            {!! nl2br(e($cleanEditorial)) !!}
         </div>
     </section>
     @endif
