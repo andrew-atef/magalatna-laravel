@@ -13,43 +13,79 @@
     :meta-description="$metaDesc"
     :og-title="$metaTitle"
     :og-description="$metaDesc"
-    :og-image="$logoUrl ?: url('/img/og-cover.png')"
+    :og-image="url('/img/og-cover.png')"
     og-type="website"
 >
     @push('schema')
         @php
-            $breadcrumbSchema = [
-                '@context' => 'https://schema.org',
-                '@type' => 'BreadcrumbList',
-                'itemListElement' => [
-                    ['@type' => 'ListItem', 'position' => 1, 'name' => 'الرئيسية', 'item' => url('/')],
-                    ['@type' => 'ListItem', 'position' => 2, 'name' => $retailer->name, 'item' => $canonicalUrl],
+            $siteNameForSchema = config('app.name', 'مجلاتنا');
+            $orgId = url('/') . '#organization';
+            $websiteId = url('/') . '#website';
+            $breadcrumbId = $canonicalUrl . '#breadcrumb';
+            $webpageId = $canonicalUrl . '#webpage';
+            $retailerGraph = [
+                [
+                    '@type' => 'Organization',
+                    '@id' => $orgId,
+                    'name' => $siteNameForSchema,
+                    'url' => url('/'),
+                    'logo' => [
+                        '@type' => 'ImageObject',
+                        'url' => url('/favicon.svg'),
+                        'width' => 140,
+                        'height' => 36,
+                    ],
+                    'areaServed' => 'EG',
+                ],
+                [
+                    '@type' => 'WebSite',
+                    '@id' => $websiteId,
+                    'url' => url('/'),
+                    'name' => $siteNameForSchema,
+                    'publisher' => ['@id' => $orgId],
+                ],
+                [
+                    '@type' => 'BreadcrumbList',
+                    '@id' => $breadcrumbId,
+                    'itemListElement' => [
+                        ['@type' => 'ListItem', 'position' => 1, 'name' => 'الرئيسية', 'item' => url('/')],
+                        ['@type' => 'ListItem', 'position' => 2, 'name' => $retailer->name, 'item' => $canonicalUrl],
+                    ],
+                ],
+                [
+                    '@type' => 'CollectionPage',
+                    '@id' => $webpageId,
+                    'name' => $metaTitle,
+                    'description' => $metaDesc,
+                    'url' => $canonicalUrl,
+                    'isPartOf' => ['@id' => $websiteId],
+                    'breadcrumb' => ['@id' => $breadcrumbId],
+                    'about' => [
+                        '@type' => 'Organization',
+                        'name' => $retailer->name,
+                        'url' => $retailer->website_url ?: url('/'),
+                        'logo' => $retailer->logo_path ? \App\Support\R2Url::asset($retailer->logo_path) : url('/favicon.svg'),
+                    ],
+                    'mainEntity' => [
+                        '@type' => 'ItemList',
+                        'numberOfItems' => $activeFlyers->total(),
+                        'itemListElement' => $activeFlyers->getCollection()->values()->map(function ($flyer, $idx) {
+                            return [
+                                '@type' => 'ListItem',
+                                'position' => $idx + 1,
+                                'url' => route('flyers.show', $flyer->slug),
+                                'name' => $flyer->title,
+                            ];
+                        })->all(),
+                    ],
                 ],
             ];
-            $collectionSchema = [
+            $retailerUnified = [
                 '@context' => 'https://schema.org',
-                '@type' => 'CollectionPage',
-                'name' => $metaTitle,
-                'description' => $metaDesc,
-                'url' => $canonicalUrl,
-                'isPartOf' => ['@type' => 'WebSite', 'name' => config('app.name', 'عروض نت'), 'url' => url('/')],
-                'about' => ['@type' => 'Organization', 'name' => $retailer->name, 'url' => $retailer->website_url ?: url('/')],
-                'mainEntity' => [
-                    '@type' => 'ItemList',
-                    'numberOfItems' => $activeFlyers->total(),
-                    'itemListElement' => $activeFlyers->map(function ($flyer, $idx) {
-                        return [
-                            '@type' => 'ListItem',
-                            'position' => $idx + 1,
-                            'url' => route('flyers.show', $flyer->slug),
-                            'name' => $flyer->title,
-                        ];
-                    })->all(),
-                ],
+                '@graph' => $retailerGraph,
             ];
         @endphp
-        <script type="application/ld+json">{!! json_encode($breadcrumbSchema, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) !!}</script>
-        <script type="application/ld+json">{!! json_encode($collectionSchema, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) !!}</script>
+        <script type="application/ld+json">{!! json_encode($retailerUnified, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) !!}</script>
     @endpush
 
     <!-- Breadcrumb - Navy -->

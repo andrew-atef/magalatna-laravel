@@ -65,4 +65,13 @@ class Retailer extends Model
     {
         return $this->hasMany(Flyer::class);
     }
+
+    public function latestActiveFlyer(): ?Flyer
+    {
+        return $this->flyers()
+            ->where('status', 'published')
+            ->whereDate('valid_until', '>=', now('Africa/Cairo')->toDateString())
+            ->latest('valid_from')
+            ->first();
+    }
 }

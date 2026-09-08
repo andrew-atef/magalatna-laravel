@@ -46,7 +46,7 @@
         <url>
             <loc>{{ route('flyers.show', $flyer->slug) }}</loc>
             <lastmod>{{ $flyer->updated_at->toAtomString() }}</lastmod>
-            <changefreq>monthly</changefreq>
+            <changefreq>never</changefreq>
             <priority>0.3</priority>
         </url>
     @endforeach

@@ -16,6 +16,9 @@ return Application::configure(basePath: dirname(__DIR__))
         $middleware->alias([
             'internal.api' => InternalApiKeyMiddleware::class,
         ]);
+        $middleware->web(append: [
+            \App\Http\Middleware\ProvideMarkdownForAiMiddleware::class,
+        ]);
     })
     ->withExceptions(function (Exceptions $exceptions): void {
         //

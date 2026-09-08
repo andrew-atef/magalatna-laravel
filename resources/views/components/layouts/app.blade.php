@@ -68,7 +68,7 @@
             ],
         ];
     @endphp
-    @if (! request()->routeIs('flyers.show'))
+    @if (! request()->routeIs('flyers.show') && ! request()->routeIs('home') && ! request()->routeIs('retailers.show'))
         <script type="application/ld+json">{!! json_encode($organizationSchema, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) !!}</script>
     @endif
 

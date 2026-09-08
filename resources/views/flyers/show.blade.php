@@ -65,9 +65,9 @@
                     '@id' => $eventId,
                     'name' => $cleanTitle,
                     'description' => $bluf,
-                    'startDate' => \Carbon\Carbon::parse($flyer->valid_from)->toIso8601String(),
-                    'endDate' => \Carbon\Carbon::parse($flyer->valid_until)->endOfDay()->toIso8601String(),
-                    'eventStatus' => 'https://schema.org/EventScheduled',
+                    'startDate' => \Carbon\Carbon::createFromFormat('Y-m-d', $flyer->valid_from->format('Y-m-d'), 'Africa/Cairo')->startOfDay()->toIso8601String(),
+                    'endDate' => \Carbon\Carbon::createFromFormat('Y-m-d', $flyer->valid_until->format('Y-m-d'), 'Africa/Cairo')->endOfDay()->toIso8601String(),
+                    'eventStatus' => $flyer->isExpired() ? 'https://schema.org/EventCancelled' : 'https://schema.org/EventScheduled',
                     'eventAttendanceMode' => 'https://schema.org/OfflineEventAttendanceMode',
                     'location' => [
                         '@type' => 'Place',
@@ -91,8 +91,8 @@
                             'url' => $pageUrl . '#item-' . $item->id,
                             'price' => number_format((float) $item->sale_price, 2, '.', ''),
                             'priceCurrency' => 'EGP',
-                            'priceValidUntil' => \Carbon\Carbon::parse($flyer->valid_until)->format('Y-m-d'),
-                            'availability' => 'https://schema.org/InStock',
+                            'priceValidUntil' => \Carbon\Carbon::createFromFormat('Y-m-d', $flyer->valid_until->format('Y-m-d'), 'Africa/Cairo')->format('Y-m-d'),
+                            'availability' => $flyer->isExpired() ? 'https://schema.org/Discontinued' : 'https://schema.org/InStock',
                             'seller' => ['@type' => 'Organization', 'name' => $flyer->retailer->name],
                         ];
                         if ($hasOld) {
@@ -140,6 +140,27 @@
 
     <!-- Flyer Header Card - Navy headings, Green validity -->
     <article class="mb-8 rounded-2xl border border-[#e2e8f0] bg-white p-6 shadow-sm">
+        @if($flyer->isExpired())
+            <div class="mb-6 rounded-2xl border-2 border-amber-500/30 bg-amber-50/80 p-5 text-amber-950 shadow-sm">
+                <div class="flex items-start gap-3">
+                    <span class="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-amber-500 text-white font-black text-lg">⚠️</span>
+                    <div class="flex-1">
+                        <h2 class="text-base font-black text-amber-900">تنبيه: هذا العرض انتهت فترة سريانه في {{ \Carbon\Carbon::parse($flyer->valid_until)->format('Y/m/d') }}</h2>
+                        <p class="mt-0.5 text-xs text-amber-800">
+                            الأسعار والخصومات الواردة أدناه محفوظة كأرشيف تاريخي لمقارنة تطور الأسعار في مصر.
+                        </p>
+                        @if($latestActive = $flyer->retailer->latestActiveFlyer())
+                            <div class="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-xl bg-white p-3 border border-amber-200">
+                                <span class="text-xs font-bold text-slate-700">تتوفر الآن مجلة جديدة سارية لهذا المتجر:</span>
+                                <a href="{{ route('flyers.show', $latestActive->slug) }}" class="inline-flex items-center gap-1 rounded-lg bg-[#039652] px-3.5 py-1.5 text-xs font-black text-white hover:bg-[#023b55] transition shadow-sm">
+                                    مشاهدة عروض {{ $flyer->retailer->name }} السارية الآن ←
+                                </a>
+                            </div>
+                        @endif
+                    </div>
+                </div>
+            </div>
+        @endif
         <div class="flex flex-wrap items-center justify-between gap-4 border-b border-slate-100 pb-4">
             <div>
                 <span class="inline-block rounded-lg bg-[#023b55]/10 px-2.5 py-1 text-xs font-bold text-[#023b55]">
@@ -211,15 +232,22 @@
                     <div class="border-b border-slate-100 bg-slate-50 px-4 py-2 text-xs font-bold text-slate-600">
                         صفحة رقم {{ $page->page_number }}
                     </div>
+                    @php
+                        $r2Cdn = rtrim(config('filesystems.disks.r2.url'), '/');
+                        $heroImagePath = $page->image_path;
+                        $fullImageUrl = $r2Cdn . '/' . ltrim($heroImagePath, '/');
+                        $mobileOptimizedUrl = $r2Cdn . '/cdn-cgi/image/width=600,format=webp/' . ltrim($heroImagePath, '/');
+                    @endphp
                     <button type="button" data-index="{{ $loop->index }}" aria-label="تكبير صفحة {{ $page->page_number }}" class="lightbox-trigger block w-full cursor-zoom-in focus:outline-none focus:ring-2 focus:ring-[#039652] focus:ring-offset-2">
                         <img
-                            src="{{ R2Url::asset($page->image_path) }}"
+                            src="{{ $fullImageUrl }}"
+                            srcset="{{ $fullImageUrl }} 1200w, {{ $mobileOptimizedUrl }} 600w"
+                            sizes="(max-width: 640px) 100vw, 768px"
                             alt="{{ $cleanTitle }} - صفحة {{ $page->page_number }}"
                             width="1200"
                             height="1600"
-                            sizes="(max-width: 640px) 100vw, 768px"
                             @if ($loop->first) loading="eager" fetchpriority="high" decoding="async" @else loading="lazy" decoding="async" @endif
-                            class="w-full object-contain"
+                            class="w-full h-auto object-contain"
                         >
                     </button>
                 </div>

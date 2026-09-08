@@ -14,22 +14,50 @@
 >
     @push('schema')
         @php
-            $websiteSchema = [
-                '@context' => 'https://schema.org',
-                '@type' => 'WebSite',
-                'name' => $siteName,
-                'url' => url('/'),
-                'potentialAction' => [
-                    '@type' => 'SearchAction',
-                    'target' => [
-                        '@type' => 'EntryPoint',
-                        'urlTemplate' => url('/') . '/?q={search_term_string}',
+            $homeOrganizationId = url('/') . '#organization';
+            $homeWebsiteId = url('/') . '#website';
+            $homeGraph = [
+                [
+                    '@type' => 'Organization',
+                    '@id' => $homeOrganizationId,
+                    'name' => $siteName,
+                    'url' => url('/'),
+                    'logo' => [
+                        '@type' => 'ImageObject',
+                        'url' => url('/favicon.svg'),
+                        'width' => 140,
+                        'height' => 36,
                     ],
-                    'query-input' => 'required name=search_term_string',
+                    'areaServed' => 'EG',
+                    'knowsAbout' => [
+                        'عروض كارفور مصر',
+                        'تخفيضات كازيون',
+                        'عروض بيم الأسبوعية',
+                        'أسعار السلع في مصر',
+                    ],
+                ],
+                [
+                    '@type' => 'WebSite',
+                    '@id' => $homeWebsiteId,
+                    'name' => $siteName,
+                    'url' => url('/'),
+                    'publisher' => ['@id' => $homeOrganizationId],
+                    'potentialAction' => [
+                        '@type' => 'SearchAction',
+                        'target' => [
+                            '@type' => 'EntryPoint',
+                            'urlTemplate' => url('/') . '/?q={search_term_string}',
+                        ],
+                        'query-input' => 'required name=search_term_string',
+                    ],
                 ],
             ];
+            $homeUnified = [
+                '@context' => 'https://schema.org',
+                '@graph' => $homeGraph,
+            ];
         @endphp
-        <script type="application/ld+json">{!! json_encode($websiteSchema, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) !!}</script>
+        <script type="application/ld+json">{!! json_encode($homeUnified, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) !!}</script>
     @endpush
 
     <!-- Header Hero & Stores Filter Carousel - Navy structure -->

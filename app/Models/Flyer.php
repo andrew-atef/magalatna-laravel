@@ -203,4 +203,10 @@ class Flyer extends Model
             default => $date->locale('ar')->isoFormat('dddd'),
         };
     }
+
+    public function isExpired(): bool
+    {
+        return $this->status === FlyerStatus::Expired
+            || Carbon::parse($this->valid_until, 'Africa/Cairo')->isPast();
+    }
 }
