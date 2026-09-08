@@ -1,0 +1,190 @@
+@php
+    $r2DiskUrl = rtrim((string) config('filesystems.disks.r2.url'), '/');
+    $logoUrl = $retailer->logo_path ? $r2DiskUrl . '/' . $retailer->logo_path : null;
+    $canonicalUrl = $canonical ?? route('retailers.show', $retailer->slug);
+    $year = \Carbon\Carbon::now('Africa/Cairo')->year;
+    $metaTitle = $seoTitle ?? "عروض {$retailer->name} مصر اليوم {$year} | أحدث مجلات الأسعار والتخفيضات";
+    $metaDesc = $seoDescription ?? "تصفح أحدث عروض {$retailer->name} في مصر اليوم {$year} - مجلات أسعار محدثة، خصومات حصرية ومقارنة أسعار السلع قبل الشراء.";
+@endphp
+
+<x-layouts.app
+    :meta-title="$metaTitle"
+    :meta-description="$metaDesc"
+    :og-title="$metaTitle"
+    :og-description="$metaDesc"
+    :og-image="$logoUrl ?: url('/img/og-cover.png')"
+    og-type="website"
+>
+    @push('schema')
+        @php
+            $breadcrumbSchema = [
+                '@context' => 'https://schema.org',
+                '@type' => 'BreadcrumbList',
+                'itemListElement' => [
+                    ['@type' => 'ListItem', 'position' => 1, 'name' => 'الرئيسية', 'item' => url('/')],
+                    ['@type' => 'ListItem', 'position' => 2, 'name' => $retailer->name, 'item' => $canonicalUrl],
+                ],
+            ];
+            $collectionSchema = [
+                '@context' => 'https://schema.org',
+                '@type' => 'CollectionPage',
+                'name' => $metaTitle,
+                'description' => $metaDesc,
+                'url' => $canonicalUrl,
+                'isPartOf' => ['@type' => 'WebSite', 'name' => config('app.name', 'عروض نت'), 'url' => url('/')],
+                'about' => ['@type' => 'Organization', 'name' => $retailer->name, 'url' => $retailer->website_url ?: url('/')],
+                'mainEntity' => [
+                    '@type' => 'ItemList',
+                    'numberOfItems' => $activeFlyers->total(),
+                    'itemListElement' => $activeFlyers->map(function ($flyer, $idx) {
+                        return [
+                            '@type' => 'ListItem',
+                            'position' => $idx + 1,
+                            'url' => route('flyers.show', $flyer->slug),
+                            'name' => $flyer->title,
+                        ];
+                    })->all(),
+                ],
+            ];
+        @endphp
+        <script type="application/ld+json">{!! json_encode($breadcrumbSchema, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) !!}</script>
+        <script type="application/ld+json">{!! json_encode($collectionSchema, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) !!}</script>
+    @endpush
+
+    <!-- Breadcrumb -->
+    <nav class="mb-4 text-xs font-semibold text-slate-500" aria-label="Breadcrumb">
+        <ol class="flex items-center gap-1.5">
+            <li><a href="{{ route('home') }}" class="hover:text-sky-600">الرئيسية</a></li>
+            <li>/</li>
+            <li class="text-slate-900">{{ $retailer->name }}</li>
+        </ol>
+    </nav>
+
+    <!-- Retailer Hero Section -->
+    <section class="mb-8 rounded-2xl border border-slate-200 bg-white p-6 shadow-sm sm:p-8">
+        <div class="flex flex-col gap-6 sm:flex-row sm:items-center">
+            <div class="flex h-20 w-20 shrink-0 items-center justify-center overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
+                @if ($logoUrl)
+                    <img src="{{ $logoUrl }}" alt="{{ $retailer->name }}" class="h-full w-full object-contain p-2">
+                @else
+                    <span class="text-2xl font-black text-sky-600">{{ mb_substr($retailer->name, 0, 1) }}</span>
+                @endif
+            </div>
+            <div class="flex-1">
+                <h1 class="text-2xl font-black text-slate-900 sm:text-3xl">عروض {{ $retailer->name }} مصر اليوم</h1>
+                <p class="mt-2 max-w-3xl text-sm leading-relaxed text-slate-600">
+                    تابع أحدث مجلات وعروض <span class="font-bold text-slate-900">{{ $retailer->name }}</span> في مصر —更新 يومي لأسعار السلع، الخصومات الحصرية ومقارنة الأسعار قبل الشراء. 
+                    @if ($retailer->website_url)
+                        <a href="{{ $retailer->website_url }}" target="_blank" rel="noopener" class="text-sky-600 hover:underline">الموقع الرسمي</a>
+                    @endif
+                </p>
+                <div class="mt-4 flex flex-wrap gap-2">
+                    <span class="inline-flex items-center gap-1.5 rounded-full bg-emerald-50 px-3 py-1 text-xs font-bold text-emerald-700">
+                        <span class="h-2 w-2 rounded-full bg-emerald-500"></span>
+                        {{ $activeCount }} مجلة سارية الآن
+                    </span>
+                    <span class="inline-flex items-center rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold text-slate-600">
+                        آخر تحديث: {{ $retailer->updated_at->format('d/m/Y') }}
+                    </span>
+                    @if ($retailer->is_active)
+                        <span class="inline-flex items-center rounded-full bg-sky-50 px-3 py-1 text-xs font-bold text-sky-700">متجر نشط</span>
+                    @endif
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Active Flyers Grid -->
+    <section class="mb-12">
+        <div class="mb-4 flex items-center justify-between">
+            <h2 class="text-lg font-black text-slate-900 sm:text-xl">مجلات {{ $retailer->name }} السارية الآن</h2>
+            <span class="text-xs font-semibold text-slate-500">{{ $activeFlyers->total() }} مجلة</span>
+        </div>
+
+        @if ($activeFlyers->isEmpty())
+            <div class="rounded-2xl border border-dashed border-slate-300 bg-white p-12 text-center">
+                <p class="text-sm font-bold text-slate-700">لا توجد مجلات سارية حالياً لـ {{ $retailer->name }}.</p>
+                <p class="mt-1 text-xs text-slate-500">تابعنا قريباً — نحدّث العروض فور صدورها.</p>
+                <a href="{{ route('home') }}" class="mt-4 inline-flex rounded-xl bg-sky-600 px-4 py-2 text-xs font-bold text-white hover:bg-sky-700">تصفح كل العروض</a>
+            </div>
+        @else
+            <div class="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4">
+                @foreach ($activeFlyers as $flyer)
+                    @php
+                        $coverPage = $flyer->pages->first();
+                        $coverUrl = $coverPage ? $r2DiskUrl . '/' . $coverPage->image_path : '/img/placeholder-flyer.png';
+                    @endphp
+                    @php
+                            $today = \Carbon\Carbon::today('Africa/Cairo');
+                            $from = \Carbon\Carbon::parse($flyer->valid_from, 'Africa/Cairo');
+                            $until = \Carbon\Carbon::parse($flyer->valid_until, 'Africa/Cairo');
+                            $isFuture = $from->isFuture();
+                            $isPast = $until->isPast();
+                        @endphp
+                    <article class="group flex flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm transition hover:shadow-md">
+                        <a href="{{ route('flyers.show', $flyer->slug) }}" class="relative aspect-[3/4] overflow-hidden bg-slate-100">
+                            <img src="{{ $coverUrl }}" alt="{{ $flyer->title }}" width="600" height="800" loading="lazy" class="h-full w-full object-cover transition duration-300 group-hover:scale-105">
+                            @if ($isFuture)
+                                <span class="absolute right-2 top-2 rounded-lg bg-amber-500 px-2 py-1 text-[11px] font-bold text-white shadow">يبدأ {{ $from->format('d/m') }}</span>
+                            @elseif ($isPast)
+                                <span class="absolute right-2 top-2 rounded-lg bg-slate-600 px-2 py-1 text-[11px] font-bold text-white shadow">منتهي</span>
+                            @else
+                                <span class="absolute right-2 top-2 rounded-lg bg-emerald-600 px-2 py-1 text-[11px] font-bold text-white shadow">سارٍ حتى {{ $until->format('d/m') }}</span>
+                            @endif
+                            <span class="absolute left-2 top-2 rounded-lg bg-slate-900/80 px-2 py-1 text-[11px] font-bold text-white backdrop-blur">{{ $flyer->total_pages }} صفحة</span>
+                        </a>
+                        <div class="flex flex-1 flex-col p-4">
+                            <h3 class="line-clamp-2 text-sm font-bold text-slate-900 group-hover:text-sky-600">
+                                <a href="{{ route('flyers.show', $flyer->slug) }}">{{ $flyer->title }}</a>
+                            </h3>
+                            <div class="mt-3 flex items-center justify-between border-t border-slate-100 pt-3 text-[11px]">
+                                <span class="text-slate-500">{{ $from->format('d/m') }} → {{ $until->format('d/m/Y') }}</span>
+                                @if ($isFuture)
+                                    <span class="rounded bg-amber-50 px-2 py-0.5 text-[10px] font-bold text-amber-700">يبدأ قريباً {{ $from->format('d/m') }}</span>
+                                @elseif ($isPast)
+                                    <span class="rounded bg-slate-100 px-2 py-0.5 text-[10px] font-bold text-slate-500">منتهي</span>
+                                @else
+                                    <span class="font-bold text-emerald-600">سارٍ الآن</span>
+                                @endif
+                            </div>
+                        </div>
+                    </article>
+                @endforeach
+            </div>
+            <div class="mt-6">
+                {{ $activeFlyers->links() }}
+            </div>
+        @endif
+    </section>
+
+    <!-- Recently Expired (Price History) -->
+    @if ($expiredFlyers->isNotEmpty())
+        <section class="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
+            <div class="mb-4 flex items-center justify-between">
+                <h2 class="text-lg font-black text-slate-900">مجلات منتهية حديثاً — أرشيف أسعار {{ $retailer->name }} (آخر 30 يوم)</h2>
+                <span class="text-xs font-semibold text-slate-500">{{ $expiredFlyers->count() }} مجلة</span>
+            </div>
+            <p class="mb-4 text-xs text-slate-500">للمقارنة ومعرفة تاريخ الأسعار قبل الشراء.</p>
+            <div class="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4">
+                @foreach ($expiredFlyers as $flyer)
+                    @php
+                        $coverPage = $flyer->pages->first();
+                        $coverUrl = $coverPage ? $r2DiskUrl . '/' . $coverPage->image_path : '/img/placeholder-flyer.png';
+                    @endphp
+                    <article class="flex flex-col overflow-hidden rounded-xl border border-slate-200 bg-slate-50 opacity-90">
+                        <a href="{{ route('flyers.show', $flyer->slug) }}" class="relative aspect-[3/4] overflow-hidden bg-slate-100">
+                            <img src="{{ $coverUrl }}" alt="{{ $flyer->title }}" width="600" height="800" loading="lazy" class="h-full w-full object-cover grayscale">
+                            <span class="absolute inset-0 bg-slate-900/10"></span>
+                            <span class="absolute right-2 top-2 rounded-lg bg-slate-700 px-2 py-1 text-[11px] font-bold text-white">منتهي {{ \Carbon\Carbon::parse($flyer->valid_until)->format('d/m') }}</span>
+                        </a>
+                        <div class="p-3">
+                            <h3 class="line-clamp-2 text-xs font-bold text-slate-700">
+                                <a href="{{ route('flyers.show', $flyer->slug) }}">{{ $flyer->title }}</a>
+                            </h3>
+                        </div>
+                    </article>
+                @endforeach
+            </div>
+        </section>
+    @endif
+</x-layouts.app>

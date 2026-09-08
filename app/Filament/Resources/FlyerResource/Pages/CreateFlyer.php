@@ -1,0 +1,13 @@
+<?php
+
+declare(strict_types=1);
+
+namespace App\Filament\Resources\FlyerResource\Pages;
+
+use App\Filament\Resources\FlyerResource;
+use Filament\Resources\Pages\CreateRecord;
+
+final class CreateFlyer extends CreateRecord
+{
+    protected static string $resource = FlyerResource::class;
+}
