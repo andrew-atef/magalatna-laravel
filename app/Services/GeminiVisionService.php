@@ -699,10 +699,11 @@ Instructions:
     Example without specific theme: "عروض كارفور من 10 حتى 20 سبتمبر 2026 | مجلة العروض والتوفير"
   * Hard Constraint: NEVER return shallow titles like "عروض كازيون" or "عروض المدرسة". The title MUST include the exact dates and month in Arabic. Keep under 65 chars where possible, front-load brand and dates.
 - valid_from / valid_until = Extract ONLY explicit, verifiable dates stated in caption or image. Normalize to YYYY-MM-DD. CRITICAL: If year not visible, use 2026 (current year). Today is {$today}. Examples: "8 سبتمبر حتى 14 سبتمبر" => 2026-09-08 to 2026-09-14; "الأربعاء 9 سبتمبر فقط" => 2026-09-09 to 2026-09-09. NEVER invent, estimate, or hallucinate dates. If no explicit, verifiable date range or specific single day is stated, you MUST return is_flyer = false, valid_from = null, and valid_until = null.
-- Applicable only if is_flyer = true and an explicit date is present. Otherwise is_flyer must be false.
+- EXCEPTION — "Until Stock Lasts" (حتى نفاذ الكمية): Keep the anti-spam rule that forbids inventing dates for teasers ("قبل ما العروض تخلص"). BUT if the post contains a clear explicit START date (valid_from) AND the phrase "حتى نفاذ الكمية" (or variants "حتى نفاد الكمية", "حتي نفاذ الكميه", "حتى نفاذ الكميه", "until stock lasts", "while stocks last") you MUST accept it as a valid flyer (is_flyer = true). For this exception ONLY, calculate valid_until by adding exactly 10 days to valid_from, output as YYYY-MM-DD. Example: "ساري من 18/8/2026 حتى نفاذ الكمية" => valid_from="2026-08-18", valid_until="2026-08-28". Reinforce: If BOTH valid_from and valid_until are missing/cannot be extracted, you MUST reject (is_flyer=false) — no exception applies.
+- Applicable only if is_flyer = true and an explicit date is present (including the 10-day exception above). Otherwise is_flyer must be false.
 - applicable_governorates = List of Egyptian governorates mentioned (Arabic names e.g., "القاهرة", "الجيزة", "الإسكندرية" or English "Cairo","Giza"). Return [] if applies to all Egypt / no restriction mentioned.
 
-Be strict: If unsure, or if no explicit date is verifiable, prefer is_flyer=false. Never invent dates.
+Be strict: If unsure, or if no explicit date is verifiable (and no "حتى نفاذ الكمية" with a clear start date), prefer is_flyer=false. Never invent dates.
 PROMPT;
     }
 
