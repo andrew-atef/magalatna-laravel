@@ -538,10 +538,15 @@ PROMPT;
         $text = trim(html_entity_decode($raw, ENT_QUOTES | ENT_HTML5, 'UTF-8'));
         $text = str_replace(['"', '"', '"', '&quot;', '&#34;', '&#x22;'], '', $text);
 
-        // Enforce 2 sentences max and no English
-        if (preg_match('/[a-zA-Z]/', $text)) {
-            Log::warning('Gemini BLUF contained English, falling back to Arabic template.', ['text' => $text]);
-            throw new RuntimeException('BLUF contains English');
+        // Allow Latin brand acronyms/names while rejecting pure English sentences
+        $arabicCount = preg_match_all('/[\x{0600}-\x{06FF}]/u', $text);
+        $totalLetters = preg_match_all('/\p{L}/u', $text);
+        $arabicRatio = $totalLetters > 0 ? ($arabicCount / $totalLetters) : 0;
+
+        // Reject only if Arabic content is less than 75% or contains prominent English filler words
+        if ($arabicRatio < 0.75 || preg_match('/\b(discover|browse|available|valid from|shop now|terms and conditions)\b/i', $text)) {
+            Log::warning('Gemini BLUF does not meet Arabic ratio requirements.', ['text' => $text, 'arabicRatio' => $arabicRatio]);
+            throw new RuntimeException('Summary does not meet Arabic ratio requirements.');
         }
 
         // Ensure 2 sentences (split by Arabic full stop)
@@ -629,8 +634,14 @@ PROMPT;
         $raw = $this->callGeminiRawText($payload, $apiKey);
         $text = trim(html_entity_decode($raw, ENT_QUOTES | ENT_HTML5, 'UTF-8'));
         $text = str_replace(['"', '"', '"', '&quot;'], '', $text);
-        if (preg_match('/[a-zA-Z]/', $text)) {
-            throw new RuntimeException('Editorial contains English');
+        // Allow Latin brand acronyms/names while rejecting pure English sentences
+        $arabicCount = preg_match_all('/[\x{0600}-\x{06FF}]/u', $text);
+        $totalLetters = preg_match_all('/\p{L}/u', $text);
+        $arabicRatio = $totalLetters > 0 ? ($arabicCount / $totalLetters) : 0;
+
+        if ($arabicRatio < 0.75 || preg_match('/\b(discover|browse|available|valid from|shop now|terms and conditions)\b/i', $text)) {
+            Log::warning('Gemini Editorial does not meet Arabic ratio requirements.', ['text' => $text, 'arabicRatio' => $arabicRatio]);
+            throw new RuntimeException('Summary does not meet Arabic ratio requirements.');
         }
         // Ensure 2 paragraphs
         $paragraphs = preg_split('/\n\s*\n/u', $text, -1, PREG_SPLIT_NO_EMPTY);

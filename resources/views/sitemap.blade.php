@@ -3,7 +3,7 @@
     <!-- Homepage -->
     <url>
         <loc>{{ url('/') }}</loc>
-        <lastmod>{{ now('Africa/Cairo')->toIso8601String() }}</lastmod>
+        <lastmod>{{ \Carbon\Carbon::parse(now())->setTimezone('Africa/Cairo')->toIso8601String() }}</lastmod>
         <changefreq>hourly</changefreq>
         <priority>1.0</priority>
     </url>
@@ -12,7 +12,7 @@
     @foreach ($retailers as $retailer)
         <url>
             <loc>{{ route('retailers.show', $retailer->slug) }}</loc>
-            <lastmod>{{ $retailer->updated_at->copy()->setTimezone('Africa/Cairo')->toIso8601String() }}</lastmod>
+            <lastmod>{{ \Carbon\Carbon::parse($retailer->updated_at)->setTimezone('Africa/Cairo')->toIso8601String() }}</lastmod>
             <changefreq>daily</changefreq>
             <priority>0.8</priority>
             @if ($retailer->logo_path)
@@ -28,7 +28,7 @@
     @foreach ($activeFlyers ?? $flyers ?? [] as $flyer)
         <url>
             <loc>{{ route('flyers.show', $flyer->slug) }}</loc>
-            <lastmod>{{ $flyer->updated_at->copy()->setTimezone('Africa/Cairo')->toIso8601String() }}</lastmod>
+            <lastmod>{{ \Carbon\Carbon::parse($flyer->updated_at)->setTimezone('Africa/Cairo')->toIso8601String() }}</lastmod>
             <changefreq>daily</changefreq>
             <priority>0.9</priority>
             @foreach ($flyer->pages->sortBy('page_number') as $page)
@@ -45,7 +45,7 @@
     @foreach ($expiredFlyers ?? [] as $flyer)
         <url>
             <loc>{{ route('flyers.show', $flyer->slug) }}</loc>
-            <lastmod>{{ $flyer->updated_at->copy()->setTimezone('Africa/Cairo')->toIso8601String() }}</lastmod>
+            <lastmod>{{ \Carbon\Carbon::parse($flyer->updated_at)->setTimezone('Africa/Cairo')->toIso8601String() }}</lastmod>
             <changefreq>never</changefreq>
             <priority>0.3</priority>
         </url>

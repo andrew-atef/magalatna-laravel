@@ -140,6 +140,13 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
                         'reason' => $reason,
                     ]);
 
+                    if ($this->rawFacebookPostId !== null) {
+                        RawFacebookPost::where('id', $this->rawFacebookPostId)->update([
+                            'status' => 'rejected',
+                            'rejection_reason' => 'العرض منتهي الصلاحية بتوقيت القاهرة (' . $validUntilCarbon->toDateString() . ')',
+                        ]);
+                    }
+
                     return;
                 }
             } catch (Throwable $e) {
@@ -168,15 +175,16 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
                 ->first();
 
             if ($existingFlyer !== null) {
-                $existingPageUrls = $existingFlyer->pages()->pluck('image_path')->all();
-                $filteredImageUrls = array_values(array_filter($this->imageUrls, function (string $url) use ($existingPageUrls): bool {
-                    $basename = basename((string) parse_url($url, PHP_URL_PATH));
-                    foreach ($existingPageUrls as $existing) {
-                        if ($url === $existing || basename((string) $existing) === $basename) {
-                            return false;
-                        }
-                    }
-                    return true;
+                $existingRawUrls = RawFacebookPost::where('flyer_id', $existingFlyer->id)
+                    ->pluck('image_urls')
+                    ->flatten()
+                    ->filter()
+                    ->map(fn (string $u) => strtok(trim($u), '?'))
+                    ->all();
+
+                $filteredImageUrls = array_values(array_filter($this->imageUrls, function (string $url) use ($existingRawUrls): bool {
+                    $cleanUrl = strtok(trim($url), '?');
+                    return ! in_array($cleanUrl, $existingRawUrls, true);
                 }));
                 $filteredImageUrls = array_values(array_unique($filteredImageUrls));
 
@@ -204,7 +212,7 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
                 ]);
 
                 $existingFlyer->total_pages = (int) $existingFlyer->total_pages + $newPagesCount;
-                $existingFlyer->save();
+                $existingFlyer->saveQuietly();
 
                 $this->updateRawPostFlyer($existingFlyer->id);
 

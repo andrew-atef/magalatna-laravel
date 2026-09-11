@@ -342,7 +342,7 @@ final class ProcessSinglePageJob implements ShouldQueue
         try {
             $response = Http::timeout(15)
                 ->withHeaders([
-                    'User-Agent' => 'AmanPrice-ProcessSinglePage/1.0',
+                    'User-Agent' => 'Magalatna-ProcessSinglePage/1.0',
                     'Accept' => 'image/*',
                 ])
                 ->withOptions([
