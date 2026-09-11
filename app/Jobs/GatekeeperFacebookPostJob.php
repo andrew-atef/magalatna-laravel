@@ -61,9 +61,21 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
                 'image_count' => count($this->imageUrls),
             ]);
 
-            $firstImageUrl = $this->imageUrls[0] ?? null;
+            $count = count($this->imageUrls);
+            $sampleImageUrls = [];
+            if ($count > 0) {
+                $sampleImageUrls[] = $this->imageUrls[0];
+            }
+            if ($count >= 3) {
+                $mid = (int) floor($count / 2);
+                $sampleImageUrls[] = $this->imageUrls[$mid];
+            }
+            if ($count >= 4) {
+                $sampleImageUrls[] = $this->imageUrls[$count - 1];
+            }
+            $sampleImageUrls = array_values(array_unique($sampleImageUrls));
 
-            $classification = $gemini->classifyPost($this->postText, $firstImageUrl, count($this->imageUrls));
+            $classification = $gemini->classifyPost($this->postText, $sampleImageUrls, $count);
 
             $isFlyer = (bool) ($classification['is_flyer'] ?? false);
             $reason = (string) ($classification['reason'] ?? 'N/A');

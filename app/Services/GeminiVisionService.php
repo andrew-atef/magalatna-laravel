@@ -38,13 +38,19 @@ final class GeminiVisionService
      *
      * @throws RuntimeException
      */
-    public function classifyPost(string $postText, ?string $firstImageUrl = null, int $imageCount = 1): array
+    /**
+     * @param  list<string>  $sampleImageUrls  Up to 3 sampled image URLs (cover, middle, last)
+     */
+    public function classifyPost(string $postText, array $sampleImageUrls = [], int $totalImages = 1): array
     {
         try {
             $apiKey = $this->apiKey();
             $postText = trim($postText);
+            $sampleImageUrls = array_values(array_unique(array_filter(array_map(static fn (mixed $u): string => trim((string) $u), $sampleImageUrls), static fn (string $u): bool => $u !== '')));
+            // Limit to 3 for payload efficiency
+            $sampleImageUrls = array_slice($sampleImageUrls, 0, 3);
 
-            if ($postText === '' && $firstImageUrl === null) {
+            if ($postText === '' && $sampleImageUrls === []) {
                 return [
                     'is_flyer' => false,
                     'reason' => 'Empty post text and no image provided.',
@@ -55,25 +61,36 @@ final class GeminiVisionService
                 ];
             }
 
+            // Backward compat: if caller passed single string as array element with old signature, handle
+            // (Gatekeeper now passes array, but keep support for legacy single string)
+            if (count($sampleImageUrls) === 1 && is_string($sampleImageUrls[0]) && str_starts_with($sampleImageUrls[0], 'http') === false && isset($sampleImageUrls[0][0]) === false) {
+                // No-op
+            }
+
             $parts = [];
 
-            $systemInstruction = $this->classificationPrompt($imageCount);
+            $systemInstruction = $this->classificationPrompt($totalImages);
 
             // Post text part — inject TOTAL_IMAGES_IN_POST for Flash 1-Day detection
             $parts[] = [
-                'text' => $systemInstruction."\n\nTOTAL_IMAGES_IN_POST: {$imageCount}\nPOST_TEXT:\n".$postText,
+                'text' => $systemInstruction."\n\nTOTAL_IMAGES_IN_POST: {$totalImages}\nPOST_TEXT:\n".$postText,
             ];
 
-            // Optional first image for multimodal classification
-            if ($firstImageUrl !== null && trim($firstImageUrl) !== '') {
-                $imagePart = $this->fetchImageAsInlineData(trim($firstImageUrl));
+            // Fetch all sampled images (max 3) for multimodal inspection — cover trap mitigation
+            foreach ($sampleImageUrls as $idx => $sampleUrl) {
+                $sampleUrl = trim((string) $sampleUrl);
+                if ($sampleUrl === '') {
+                    continue;
+                }
+                $imagePart = $this->fetchImageAsInlineData($sampleUrl);
                 if ($imagePart !== null) {
                     $parts[] = $imagePart;
                 } else {
-                    Log::warning('Failed to fetch firstImageUrl for classification, proceeding with text only.', [
-                        'url' => $firstImageUrl,
+                    Log::warning('Failed to fetch sample image for classification, proceeding with text.', [
+                        'url' => $sampleUrl,
+                        'index' => $idx,
                     ]);
-                    $parts[] = ['text' => 'First image URL (failed to download): '.$firstImageUrl];
+                    $parts[] = ['text' => 'Sample image '.($idx + 1).' URL (failed to download): '.$sampleUrl];
                 }
             }
 
