@@ -193,6 +193,9 @@ final class ProcessSinglePageJob implements ShouldQueue
 
                 // Prevent cascade purge storm: disable FlyerItemObserver touch on every insert
                 FlyerItem::withoutEvents(function () use ($flyer, $flyerPage, $items): void {
+                    // Clear previous items for this specific page to ensure idempotency on retries
+                    FlyerItem::where('flyer_page_id', $flyerPage->id)->delete();
+
                     foreach ($items as $raw) {
                         try {
                             $productName = trim((string) ($raw['product_name'] ?? ''));

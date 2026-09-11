@@ -64,14 +64,13 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
             $count = count($this->imageUrls);
             $sampleImageUrls = [];
             if ($count > 0) {
-                $sampleImageUrls[] = $this->imageUrls[0];
+                $sampleImageUrls[] = $this->imageUrls[0]; // Page 1 (Cover)
             }
-            if ($count >= 3) {
-                $mid = (int) floor($count / 2);
-                $sampleImageUrls[] = $this->imageUrls[$mid];
+            if ($count >= 2) {
+                $sampleImageUrls[] = $this->imageUrls[1]; // Page 2 (Crucial for dates & first price tables)
             }
             if ($count >= 4) {
-                $sampleImageUrls[] = $this->imageUrls[$count - 1];
+                $sampleImageUrls[] = $this->imageUrls[$count - 1]; // Last Page (Back cover/terms)
             }
             $sampleImageUrls = array_values(array_unique($sampleImageUrls));
 
@@ -169,8 +168,30 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
                 ->first();
 
             if ($existingFlyer !== null) {
+                $existingPageUrls = $existingFlyer->pages()->pluck('image_path')->all();
+                $filteredImageUrls = array_values(array_filter($this->imageUrls, function (string $url) use ($existingPageUrls): bool {
+                    $basename = basename((string) parse_url($url, PHP_URL_PATH));
+                    foreach ($existingPageUrls as $existing) {
+                        if ($url === $existing || basename((string) $existing) === $basename) {
+                            return false;
+                        }
+                    }
+                    return true;
+                }));
+                $filteredImageUrls = array_values(array_unique($filteredImageUrls));
+
+                if ($filteredImageUrls === []) {
+                    Log::info('[CONSOLIDATION] No new unique pages to merge, skipping.', [
+                        'existing_flyer_id' => $existingFlyer->id,
+                        'existing_slug' => $existingFlyer->slug,
+                        'retailer_id' => $retailer->id,
+                    ]);
+
+                    return;
+                }
+
                 $startPageNumber = (int) ($existingFlyer->pages()->max('page_number') ?? 0);
-                $newPagesCount = count($this->imageUrls);
+                $newPagesCount = count($filteredImageUrls);
 
                 Log::info('[CONSOLIDATION] Merging ' . $newPagesCount . ' new pages into existing flyer #' . $existingFlyer->id . '.', [
                     'existing_flyer_id' => $existingFlyer->id,
@@ -188,7 +209,7 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
                 $this->updateRawPostFlyer($existingFlyer->id);
 
                 $jobs = [];
-                foreach ($this->imageUrls as $index => $imageUrl) {
+                foreach ($filteredImageUrls as $index => $imageUrl) {
                     $pageNumber = $startPageNumber + $index + 1;
                     $jobs[] = new ProcessSinglePageJob(
                         flyerId: $existingFlyer->id,

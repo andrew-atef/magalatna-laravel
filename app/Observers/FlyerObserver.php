@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Observers;
 
+use App\Enums\FlyerStatus;
 use App\Jobs\PurgeCloudflareCacheJob;
 use App\Models\Flyer;
 use Illuminate\Support\Facades\Cache;
@@ -72,6 +73,11 @@ final class FlyerObserver
 
     private function handlePurge(Flyer $flyer, string $event): void
     {
+        // Only purge public cache and notify search engines if the flyer is actually published
+        if ($flyer->status !== FlyerStatus::Published && $event !== 'deleted') {
+            return;
+        }
+
         try {
             Cache::forget('sitemap_xml_content');
             Cache::forget('llms_txt_content');

@@ -722,6 +722,12 @@ Instructions:
   2. Two-Day Weekend Offers ("يوم الجمعة 11 سبتمبر ويوم السبت 12 سبتمبر"): valid_from="2026-09-11", valid_until="2026-09-12".
   3. Cross-Month Campaigns ("من الجمعة 11 سبتمبر حتى الخميس 1 أكتوبر"): Correctly increment the month for end dates: valid_from="2026-09-11", valid_until="2026-10-01".
   4. Open-ended with Start Date ("ساري من 10 سبتمبر وحتى نفاذ الكمية"): Calculate valid_until as valid_from + 10 days (e.g., 2026-09-20) — same as "Until Stock Lasts" exception above.
+=== EGYPTIAN SLANG & COLLOQUIAL DATE RULES ===
+- "إنهاردة" / "النهارده" means "Today" ({$today}).
+- "بكرة" / "بكره" means "Tomorrow".
+- If text says "من إنهاردة وحتى 16-9-2026", valid_from = "{$today}", valid_until = "2026-09-16".
+- If text says "إنهاردة وبكرة الإثنين والثلاثاء 7 و 8 سبتمبر", valid_from = "2026-09-07", valid_until = "2026-09-08".
+- Never reject a post simply because it uses colloquial Egyptian date phrasing like "من إنهاردة".
 - Applicable only if is_flyer = true and an explicit date is present (including the 10-day exception above). Otherwise is_flyer must be false.
 - applicable_governorates = List of Egyptian governorates mentioned (Arabic names e.g., "القاهرة", "الجيزة", "الإسكندرية" or English "Cairo","Giza"). Return [] if applies to all Egypt / no restriction mentioned.
 
