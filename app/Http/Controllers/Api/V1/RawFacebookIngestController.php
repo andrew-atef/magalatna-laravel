@@ -6,6 +6,8 @@ namespace App\Http\Controllers\Api\V1;
 
 use App\Http\Controllers\Controller;
 use App\Jobs\GatekeeperFacebookPostJob;
+use App\Models\RawFacebookPost;
+use App\Models\Retailer;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
@@ -37,6 +39,22 @@ final class RawFacebookIngestController extends Controller
             $imageUrls = array_values($validated['image_urls']);
             $publishedAt = (string) $validated['published_at'];
 
+            // Zero data loss: persist every incoming payload
+            $retailer = Retailer::where('slug', $retailerSlug)->firstOrFail();
+
+            $rawPost = RawFacebookPost::updateOrCreate(
+                [
+                    'retailer_id' => $retailer->id,
+                    'facebook_post_id' => $facebookPostId,
+                ],
+                [
+                    'post_text' => $postText ?? null,
+                    'image_urls' => $imageUrls,
+                    'published_at' => $publishedAt ?? now(),
+                    'status' => 'pending',
+                ]
+            );
+
             // Dispatch asynchronously — must return 202 within 100ms, no blocking work here.
             GatekeeperFacebookPostJob::dispatch(
                 retailerSlug: $retailerSlug,
@@ -44,6 +62,7 @@ final class RawFacebookIngestController extends Controller
                 postText: $postText,
                 imageUrls: $imageUrls,
                 publishedAt: $publishedAt,
+                rawFacebookPostId: $rawPost->id,
             );
 
             Log::info('Facebook post ingested, Gatekeeper dispatched.', [

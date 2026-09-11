@@ -141,7 +141,13 @@ final class RetailerResource extends Resource
                 Tables\Columns\TextColumn::make('slug')
                     ->label('Slug')
                     ->searchable()
-                    ->toggleable(isToggledHiddenByDefault: true),
+                    ->sortable()
+                    ->copyable()
+                    ->copyMessage('تم نسخ الـ slug')
+                    ->copyMessageDuration(1500)
+                    ->badge()
+                    ->color('gray')
+                    ->toggleable(),
 
                 Tables\Columns\TextColumn::make('created_at')
                     ->label('Created')

@@ -7,6 +7,7 @@ namespace App\Jobs;
 use App\Enums\FlyerStatus;
 use App\Jobs\PingIndexNowJob;
 use App\Models\Flyer;
+use App\Models\RawFacebookPost;
 use App\Models\Retailer;
 use App\Services\FlyerSlugService;
 use App\Services\GeminiVisionService;
@@ -45,6 +46,7 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
         public readonly string $postText,
         public readonly array $imageUrls,
         public readonly string $publishedAt,
+        public readonly ?int $rawFacebookPostId = null,
     ) {}
 
     /**
@@ -61,7 +63,6 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
 
             $firstImageUrl = $this->imageUrls[0] ?? null;
 
-            // Phase 1: Classification via Gemini 2.5 Flash — pass imageCount for Flash 1-Day detection
             $classification = $gemini->classifyPost($this->postText, $firstImageUrl, count($this->imageUrls));
 
             $isFlyer = (bool) ($classification['is_flyer'] ?? false);
@@ -78,6 +79,9 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
                 'valid_until' => $validUntil,
             ]);
 
+            // Persist AI classification to audit trail
+            $this->updateRawPostClassification($classification, $isFlyer, (string) $reason, $validUntil);
+
             if ($isFlyer === false) {
                 Log::info('Discard: not a flyer.', [
                     'facebook_post_id' => $this->facebookPostId,
@@ -87,7 +91,6 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
                 return;
             }
 
-            // Strict Validity Date Guardrail: Never invent dates
             if (! is_string($validUntil) || trim((string) $validUntil) === '') {
                 Log::warning('Discard: flyer without explicit valid_until date.', [
                     'facebook_post_id' => $this->facebookPostId,
@@ -99,7 +102,6 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
                 return;
             }
 
-            // Normalize dates
             $validFromCarbon = $this->parseDateOrNull($validFrom);
             $validUntilCarbon = $this->parseDateOrNull($validUntil);
 
@@ -112,12 +114,10 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
                 return;
             }
 
-            // 1-Day Flash: if valid_from is null but valid_until is valid, set valid_from = valid_until
             if ($validFromCarbon === null) {
                 $validFromCarbon = $validUntilCarbon->copy();
             }
 
-            // Cairo Negative Temporal Check
             try {
                 $todayCairo = Carbon::today('Africa/Cairo');
 
@@ -138,7 +138,6 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
                 ]);
             }
 
-            // Resolve retailer
             $retailer = Retailer::where('slug', $this->retailerSlug)->first();
 
             if ($retailer === null) {
@@ -150,7 +149,115 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
                 throw new \RuntimeException('Retailer not found: '.$this->retailerSlug);
             }
 
-            // إنشاء الـ Slug الإنجليزي الأنيق عبر الخدمة
+            // === CONSOLIDATION CHECK: Merge same-period posts instead of fragmenting ===
+            $existingFlyer = Flyer::where('retailer_id', $retailer->id)
+                ->where('valid_from', $validFromCarbon->toDateString())
+                ->where('valid_until', $validUntilCarbon->toDateString())
+                ->whereIn('status', [FlyerStatus::Draft, FlyerStatus::PendingReview, FlyerStatus::Published])
+                ->first();
+
+            if ($existingFlyer !== null) {
+                $startPageNumber = (int) ($existingFlyer->pages()->max('page_number') ?? 0);
+                $newPagesCount = count($this->imageUrls);
+
+                Log::info('[CONSOLIDATION] Merging ' . $newPagesCount . ' new pages into existing flyer #' . $existingFlyer->id . '.', [
+                    'existing_flyer_id' => $existingFlyer->id,
+                    'existing_slug' => $existingFlyer->slug,
+                    'new_pages' => $newPagesCount,
+                    'start_page' => $startPageNumber + 1,
+                    'retailer_id' => $retailer->id,
+                    'valid_from' => $validFromCarbon->toDateString(),
+                    'valid_until' => $validUntilCarbon->toDateString(),
+                ]);
+
+                $existingFlyer->total_pages = (int) $existingFlyer->total_pages + $newPagesCount;
+                $existingFlyer->save();
+
+                $this->updateRawPostFlyer($existingFlyer->id);
+
+                $jobs = [];
+                foreach ($this->imageUrls as $index => $imageUrl) {
+                    $pageNumber = $startPageNumber + $index + 1;
+                    $jobs[] = new ProcessSinglePageJob(
+                        flyerId: $existingFlyer->id,
+                        imageUrl: (string) $imageUrl,
+                        pageNumber: $pageNumber,
+                    );
+                }
+
+                $flyerId = $existingFlyer->id;
+
+                Bus::batch($jobs)
+                    ->name('flyer-'.$existingFlyer->id.'-'.$this->facebookPostId.'-consolidated')
+                    ->allowFailures()
+                    ->then(static function (Batch $batch) use ($flyerId): void {
+                        try {
+                            $flyer = Flyer::find($flyerId);
+
+                            if ($flyer === null) {
+                                Log::error('Flyer not found in consolidated batch then callback.', ['flyer_id' => $flyerId]);
+
+                                return;
+                            }
+
+                            $autoPublish = (bool) config('app.auto_publish_flyers', true);
+                            if ($flyer->status !== FlyerStatus::Published) {
+                                $flyer->status = $autoPublish ? FlyerStatus::Published : FlyerStatus::PendingReview;
+                            }
+
+                            $flyer->bluf_summary = self::buildBlufSummary($flyer);
+                            $flyer->editorial_overview = self::buildEditorialOverview($flyer);
+                            $flyer->save();
+
+                            Log::info($autoPublish ? '[CONSOLIDATION] Flyer auto-published with merged BLUF.' : '[CONSOLIDATION] Flyer merged and pending_review with BLUF.', [
+                                'flyer_id' => $flyer->id,
+                                'batch_id' => $batch->id,
+                                'status' => $flyer->status->value,
+                            ]);
+
+                            if ($autoPublish) {
+                                try {
+                                    PingIndexNowJob::dispatch(route('flyers.show', $flyer->slug));
+                                } catch (Throwable $e) {
+                                    Log::warning('Failed to dispatch IndexNow after consolidation.', [
+                                        'flyer_id' => $flyer->id,
+                                        'error' => $e->getMessage(),
+                                    ]);
+                                }
+                            }
+                        } catch (Throwable $e) {
+                            Log::error('Failed in consolidated batch then() for flyer.', [
+                                'flyer_id' => $flyerId,
+                                'error' => $e->getMessage(),
+                                'trace' => $e->getTraceAsString(),
+                            ]);
+                        }
+                    })
+                    ->catch(function (Batch $batch, Throwable $e): void {
+                        Log::error('Batch processing caught failure.', [
+                            'batch_id' => $batch->id,
+                            'error' => $e->getMessage(),
+                        ]);
+                    })
+                    ->finally(function (Batch $batch) use ($flyerId): void {
+                        Log::info('Batch finished.', [
+                            'flyer_id' => $flyerId,
+                            'batch_id' => $batch->id,
+                            'failed_jobs' => $batch->failedJobs,
+                        ]);
+                    })
+                    ->onQueue('default')
+                    ->dispatch();
+
+                Log::info('Gatekeeper fan-out dispatched (consolidated).', [
+                    'flyer_id' => $existingFlyer->id,
+                    'jobs_count' => count($jobs),
+                ]);
+
+                return;
+            }
+
+            // Normal new flyer creation
             $slug = $slugService->generate(
                 retailerSlug: $retailer->slug,
                 validFromDate: $validFromCarbon->toDateString(),
@@ -164,7 +271,6 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
                 rawTitle: is_string($flyerTitle) ? trim($flyerTitle) : null
             );
 
-            // Create Flyer in draft status
             $flyer = Flyer::create([
                 'retailer_id' => $retailer->id,
                 'title' => $title,
@@ -183,7 +289,8 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
                 'title' => $flyer->title,
             ]);
 
-            // Fan-out: Bus::batch of ProcessSinglePageJob per image
+            $this->updateRawPostFlyer($flyer->id);
+
             $jobs = [];
 
             foreach ($this->imageUrls as $index => $imageUrl) {
@@ -210,11 +317,9 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
                             return;
                         }
 
-                        // Auto-publish toggle via .env — when true, publish immediately after OCR
                         $autoPublish = (bool) config('app.auto_publish_flyers', true);
                         $flyer->status = $autoPublish ? FlyerStatus::Published : FlyerStatus::PendingReview;
 
-                        // Generate 2-sentence bluf_summary + editorial overview for SEO/GEO
                         $flyer->bluf_summary = self::buildBlufSummary($flyer);
                         $flyer->editorial_overview = self::buildEditorialOverview($flyer);
 
@@ -227,7 +332,6 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
                             'bluf_summary' => $flyer->bluf_summary,
                         ]);
 
-                        // Ping IndexNow immediately when auto-published
                         if ($autoPublish) {
                             try {
                                 PingIndexNowJob::dispatch(route('flyers.show', $flyer->slug));
@@ -293,6 +397,53 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
         }
     }
 
+    private function updateRawPostClassification(array $classification, bool $isFlyer, string $reason, ?string $validUntil): void
+    {
+        if ($this->rawFacebookPostId === null) {
+            return;
+        }
+
+        try {
+            $rawPost = RawFacebookPost::find($this->rawFacebookPostId);
+            if ($rawPost === null) {
+                return;
+            }
+
+            $status = ($isFlyer && ! empty($validUntil) && trim((string) $validUntil) !== '') ? 'accepted' : 'rejected';
+
+            $rawPost->update([
+                'ai_classification' => $classification,
+                'rejection_reason' => $reason,
+                'status' => $status,
+            ]);
+        } catch (Throwable $e) {
+            Log::warning('Failed to update RawFacebookPost classification.', [
+                'raw_post_id' => $this->rawFacebookPostId,
+                'error' => $e->getMessage(),
+            ]);
+        }
+    }
+
+    private function updateRawPostFlyer(int $flyerId): void
+    {
+        if ($this->rawFacebookPostId === null) {
+            return;
+        }
+
+        try {
+            $rawPost = RawFacebookPost::find($this->rawFacebookPostId);
+            if ($rawPost !== null) {
+                $rawPost->update(['flyer_id' => $flyerId]);
+            }
+        } catch (Throwable $e) {
+            Log::warning('Failed to update RawFacebookPost flyer_id.', [
+                'raw_post_id' => $this->rawFacebookPostId,
+                'flyer_id' => $flyerId,
+                'error' => $e->getMessage(),
+            ]);
+        }
+    }
+
     private function fallbackTitle(string $retailerName): string
     {
         return trim($retailerName).' Offers '.Carbon::today('Africa/Cairo')->format('Y-m-d');
@@ -335,7 +486,6 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
     {
         $rawTitle = is_string($rawTitle) ? trim($rawTitle) : '';
 
-        // Strict regex check for 2026 SEO formulas — must match exactly to avoid cannibalization
         $isSingleDay = $validFrom->isSameDay($validUntil);
         $dayNamePattern = '(?:الأحد|الإثنين|الثلاثاء|الأربعاء|الخميس|الجمعة|السبت)';
         $monthPattern = '(?:يناير|فبراير|مارس|أبريل|مايو|يونيو|يوليو|أغسطس|سبتمبر|أكتوبر|نوفمبر|ديسمبر)';
@@ -343,9 +493,7 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
         if ($isSingleDay) {
             $pattern = "/^عروض\s+.+\s+{$dayNamePattern}\s+\d{1,2}\s+{$monthPattern}\s+20\d{2}\s*\|\s*عرض اليوم الواحد$/u";
         } else {
-            // Multi-day: must contain "من X حتى Y Month Year |"
             $pattern = "/^عروض\s+.+\s+من\s+\d{1,2}\s+حتى\s+\d{1,2}\s+{$monthPattern}\s+20\d{2}\s*\|/u";
-            // Also handle cross-month: "من 28 فبراير حتى 5 مارس 2026"
             if ($validFrom->month !== $validUntil->month) {
                 $pattern = "/^عروض\s+.+\s+من\s+\d{1,2}\s+{$monthPattern}\s+حتى\s+\d{1,2}\s+{$monthPattern}\s+20\d{2}\s*\|/u";
             }
@@ -357,7 +505,6 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
             return $rawTitle;
         }
 
-        // Extract theme from raw title if present after |
         $theme = 'مجلة العروض والتوفير';
         if (str_contains($rawTitle, '|')) {
             $parts = explode('|', $rawTitle, 2);
@@ -392,9 +539,7 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
             }
         }
 
-        // Front-load brand and dates, keep under 65 chars where possible (truncate theme if needed)
         if (mb_strlen($title) > 65) {
-            // Keep the date part, truncate theme
             $title = mb_substr($title, 0, 65);
         }
 
@@ -414,7 +559,6 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
 
         $candidate = $base.'-'.$suffix;
 
-        // Ensure uniqueness with loop
         $counter = 0;
         $slug = $candidate;
 
@@ -434,7 +578,6 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
     private static function buildBlufSummary(Flyer $flyer): string
     {
         try {
-            // Try Gemini strict Arabic 2-sentence BLUF first
             try {
                 $retailerName = $flyer->retailer?->name ?? $flyer->retailer()->first()?->name ?? 'المتجر';
                 $from = $flyer->valid_from instanceof Carbon ? $flyer->valid_from->format('d/m/Y') : (string) $flyer->valid_from;
@@ -461,12 +604,11 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
                 Log::debug('Gemini BLUF generation failed, using fallback.', ['flyer_id' => $flyer->id, 'error' => $e->getMessage()]);
             }
 
-            // Fallback high-CTR atomic 2-sentence — 2026 SEO, no English, no space bug
             $titleForBluf = $flyer->title ?? 'العرض';
             $untilCarbon = $flyer->valid_until instanceof Carbon ? $flyer->valid_until : Carbon::parse($flyer->valid_until);
             $untilText = $untilCarbon->locale('ar')->isoFormat('dddd D MMMM YYYY');
             if (! str_contains($untilText, 'سبتمبر') && ! str_contains($untilText, 'يناير')) {
-                $untilText = $this->arabicDayName($untilCarbon).' '.$untilCarbon->day.' '.$this->arabicMonthName((int) $untilCarbon->month).' '.$untilCarbon->year;
+                $untilText = (new self)->arabicDayName($untilCarbon).' '.$untilCarbon->day.' '.(new self)->arabicMonthName((int) $untilCarbon->month).' '.$untilCarbon->year;
             }
             $maxDiscount = $flyer->items()->max('discount_percent');
             $discount = number_format((float) ($maxDiscount ?? 0), 2, '.', '');
@@ -491,13 +633,11 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
     private static function buildEditorialOverview(Flyer $flyer): string
     {
         try {
-            // Try Gemini editorial first
             try {
                 /** @var GeminiVisionService $gemini */
                 $gemini = app(GeminiVisionService::class);
                 $text = $gemini->generateEditorialOverview($flyer);
                 if (trim($text) !== '' && ! preg_match('/[a-zA-Z]/', $text)) {
-                    // Fix space bugs
                     $text = (string) preg_replace('/(\d+)\.\s+(\d+%)/u', '$1.$2', $text);
                     $text = (string) preg_replace('/(\d+)\s+%/u', '$1%', $text);
 
@@ -507,7 +647,6 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
                 Log::debug('Gemini Editorial generation failed, using fallback.', ['flyer_id' => $flyer->id, 'error' => $e->getMessage()]);
             }
 
-            // Fallback: 150-word 2 paragraphs, high-value fluff-free
             $retailerName = $flyer->retailer?->name ?? $flyer->retailer()->first()?->name ?? 'المتجر';
             $title = $flyer->title ?? 'العرض';
             $from = $flyer->valid_from instanceof Carbon ? $flyer->valid_from->format('Y-m-d') : (string) $flyer->valid_from;

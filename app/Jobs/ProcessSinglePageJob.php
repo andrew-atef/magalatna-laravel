@@ -10,6 +10,7 @@ use App\Models\FlyerItem;
 use App\Models\FlyerPage;
 use App\Services\GeminiVisionService;
 use App\Services\ImageOptimizerService;
+use App\Support\ArabicNormalizer;
 use Illuminate\Bus\Batchable;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -170,9 +171,9 @@ final class ProcessSinglePageJob implements ShouldQueue
                 'count' => count($items),
             ]);
 
-            // 4. Insert FlyerPage and FlyerItems within transaction
+            // 4. Insert FlyerPage and FlyerItems within transaction — WITHOUT cascade cache purge
             DB::transaction(function () use ($flyer, $r2Key, $items): void {
-                // Upsert FlyerPage (unique flyer_id + page_number)
+                // Upsert FlyerPage (unique flyer_id + page_number) — no observer, safe
                 $flyerPage = FlyerPage::updateOrCreate(
                     [
                         'flyer_id' => $flyer->id,
@@ -190,127 +191,124 @@ final class ProcessSinglePageJob implements ShouldQueue
                     'flyer_id' => $flyer->id,
                 ]);
 
-                foreach ($items as $raw) {
-                    try {
-                        $productName = trim((string) ($raw['product_name'] ?? ''));
+                // Prevent cascade purge storm: disable FlyerItemObserver touch on every insert
+                FlyerItem::withoutEvents(function () use ($flyer, $flyerPage, $items): void {
+                    foreach ($items as $raw) {
+                        try {
+                            $productName = trim((string) ($raw['product_name'] ?? ''));
 
-                        if ($productName === '') {
-                            Log::warning('Skipping item without product_name.', [
-                                'flyer_id' => $flyer->id,
-                                'page_number' => $this->pageNumber,
-                            ]);
+                            if ($productName === '') {
+                                Log::warning('Skipping item without product_name.', [
+                                    'flyer_id' => $flyer->id,
+                                    'page_number' => $this->pageNumber,
+                                ]);
 
-                            continue;
-                        }
+                                continue;
+                            }
 
-                        $salePrice = (float) ($raw['sale_price'] ?? 0);
-                        $oldPrice = isset($raw['old_price']) && $raw['old_price'] !== null ? (float) $raw['old_price'] : null;
-                        $unit = $raw['unit'] ?? null;
-                        $brandName = $raw['brand_name'] ?? null;
-                        $bundleCondition = $raw['bundle_condition'] ?? null;
-                        $extraAttributes = $raw['extra_attributes'] ?? null;
+                            $salePrice = (float) ($raw['sale_price'] ?? 0);
+                            $oldPrice = isset($raw['old_price']) && $raw['old_price'] !== null ? (float) $raw['old_price'] : null;
+                            $unit = $raw['unit'] ?? null;
+                            $brandName = $raw['brand_name'] ?? null;
+                            $bundleCondition = $raw['bundle_condition'] ?? null;
+                            $extraAttributes = $raw['extra_attributes'] ?? null;
 
-                        // Calculate savings and discount percent if old_price present and valid
-                        $savingsAmount = null;
-                        $discountPercent = null;
+                            // Calculate savings and discount percent if old_price present and valid
+                            $savingsAmount = null;
+                            $discountPercent = null;
 
-                        if ($oldPrice !== null && $oldPrice > 0 && $oldPrice > $salePrice) {
-                            $savingsAmount = round($oldPrice - $salePrice, 2);
-                            $discountPercent = round(($savingsAmount / $oldPrice) * 100, 2);
+                            if ($oldPrice !== null && $oldPrice > 0 && $oldPrice > $salePrice) {
+                                $savingsAmount = round($oldPrice - $salePrice, 2);
+                                $discountPercent = round(($savingsAmount / $oldPrice) * 100, 2);
 
-                            // Guard against unrealistic discounts >90% (likely superscript misread)
-                            if ($discountPercent > 90) {
-                                Log::warning('Unrealistic discount percent, possible superscript parse error.', [
+                                // Guard against unrealistic discounts >90% (likely superscript misread)
+                                if ($discountPercent > 90) {
+                                    Log::warning('Unrealistic discount percent, possible superscript parse error.', [
+                                        'product_name' => $productName,
+                                        'sale_price' => $salePrice,
+                                        'old_price' => $oldPrice,
+                                        'discount_percent' => $discountPercent,
+                                    ]);
+                                }
+                            } elseif ($oldPrice !== null && $oldPrice <= $salePrice) {
+                                // If old_price <= sale_price, treat as no discount (data error)
+                                Log::warning('old_price <= sale_price, clearing discount.', [
                                     'product_name' => $productName,
                                     'sale_price' => $salePrice,
                                     'old_price' => $oldPrice,
-                                    'discount_percent' => $discountPercent,
                                 ]);
+                                $savingsAmount = null;
+                                $discountPercent = null;
+                                $oldPrice = null;
                             }
-                        } elseif ($oldPrice !== null && $oldPrice <= $salePrice) {
-                            // If old_price <= sale_price, treat as no discount (data error)
-                            Log::warning('old_price <= sale_price, clearing discount.', [
+
+                            // Brand resolution
+                            $brandId = null;
+
+                            if (is_string($brandName) && trim($brandName) !== '') {
+                                $brandNameTrim = trim($brandName);
+                                $brandSlug = Str::slug($brandNameTrim);
+
+                                if ($brandSlug === '') {
+                                    $brandSlug = 'brand-'.Str::lower(Str::ulid()->toString());
+                                }
+
+                                try {
+                                    $brand = Brand::firstOrCreate(
+                                        ['name' => $brandNameTrim],
+                                        ['slug' => $this->uniqueBrandSlug($brandSlug)]
+                                    );
+                                    $brandId = $brand->id;
+                                } catch (Throwable $e) {
+                                    Log::warning('Failed to resolve brand, proceeding without brand.', [
+                                        'brand_name' => $brandNameTrim,
+                                        'error' => $e->getMessage(),
+                                    ]);
+                                }
+                            }
+
+                            $slug = Str::slug($productName);
+
+                            if ($slug === '') {
+                                $slug = 'product-'.Str::lower(Str::ulid()->toString());
+                            }
+
+                            $slug = $slug.'-'.substr(Str::ulid()->toString(), -4);
+
+                            // extra_attributes json
+                            $extraJson = null;
+
+                            if (is_array($extraAttributes) && $extraAttributes !== []) {
+                                $extraJson = $extraAttributes;
+                            } elseif (is_array($extraAttributes) && $extraAttributes === []) {
+                                $extraJson = null;
+                            }
+
+                            FlyerItem::create([
+                                'flyer_id' => $flyer->id,
+                                'flyer_page_id' => $flyerPage->id,
+                                'brand_id' => $brandId,
                                 'product_name' => $productName,
+                                'slug' => $slug,
+                                'normalized_name' => ArabicNormalizer::normalize($productName),
                                 'sale_price' => $salePrice,
                                 'old_price' => $oldPrice,
+                                'savings_amount' => $savingsAmount,
+                                'discount_percent' => $discountPercent,
+                                'unit' => is_string($unit) && trim($unit) !== '' ? trim($unit) : null,
+                                'bundle_condition' => is_string($bundleCondition) && trim($bundleCondition) !== '' ? trim($bundleCondition) : null,
+                                'extra_attributes' => $extraJson,
+                                'is_featured' => false,
                             ]);
-                            $savingsAmount = null;
-                            $discountPercent = null;
-                            $oldPrice = null;
+                        } catch (Throwable $e) {
+                            Log::error('Failed to insert flyer_item.', [
+                                'flyer_id' => $flyer->id,
+                                'product_name' => $raw['product_name'] ?? 'unknown',
+                                'error' => $e->getMessage(),
+                            ]);
                         }
-
-                        // Brand resolution
-                        $brandId = null;
-
-                        if (is_string($brandName) && trim($brandName) !== '') {
-                            $brandNameTrim = trim($brandName);
-                            $brandSlug = Str::slug($brandNameTrim);
-
-                            if ($brandSlug === '') {
-                                $brandSlug = 'brand-'.Str::lower(Str::ulid()->toString());
-                            }
-
-                            try {
-                                $brand = Brand::firstOrCreate(
-                                    ['name' => $brandNameTrim],
-                                    ['slug' => $this->uniqueBrandSlug($brandSlug)]
-                                );
-                                $brandId = $brand->id;
-                            } catch (Throwable $e) {
-                                Log::warning('Failed to resolve brand, proceeding without brand.', [
-                                    'brand_name' => $brandNameTrim,
-                                    'error' => $e->getMessage(),
-                                ]);
-                            }
-                        }
-
-                        $slug = Str::slug($productName);
-
-                        if ($slug === '') {
-                            $slug = 'product-'.Str::lower(Str::ulid()->toString());
-                        }
-
-                        $slug = $slug.'-'.substr(Str::ulid()->toString(), -4);
-
-                        // Ensure slug uniqueness within flyer_items? Not required globally unique, but indexed
-                        // extra_attributes json
-                        $extraJson = null;
-
-                        if (is_array($extraAttributes) && $extraAttributes !== []) {
-                            $extraJson = $extraAttributes;
-                        } elseif (is_array($extraAttributes) && $extraAttributes === []) {
-                            $extraJson = null;
-                        }
-
-                        FlyerItem::create([
-                            'flyer_id' => $flyer->id,
-                            'flyer_page_id' => $flyerPage->id,
-                            'brand_id' => $brandId,
-                            'product_name' => $productName,
-                            'slug' => $slug,
-                            // normalized_name auto via observer/hook
-                            'sale_price' => $salePrice,
-                            'old_price' => $oldPrice,
-                            'savings_amount' => $savingsAmount,
-                            'discount_percent' => $discountPercent,
-                            'unit' => is_string($unit) && trim($unit) !== '' ? trim($unit) : null,
-                            'bundle_condition' => is_string($bundleCondition) && trim($bundleCondition) !== '' ? trim($bundleCondition) : null,
-                            'extra_attributes' => $extraJson,
-                            'is_featured' => false,
-                        ]);
-                    } catch (Throwable $e) {
-                        Log::error('Failed to insert flyer_item.', [
-                            'flyer_id' => $flyer->id,
-                            'product_name' => $raw['product_name'] ?? 'unknown',
-                            'error' => $e->getMessage(),
-                        ]);
-
-                        // Continue to next item, don't fail entire transaction for one bad item
-                        // But we are inside DB transaction, so we catch and continue to allow other items
-                        // To avoid rollback of all items, we could use savepoint? For now, log and continue
-                        // Re-throw only if critical? We'll continue.
                     }
-                }
+                });
             });
 
             Log::info('ProcessSinglePageJob completed successfully.', [
