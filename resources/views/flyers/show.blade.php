@@ -65,8 +65,8 @@
                     '@id' => $eventId,
                     'name' => $cleanTitle,
                     'description' => $bluf,
-                    'startDate' => \Carbon\Carbon::createFromFormat('Y-m-d', $flyer->valid_from->format('Y-m-d'), 'Africa/Cairo')->startOfDay()->toIso8601String(),
-                    'endDate' => \Carbon\Carbon::createFromFormat('Y-m-d', $flyer->valid_until->format('Y-m-d'), 'Africa/Cairo')->endOfDay()->toIso8601String(),
+                    'startDate' => \Carbon\Carbon::parse($flyer->valid_from)->startOfDay()->toIso8601String(),
+                    'endDate' => \Carbon\Carbon::parse($flyer->valid_until)->endOfDay()->toIso8601String(),
                     'eventStatus' => $flyer->isExpired() ? 'https://schema.org/EventCancelled' : 'https://schema.org/EventScheduled',
                     'eventAttendanceMode' => 'https://schema.org/OfflineEventAttendanceMode',
                     'location' => [
@@ -91,7 +91,7 @@
                             'url' => $pageUrl . '#item-' . $item->id,
                             'price' => number_format((float) $item->sale_price, 2, '.', ''),
                             'priceCurrency' => 'EGP',
-                            'priceValidUntil' => \Carbon\Carbon::createFromFormat('Y-m-d', $flyer->valid_until->format('Y-m-d'), 'Africa/Cairo')->format('Y-m-d'),
+                            'priceValidUntil' => \Carbon\Carbon::parse($flyer->valid_until)->format('Y-m-d'),
                             'availability' => $flyer->isExpired() ? 'https://schema.org/Discontinued' : 'https://schema.org/InStock',
                             'seller' => ['@type' => 'Organization', 'name' => $flyer->retailer->name],
                         ];

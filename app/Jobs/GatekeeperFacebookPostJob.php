@@ -69,8 +69,8 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
             if ($count >= 2) {
                 $sampleImageUrls[] = $this->imageUrls[1]; // Page 2 (Crucial for dates & first price tables)
             }
-            if ($count >= 4) {
-                $sampleImageUrls[] = $this->imageUrls[$count - 1]; // Last Page (Back cover/terms)
+            if ($count >= 3) {
+                $sampleImageUrls[] = $this->imageUrls[$count - 1]; // Last Page
             }
             $sampleImageUrls = array_values(array_unique($sampleImageUrls));
 
@@ -195,10 +195,22 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
                         'retailer_id' => $retailer->id,
                     ]);
 
+                    if ($this->rawFacebookPostId !== null) {
+                        $rawPost = RawFacebookPost::find($this->rawFacebookPostId);
+                        if ($rawPost !== null) {
+                            $rawPost->update([
+                                'flyer_id' => $existingFlyer->id,
+                                'status' => 'rejected',
+                                'rejection_reason' => 'تم التخطي أثناء الدمج: جميع صور المنشور مدمجة بالفعل في المجلة #' . $existingFlyer->id,
+                            ]);
+                        }
+                    }
+
                     return;
                 }
 
-                $startPageNumber = (int) ($existingFlyer->pages()->max('page_number') ?? 0);
+                $maxDbPage = (int) ($existingFlyer->pages()->max('page_number') ?? 0);
+                $startPageNumber = max((int) $existingFlyer->total_pages, $maxDbPage);
                 $newPagesCount = count($filteredImageUrls);
 
                 Log::info('[CONSOLIDATION] Merging ' . $newPagesCount . ' new pages into existing flyer #' . $existingFlyer->id . '.', [
