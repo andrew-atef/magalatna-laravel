@@ -8,6 +8,7 @@ use App\Http\Controllers\Controller;
 use App\Jobs\GatekeeperFacebookPostJob;
 use App\Models\RawFacebookPost;
 use App\Models\Retailer;
+use Carbon\Carbon;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
@@ -37,7 +38,8 @@ final class RawFacebookIngestController extends Controller
             $postText = (string) $validated['post_text'];
             /** @var list<string> $imageUrls */
             $imageUrls = array_values($validated['image_urls']);
-            $publishedAt = (string) $validated['published_at'];
+            $publishedAtRaw = (string) $validated['published_at'];
+            $cairoPublishedAt = Carbon::parse($publishedAtRaw)->setTimezone('Africa/Cairo');
 
             // Zero data loss: persist every incoming payload
             $retailer = Retailer::where('slug', $retailerSlug)->firstOrFail();
@@ -50,7 +52,7 @@ final class RawFacebookIngestController extends Controller
                 [
                     'post_text' => $postText ?? null,
                     'image_urls' => $imageUrls,
-                    'published_at' => $publishedAt ?? now(),
+                    'published_at' => $cairoPublishedAt,
                     'status' => 'pending',
                 ]
             );
@@ -61,7 +63,7 @@ final class RawFacebookIngestController extends Controller
                 facebookPostId: $facebookPostId,
                 postText: $postText,
                 imageUrls: $imageUrls,
-                publishedAt: $publishedAt,
+                publishedAt: $cairoPublishedAt->toIso8601String(),
                 rawFacebookPostId: $rawPost->id,
             );
 
