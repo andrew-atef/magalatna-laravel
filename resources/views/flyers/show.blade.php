@@ -175,20 +175,20 @@
                 $until = \Carbon\Carbon::parse($flyer->valid_until, 'Africa/Cairo');
             @endphp
             <div class="flex items-center gap-3">
-                @if ($from->isFuture())
+                @if ($flyer->isExpired())
+                    <span class="rounded-xl border border-slate-200 bg-slate-100 px-3 py-1.5 text-xs font-bold text-slate-600">
+                        انتهى في {{ $until->format('d/m/Y') }}
+                    </span>
+                @elseif ($from->isFuture())
                     <span class="rounded-xl border border-[#fcc023]/50 bg-[#fcc023] px-3 py-1.5 text-xs font-bold text-slate-900">
                         يبدأ قريباً {{ $from->format('d/m/Y') }}
                     </span>
                     <span class="rounded-xl border border-[#023b55]/15 bg-white px-3 py-1.5 text-xs font-bold text-[#023b55]">
                         سارٍ من {{ $from->format('d/m/Y') }} حتى {{ $until->format('d/m/Y') }}
                     </span>
-                @elseif ($until->isPast())
-                    <span class="rounded-xl border border-slate-200 bg-slate-100 px-3 py-1.5 text-xs font-bold text-slate-600">
-                        انتهى في {{ $until->format('d/m/Y') }}
-                    </span>
                 @else
                     <span class="rounded-xl border border-[#039652]/30 bg-[#039652]/10 px-3 py-1.5 text-xs font-bold text-[#039652]">
-                        سارٍ حتى {{ $until->format('d/m/Y') }}
+                        سارٍ حتى {{ \Carbon\Carbon::parse($flyer->valid_until)->format('d/m/Y') }}
                     </span>
                 @endif
             </div>

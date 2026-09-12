@@ -8,6 +8,7 @@ use App\Filament\Resources\RawFacebookPostResource\Pages;
 use App\Jobs\ProcessSinglePageJob;
 use App\Models\Flyer;
 use App\Models\RawFacebookPost;
+use App\Support\FacebookMediaHelper;
 use Filament\Forms;
 use Filament\Forms\Form;
 use Filament\Notifications\Notification;
@@ -179,7 +180,8 @@ final class RawFacebookPostResource extends Resource
 
                 Tables\Columns\TextColumn::make('published_at')
                     ->label('تاريخ النشر')
-                    ->dateTime('Y-m-d H:i')
+                    ->dateTime('Y/m/d h:i A')
+                    ->timezone('Africa/Cairo')
                     ->sortable()
                     ->toggleable(),
 
@@ -284,10 +286,49 @@ final class RawFacebookPostResource extends Resource
                                 ->whereIn('status', [\App\Enums\FlyerStatus::Draft, \App\Enums\FlyerStatus::PendingReview, \App\Enums\FlyerStatus::Published])
                                 ->first();
 
+                            $imageUrls = is_array($record->image_urls) ? array_values($record->image_urls) : [];
+
                             if ($existing !== null) {
+                                // Signature dedup: skip photos already merged (host-independent —
+                                // Facebook rotates scontent-cdg/mrs/prg edge hosts for identical photos).
+                                $existingSignatures = RawFacebookPost::where('flyer_id', $existing->id)
+                                    ->pluck('image_urls')
+                                    ->flatten()
+                                    ->filter()
+                                    ->map(fn (mixed $u) => FacebookMediaHelper::extractPhotoSignature((string) $u))
+                                    ->unique()
+                                    ->all();
+
+                                $seen = $existingSignatures;
+                                $uniqueUrls = [];
+                                foreach ($imageUrls as $url) {
+                                    $sig = FacebookMediaHelper::extractPhotoSignature((string) $url);
+                                    if (in_array($sig, $seen, true)) {
+                                        continue;
+                                    }
+                                    $seen[] = $sig;
+                                    $uniqueUrls[] = (string) $url;
+                                }
+                                $imageUrls = array_values($uniqueUrls);
+
                                 $flyer = $existing;
                                 $startPage = (int) ($flyer->pages()->max('page_number') ?? 0);
-                                $flyer->total_pages = (int) $flyer->total_pages + count((array) $record->image_urls);
+
+                                if ($imageUrls === []) {
+                                    $record->update([
+                                        'status' => 'manually_approved',
+                                        'flyer_id' => $flyer->id,
+                                    ]);
+
+                                    Notification::make()
+                                        ->title('جميع صور المنشور مدمجة بالفعل في المجلة — تم الربط بدون صفحات جديدة.')
+                                        ->success()
+                                        ->send();
+
+                                    return;
+                                }
+
+                                $flyer->total_pages = (int) $flyer->total_pages + count($imageUrls);
                                 $flyer->save();
                             } else {
                                 $flyer = Flyer::create([
@@ -297,7 +338,7 @@ final class RawFacebookPostResource extends Resource
                                     'valid_from' => $validFrom,
                                     'valid_until' => $validUntil,
                                     'status' => \App\Enums\FlyerStatus::Draft,
-                                    'total_pages' => count((array) $record->image_urls),
+                                    'total_pages' => count($imageUrls),
                                 ]);
                                 $startPage = 0;
                             }
@@ -306,8 +347,6 @@ final class RawFacebookPostResource extends Resource
                                 'status' => 'manually_approved',
                                 'flyer_id' => $flyer->id,
                             ]);
-
-                            $imageUrls = is_array($record->image_urls) ? array_values($record->image_urls) : [];
 
                             foreach ($imageUrls as $index => $url) {
                                 $pageNumber = $startPage + $index + 1;

@@ -25,9 +25,9 @@ final class GeminiVisionService
         return trim($model) !== '' ? trim($model) : 'gemini-2.5-flash';
     }
 
-    private const MAX_RETRIES = 3;
+    private const MAX_RETRIES = 4;
 
-    private const INITIAL_RETRY_DELAY_MS = 2000;
+    private const INITIAL_RETRY_DELAY_MS = 8000;
 
     /**
      * Phase 1: Gatekeeper / Classification.
@@ -246,7 +246,10 @@ final class GeminiVisionService
 
                 if ($status === 429) {
                     $retryAfter = (int) $response->header('Retry-After');
-                    $waitMs = $retryAfter > 0 ? $retryAfter * 1000 : $delayMs;
+                    // Linear backoff scaled to the 60s RPM window:
+                    // Attempt 1 = 8s, Attempt 2 = 16s, Attempt 3 = 24s, Attempt 4 = 32s.
+                    // Honors server-sent Retry-After when present.
+                    $waitMs = $retryAfter > 0 ? $retryAfter * 1000 : ($attempt * self::INITIAL_RETRY_DELAY_MS);
 
                     Log::warning('Gemini API 429 Too Many Requests.', [
                         'attempt' => $attempt,
@@ -259,7 +262,6 @@ final class GeminiVisionService
                     }
 
                     usleep($waitMs * 1000);
-                    $delayMs *= 2;
 
                     continue;
                 }

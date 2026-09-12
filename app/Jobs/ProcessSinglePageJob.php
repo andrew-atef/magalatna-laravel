@@ -287,13 +287,31 @@ final class ProcessSinglePageJob implements ShouldQueue
                                 $extraJson = null;
                             }
 
+                            $normalizedName = ArabicNormalizer::normalize($productName);
+
+                            // Check if identical item (same normalized name and exact sale price) already exists in THIS flyer
+                            $existingItem = FlyerItem::where('flyer_id', $flyer->id)
+                                ->where('normalized_name', $normalizedName)
+                                ->where('sale_price', $salePrice)
+                                ->first();
+
+                            if ($existingItem !== null) {
+                                Log::info('Skipping duplicate product within flyer.', [
+                                    'flyer_id' => $flyer->id,
+                                    'product_name' => $productName,
+                                    'sale_price' => $salePrice,
+                                ]);
+
+                                continue;
+                            }
+
                             FlyerItem::create([
                                 'flyer_id' => $flyer->id,
                                 'flyer_page_id' => $flyerPage->id,
                                 'brand_id' => $brandId,
                                 'product_name' => $productName,
                                 'slug' => $slug,
-                                'normalized_name' => ArabicNormalizer::normalize($productName),
+                                'normalized_name' => $normalizedName,
                                 'sale_price' => $salePrice,
                                 'old_price' => $oldPrice,
                                 'savings_amount' => $savingsAmount,

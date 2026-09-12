@@ -6,11 +6,15 @@ namespace App\Console\Commands;
 
 use App\Jobs\PurgeCloudflareCacheJob;
 use App\Models\Flyer;
+use App\Models\FlyerItem;
+use App\Models\FlyerPage;
 use App\Models\Retailer;
+use App\Support\ArabicNormalizer;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Storage;
 
 final class DeduplicateFlyersCommand extends Command
 {
@@ -30,6 +34,11 @@ final class DeduplicateFlyersCommand extends Command
         $pagesMoved = 0;
         $itemsMoved = 0;
         $itemsDeleted = 0;
+        $pagesCompressed = 0;
+        $flyersCompressed = 0;
+        $blufRegenerated = 0;
+        /** @var array<int, true> $touchedFlyerIds Flyers whose pages/items changed and need BLUF refresh */
+        $touchedFlyerIds = [];
 
         // 1. Clean Duplicate Retailers by canonical key.
         // Catches bim/bimmisr, kazyon/kazyonegypt, carrefour/carrefouregypt
@@ -248,26 +257,119 @@ final class DeduplicateFlyersCommand extends Command
         }
         $this->info(" → مجموعات مكررة: {$flyersMerged} مجموعة، حذف {$flyersDeleted} مجلة مكررة، نقل {$pagesMoved} صفحة و {$itemsMoved} منتج");
 
-        // 3. Deduplicate FlyerItem Records within each flyer (same product_name + sale_price)
-        $this->info('3) إزالة المنتجات المكررة داخل كل مجلة...');
-        $flyersAll = Flyer::with('items')->get();
-        foreach ($flyersAll as $flyer) {
-            $seen = [];
-            foreach ($flyer->items()->orderBy('id')->get() as $item) {
-                $key = mb_strtolower(trim((string) $item->product_name)) . '|' . number_format((float) $item->sale_price, 2, '.', '');
-                if (isset($seen[$key])) {
-                    if (! $dryRun) {
-                        $item->delete();
+        // 3. Compress bloated flyers: identical R2 image content → keep first copy.
+        // (e.g. 30 pages from 6x-merged 5-image album → 5 unique pages).
+        // R2 filenames are random ULIDs, so only a content MD5 is a reliable signal.
+        // Zero data loss: items on deleted pages are relinked to the surviving copy.
+        $this->info('3) ضغط المجلات المتضخمة (صفحات مكررة بنفس المحتوى)...');
+        Flyer::query()->orderBy('id')->chunk(50, function ($flyers) use ($dryRun, &$pagesCompressed, &$flyersCompressed, &$touchedFlyerIds): void {
+            foreach ($flyers as $flyer) {
+                $pages = $flyer->pages()->orderBy('page_number')->orderBy('id')->get();
+                if ($pages->count() <= 1) {
+                    continue;
+                }
+
+                $bySignature = [];
+                /** @var array<int, int> $dupMap dupPageId => keptPageId */
+                $dupMap = [];
+                foreach ($pages as $page) {
+                    $sig = self::pageContentSignature(trim((string) $page->image_path), (int) $page->id);
+                    if (! isset($bySignature[$sig])) {
+                        $bySignature[$sig] = $page;
+
+                        continue;
                     }
-                    $itemsDeleted++;
-                } else {
-                    $seen[$key] = true;
+                    $dupMap[(int) $page->id] = (int) $bySignature[$sig]->id;
+                }
+
+                if ($dupMap === []) {
+                    continue;
+                }
+
+                $this->line(" - مجلة متضخمة #{$flyer->id} ({$flyer->slug}): {$pages->count()} صفحة → " . ($pages->count() - count($dupMap)) . ' فريدة');
+
+                if (! $dryRun) {
+                    DB::transaction(function () use ($flyer, $dupMap): void {
+                        foreach ($dupMap as $dupId => $keptId) {
+                            // Relink items to the surviving copy before deleting the page
+                            FlyerItem::where('flyer_page_id', $dupId)->update(['flyer_page_id' => $keptId]);
+                            FlyerPage::where('id', $dupId)->delete();
+                        }
+
+                        // Resequence 1..N (two-phase to respect UNIQUE flyer_id+page_number)
+                        $offset = 1000000;
+                        $seq = 0;
+                        $ids = DB::table('flyer_pages')->where('flyer_id', $flyer->id)->orderBy('page_number')->orderBy('id')->pluck('id');
+                        foreach ($ids as $pid) {
+                            DB::table('flyer_pages')->where('id', $pid)->update(['page_number' => $offset + ($seq++), 'updated_at' => now()]);
+                        }
+                        $seq = 1;
+                        $ordered = DB::table('flyer_pages')->where('flyer_id', $flyer->id)->orderBy('page_number')->orderBy('id')->pluck('id');
+                        foreach ($ordered as $pid) {
+                            DB::table('flyer_pages')->where('id', $pid)->update(['page_number' => $seq++, 'updated_at' => now()]);
+                        }
+                        $flyer->update(['total_pages' => $ordered->count()]);
+                    });
+                }
+
+                $pagesCompressed += count($dupMap);
+                $flyersCompressed++;
+                $touchedFlyerIds[(int) $flyer->id] = true;
+            }
+        });
+        $this->info(" → ضغط {$flyersCompressed} مجلة متضخمة، حذف {$pagesCompressed} صفحة مكررة المحتوى");
+
+        // 4. Deduplicate FlyerItem Records within each flyer by [flyer_id, normalized_name, sale_price]
+        $this->info('4) إزالة المنتجات المكررة داخل كل مجلة...');
+        Flyer::query()->orderBy('id')->chunk(50, function ($flyers) use ($dryRun, &$itemsDeleted, &$touchedFlyerIds): void {
+            foreach ($flyers as $flyer) {
+                $seen = [];
+                $flyerTouched = false;
+                foreach ($flyer->items()->orderBy('id')->get() as $item) {
+                    $norm = trim((string) $item->normalized_name);
+                    if ($norm === '') {
+                        $norm = ArabicNormalizer::normalize((string) $item->product_name);
+                        if (! $dryRun && $norm !== '') {
+                            $item->update(['normalized_name' => $norm]);
+                        }
+                    }
+                    $key = mb_strtolower($norm) . '|' . number_format((float) $item->sale_price, 2, '.', '');
+                    if (isset($seen[$key])) {
+                        if (! $dryRun) {
+                            $item->delete();
+                        }
+                        $itemsDeleted++;
+                        $flyerTouched = true;
+                    } else {
+                        $seen[$key] = true;
+                    }
+                }
+                if ($flyerTouched) {
+                    $touchedFlyerIds[(int) $flyer->id] = true;
                 }
             }
-        }
+        });
         $this->info(" → حذف {$itemsDeleted} منتج مكرر");
 
-        // 4. Flush & Invalidate Caches
+        // 5. Regenerate BLUF + Editorial Overview for cleaned flyers.
+        // Nulling the stored columns lets the Flyer accessors rebuild fresh summaries
+        // deterministically from the merged items (zero Gemini API cost, no 429 risk).
+        if (! $dryRun && $touchedFlyerIds !== []) {
+            $this->info('5) تجديد ملخصات BLUF للمجلات المنظفة...');
+            foreach (array_keys($touchedFlyerIds) as $fid) {
+                $f = Flyer::find($fid);
+                if ($f === null) {
+                    continue;
+                }
+                $f->update(['bluf_summary' => null, 'editorial_overview' => null]);
+                $blufRegenerated++;
+            }
+            $this->info(" → تم تجديد {$blufRegenerated} ملخص");
+        } else {
+            $this->info($dryRun ? '5) [Dry Run] سيتم تجديد ملخصات BLUF للمجلات المنظفة.' : '5) لا توجد مجلات تحتاج تجديد ملخصات.');
+        }
+
+        // 6. Flush & Invalidate Caches
         if (! $dryRun) {
             Cache::flush();
             Cache::forget('sitemap_xml_content');
@@ -288,7 +390,10 @@ final class DeduplicateFlyersCommand extends Command
                 ['المجلات المكررة المحذوفة', $flyersDeleted],
                 ['الصفحات المنقولة', $pagesMoved],
                 ['المنتجات المنقولة', $itemsMoved],
+                ['الصفحات المضغوطة (محتوى مكرر)', $pagesCompressed],
+                ['المجلات المضغوطة', $flyersCompressed],
                 ['المنتجات المكررة المحذوفة', $itemsDeleted],
+                ['ملخصات BLUF المجددة', $blufRegenerated],
             ]
         );
 
@@ -298,11 +403,41 @@ final class DeduplicateFlyersCommand extends Command
     }
 
     /**
+     * Content signature for a stored R2 page image.
+     *
+     * R2 filenames are random ULIDs, so the key alone can never match duplicates —
+     * only an MD5 of the stored bytes is reliable. If the object is unreadable
+     * (R2 offline, missing key), returns a per-page unique key so the page is
+     * conservatively KEPT (zero data loss: never delete on uncertain signal).
+     */
+    private static function pageContentSignature(string $imagePath, int $pageId): string
+    {
+        $path = trim($imagePath);
+        if ($path === '') {
+            return 'unreadable-' . $pageId;
+        }
+
+        try {
+            $binary = Storage::disk('r2')->get($path);
+            if (is_string($binary) && $binary !== '') {
+                return 'md5:' . md5($binary);
+            }
+        } catch (\Throwable $e) {
+            Log::debug('Deduplicate: R2 read failed, keeping page as unique.', [
+                'page_id' => $pageId,
+                'image_path' => $path,
+                'error' => $e->getMessage(),
+            ]);
+        }
+
+        return 'unreadable-' . $pageId;
+    }
+
+    /**
      * Canonical grouping key: bim/bimmisr/bim-egypt → bim,
      * kazyon/kazyonegypt → kazyon, carrefour/carrefouregypt → carrefour,
      * «بيم مصر» → «بيم».
-     */
-    private static function canonicalRetailerKey(Retailer $retailer): string
+     */    private static function canonicalRetailerKey(Retailer $retailer): string
     {
         $slug = mb_strtolower(trim((string) $retailer->slug));
         $key = $slug !== '' ? $slug : mb_strtolower(trim((string) $retailer->name));

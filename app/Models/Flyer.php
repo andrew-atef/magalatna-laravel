@@ -206,7 +206,15 @@ class Flyer extends Model
 
     public function isExpired(): bool
     {
-        return $this->status === FlyerStatus::Expired
-            || Carbon::parse($this->valid_until, 'Africa/Cairo')->isPast();
+        if ($this->status === \App\Enums\FlyerStatus::Expired) {
+            return true;
+        }
+
+        if (empty($this->valid_until)) {
+            return false;
+        }
+
+        // A flyer is only expired if the current Cairo time has passed the END of the valid_until day (23:59:59)
+        return \Carbon\Carbon::parse($this->valid_until, 'Africa/Cairo')->endOfDay()->isPast();
     }
 }

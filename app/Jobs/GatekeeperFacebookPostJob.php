@@ -11,6 +11,7 @@ use App\Models\RawFacebookPost;
 use App\Models\Retailer;
 use App\Services\FlyerSlugService;
 use App\Services\GeminiVisionService;
+use App\Support\FacebookMediaHelper;
 use Carbon\Carbon;
 use Illuminate\Bus\Batch;
 use Illuminate\Bus\Queueable;
@@ -223,39 +224,47 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
 
                     // 3. STRICT MERGE: If ANY existing flyer matched, merge unique images into it. NEVER create -part-2!
                     if ($existingFlyer !== null) {
-                        $existingRawUrls = RawFacebookPost::where('flyer_id', $existingFlyer->id)
-                    ->pluck('image_urls')
-                    ->flatten()
-                    ->filter()
-                    ->map(fn (string $u) => strtok(trim($u), '?'))
-                    ->all();
+                        // Immutable photo-signature dedup: Facebook serves identical photos from
+                        // rotating edge hosts (scontent-cdg/mrs/prg...), so full-URL comparison
+                        // misses duplicates. Match on the host-independent photo signature.
+                        $existingRawSignatures = RawFacebookPost::where('flyer_id', $existingFlyer->id)
+                            ->pluck('image_urls')
+                            ->flatten()
+                            ->filter()
+                            ->map(fn (mixed $u) => FacebookMediaHelper::extractPhotoSignature((string) $u))
+                            ->unique()
+                            ->all();
 
-                $filteredImageUrls = array_values(array_filter($this->imageUrls, function (string $url) use ($existingRawUrls): bool {
-                    $cleanUrl = strtok(trim($url), '?');
-                    return ! in_array($cleanUrl, $existingRawUrls, true);
-                }));
-                $filteredImageUrls = array_values(array_unique($filteredImageUrls));
-
-                if ($filteredImageUrls === []) {
-                    Log::info('[CONSOLIDATION] No new unique pages to merge, skipping.', [
-                        'existing_flyer_id' => $existingFlyer->id,
-                        'existing_slug' => $existingFlyer->slug,
-                        'retailer_id' => $retailer->id,
-                    ]);
-
-                    if ($this->rawFacebookPostId !== null) {
-                        $rawPost = RawFacebookPost::find($this->rawFacebookPostId);
-                        if ($rawPost !== null) {
-                            $rawPost->update([
-                                'flyer_id' => $existingFlyer->id,
-                                'status' => 'rejected',
-                                'rejection_reason' => 'تم التخطي أثناء الدمج: جميع صور المنشور مدمجة بالفعل في المجلة #' . $existingFlyer->id,
-                            ]);
+                        // Filter incoming URLs by signature; also collapse intra-batch
+                        // host-varied duplicates of the same photo within this post.
+                        $seenSignatures = $existingRawSignatures;
+                        $filteredImageUrls = [];
+                        foreach ($this->imageUrls as $url) {
+                            $sig = FacebookMediaHelper::extractPhotoSignature((string) $url);
+                            if (in_array($sig, $seenSignatures, true)) {
+                                continue;
+                            }
+                            $seenSignatures[] = $sig;
+                            $filteredImageUrls[] = (string) $url;
                         }
-                    }
+                        $filteredImageUrls = array_values($filteredImageUrls);
 
-                    return;
-                }
+                        if ($filteredImageUrls === []) {
+                            Log::info('[CONSOLIDATION] Zero new unique photo signatures to merge, skipping.', [
+                                'existing_flyer_id' => $existingFlyer->id,
+                                'retailer_id' => $retailer->id,
+                            ]);
+
+                            if ($this->rawFacebookPostId !== null) {
+                                RawFacebookPost::where('id', $this->rawFacebookPostId)->update([
+                                    'flyer_id' => $existingFlyer->id,
+                                    'status' => 'rejected',
+                                    'rejection_reason' => 'تم التخطي: جميع صور المنشور مدمجة بالفعل في المجلة #' . $existingFlyer->id,
+                                ]);
+                            }
+
+                            return;
+                        }
 
                 $maxDbPage = (int) ($existingFlyer->pages()->max('page_number') ?? 0);
                 $startPageNumber = max((int) $existingFlyer->total_pages, $maxDbPage);
@@ -482,6 +491,16 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
                 return;
             }
         } catch (Throwable $e) {
+            if (str_contains($e->getMessage(), '429') || str_contains($e->getMessage(), 'rate limit') || str_contains($e->getMessage(), 'rate limited')) {
+                Log::warning('Gatekeeper hit Gemini 429 rate limit, releasing job back to queue for 30s.', [
+                    'facebook_post_id' => $this->facebookPostId,
+                    'attempt' => $this->attempts(),
+                ]);
+                $this->release(30);
+
+                return;
+            }
+
             Log::error('GatekeeperFacebookPostJob failed.', [
                 'retailer_slug' => $this->retailerSlug,
                 'facebook_post_id' => $this->facebookPostId,
