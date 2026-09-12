@@ -37,6 +37,8 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
 
     public int $timeout = 120;
 
+    public ?int $rawFacebookPostId = null;
+
     /**
      * @param  list<string>  $imageUrls
      */
@@ -46,8 +48,17 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
         public readonly string $postText,
         public readonly array $imageUrls,
         public readonly string $publishedAt,
-        public readonly ?int $rawFacebookPostId = null,
-    ) {}
+        ?int $rawFacebookPostId = null,
+    ) {
+        $this->rawFacebookPostId = $rawFacebookPostId;
+    }
+
+    public function __wakeup(): void
+    {
+        if (! isset($this->rawFacebookPostId)) {
+            $this->rawFacebookPostId = null;
+        }
+    }
 
     /**
      * Execute the job.
