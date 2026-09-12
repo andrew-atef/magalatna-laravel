@@ -14,6 +14,7 @@ use App\Services\GeminiVisionService;
 use Carbon\Carbon;
 use Illuminate\Bus\Batch;
 use Illuminate\Bus\Queueable;
+use Illuminate\Contracts\Cache\LockTimeoutException;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
@@ -179,15 +180,50 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
                 throw new \RuntimeException('Retailer not found: '.$this->retailerSlug);
             }
 
-            // === CONSOLIDATION CHECK: Merge same-period posts instead of fragmenting ===
-            $existingFlyer = Flyer::where('retailer_id', $retailer->id)
-                ->where('valid_from', $validFromCarbon->toDateString())
-                ->where('valid_until', $validUntilCarbon->toDateString())
-                ->whereIn('status', [FlyerStatus::Draft, FlyerStatus::PendingReview, FlyerStatus::Published])
-                ->first();
+            // === ATOMIC INGEST LOCK: serialize all ingest for this retailer ===
+            // Prevents concurrent workers from both seeing existingFlyer === null
+            // and creating duplicate -part-2 flyers for the same period.
+            $lockKey = 'flyer_ingest_lock_'.$retailer->id;
+            $fromStr = $validFromCarbon->toDateString();
+            $untilStr = $validUntilCarbon->toDateString();
 
-            if ($existingFlyer !== null) {
-                $existingRawUrls = RawFacebookPost::where('flyer_id', $existingFlyer->id)
+            try {
+                Cache::lock($lockKey, 60)->block(30, function () use ($gemini, $slugService, $retailer, $validFromCarbon, $validUntilCarbon, $governorates, $flyerTitle, $count, $fromStr, $untilStr): void {
+                    // 1. Search for ANY existing flyer for this retailer within matching/overlapping date range
+                    $existingFlyer = Flyer::where('retailer_id', $retailer->id)
+                        ->where(function ($q) use ($fromStr, $untilStr): void {
+                            $q->where(function ($exact) use ($fromStr, $untilStr): void {
+                                $exact->where('valid_from', $fromStr)->where('valid_until', $untilStr);
+                            })->orWhere(function ($sub) use ($fromStr, $untilStr): void {
+                                $sub->whereDate('valid_from', '<=', $untilStr)
+                                    ->whereDate('valid_until', '>=', $fromStr);
+                            });
+                        })
+                        ->whereIn('status', [FlyerStatus::Draft, FlyerStatus::PendingReview, FlyerStatus::Published])
+                        ->orderBy('id')
+                        ->first();
+
+                    // 2. Also check if the generated slug base already exists (catches renamed duplicates)
+                    $baseSlug = $slugService->generate($retailer->slug, $fromStr, $untilStr);
+                    if ($existingFlyer === null) {
+                        // Strip any -part-N suffix the service may have appended, then fuzzy-match
+                        $canonicalBase = (string) preg_replace('/-part-\d+$/', '', $baseSlug);
+                        $existingFlyer = Flyer::where('retailer_id', $retailer->id)
+                            ->where('slug', 'like', $canonicalBase.'%')
+                            ->orderBy('id')
+                            ->first();
+                        if ($existingFlyer !== null) {
+                            Log::info('[STRICT-MERGE] Matched existing flyer by slug base.', [
+                                'existing_flyer_id' => $existingFlyer->id,
+                                'base_slug' => $canonicalBase,
+                                'retailer_id' => $retailer->id,
+                            ]);
+                        }
+                    }
+
+                    // 3. STRICT MERGE: If ANY existing flyer matched, merge unique images into it. NEVER create -part-2!
+                    if ($existingFlyer !== null) {
+                        $existingRawUrls = RawFacebookPost::where('flyer_id', $existingFlyer->id)
                     ->pluck('image_urls')
                     ->flatten()
                     ->filter()
@@ -322,12 +358,9 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
                 return;
             }
 
-            // Normal new flyer creation
-            $slug = $slugService->generate(
-                retailerSlug: $retailer->slug,
-                validFromDate: $validFromCarbon->toDateString(),
-                validUntilDate: $validUntilCarbon->toDateString()
-            );
+            // 4. Create new flyer ONLY if zero existing flyers matched.
+            // $baseSlug was already generated (and uniqueness-checked) inside the lock.
+            $slug = $baseSlug;
 
             $title = $this->formatTitle(
                 retailerName: $retailer->name,
@@ -435,6 +468,19 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
                 'flyer_id' => $flyer->id,
                 'jobs_count' => count($jobs),
             ]);
+                }); // end Cache::lock()->block()
+            } catch (LockTimeoutException $e) {
+                Log::warning('Could not acquire flyer ingest lock, releasing job for retry.', [
+                    'retailer_slug' => $this->retailerSlug,
+                    'facebook_post_id' => $this->facebookPostId,
+                    'lock_key' => $lockKey,
+                    'error' => $e->getMessage(),
+                ]);
+
+                $this->release(15);
+
+                return;
+            }
         } catch (Throwable $e) {
             Log::error('GatekeeperFacebookPostJob failed.', [
                 'retailer_slug' => $this->retailerSlug,

@@ -31,12 +31,14 @@ final class DeduplicateFlyersCommand extends Command
         $itemsMoved = 0;
         $itemsDeleted = 0;
 
-        // 1. Clean Duplicate Retailers by clean_name
+        // 1. Clean Duplicate Retailers by canonical key.
+        // Catches bim/bimmisr, kazyon/kazyonegypt, carrefour/carrefouregypt
+        // (slug suffixes) as well as identical Arabic names (بيم / بيم مصر).
         $this->info('1) فحص المتاجر المكررة...');
         $retailers = Retailer::all();
-        $grouped = $retailers->groupBy(fn (Retailer $r): string => trim((string) preg_replace('/\s+مصر$/u', '', (string) $r->name)));
+        $grouped = $retailers->groupBy(fn (Retailer $r): string => self::canonicalRetailerKey($r));
 
-        foreach ($grouped as $cleanName => $group) {
+        foreach ($grouped as $canonicalKey => $group) {
             if ($group->count() <= 1) {
                 continue;
             }
@@ -49,17 +51,55 @@ final class DeduplicateFlyersCommand extends Command
             foreach ($duplicates as $dup) {
                 $flyerCount = Flyer::where('retailer_id', $dup->id)->count();
                 $rawCount = \App\Models\RawFacebookPost::where('retailer_id', $dup->id)->count();
+                $childCount = Retailer::where('parent_id', $dup->id)->count();
 
-                $this->line(" - دمج المتجر المكرر [{$dup->id}] {$dup->name} ({$dup->slug}) -> الأساسي [{$primary->id}] {$primary->name} ({$primary->slug}) — {$flyerCount} مجلة, {$rawCount} منشور خام");
+                $this->line(" - دمج المتجر المكرر [{$dup->id}] {$dup->name} ({$dup->slug}) -> الأساسي [{$primary->id}] {$primary->name} ({$primary->slug}) — {$flyerCount} مجلة, {$rawCount} منشور خام, {$childCount} فرع");
 
                 if (! $dryRun) {
                     DB::transaction(function () use ($dup, $primary): void {
                         Flyer::where('retailer_id', $dup->id)->update(['retailer_id' => $primary->id]);
                         \App\Models\RawFacebookPost::where('retailer_id', $dup->id)->update(['retailer_id' => $primary->id]);
+                        Retailer::where('parent_id', $dup->id)->update(['parent_id' => $primary->id]);
                     });
                     $dup->delete();
                 }
 
+                $retailerMerged++;
+                $retailerDeleted++;
+            }
+        }
+
+        // Second pass: identical Arabic clean names with different slug roots (safety net)
+        $retailers = Retailer::all();
+        $groupedByName = $retailers->groupBy(fn (Retailer $r): string => trim((string) preg_replace('/\s+مصر$/u', '', (string) $r->name)));
+        foreach ($groupedByName as $cleanName => $group) {
+            if ($group->count() <= 1 || trim((string) $cleanName) === '') {
+                continue;
+            }
+            // Skip groups already unified by canonical key
+            $keys = $group->map(fn (Retailer $r): string => self::canonicalRetailerKey($r))->unique();
+            if ($keys->count() <= 1) {
+                continue; // handled (or mergeable) in first pass
+            }
+            $sorted = $group->sortBy('id');
+            $primary = $sorted->first();
+            $duplicates = $sorted->slice(1);
+            foreach ($duplicates as $dup) {
+                // Re-check existence (first pass may have deleted it)
+                if (Retailer::find($dup->id) === null || $dup->id === $primary->id) {
+                    continue;
+                }
+                $flyerCount = Flyer::where('retailer_id', $dup->id)->count();
+                $rawCount = \App\Models\RawFacebookPost::where('retailer_id', $dup->id)->count();
+                $this->line(" - دمج بالاسم المطابق [{$dup->id}] {$dup->name} ({$dup->slug}) -> الأساسي [{$primary->id}] {$primary->name} ({$primary->slug}) — {$flyerCount} مجلة, {$rawCount} منشور خام");
+                if (! $dryRun) {
+                    DB::transaction(function () use ($dup, $primary): void {
+                        Flyer::where('retailer_id', $dup->id)->update(['retailer_id' => $primary->id]);
+                        \App\Models\RawFacebookPost::where('retailer_id', $dup->id)->update(['retailer_id' => $primary->id]);
+                        Retailer::where('parent_id', $dup->id)->update(['parent_id' => $primary->id]);
+                    });
+                    $dup->delete();
+                }
                 $retailerMerged++;
                 $retailerDeleted++;
             }
@@ -89,61 +129,122 @@ final class DeduplicateFlyersCommand extends Command
 
             $this->line(" - مجموعة مكررة: retailer {$g->retailer_id} {$g->valid_from} → {$g->valid_until} — الأساسي #{$primary->id} ({$primary->slug}), مكررات: " . $dups->pluck('id')->implode(','));
 
-            // Collect unique pages by image_path
-            $existingPaths = $primary->pages()->pluck('image_path')->filter()->map(fn ($p) => trim((string) $p))->all();
-            $existingPaths = array_unique($existingPaths);
+            if ($dryRun) {
+                // Dry-run: estimate only (unique image_path + unique items)
+                $existingPaths = $primary->pages()->pluck('image_path')->filter()->map(fn ($p) => trim((string) $p))->all();
+                $existingPaths = array_unique($existingPaths);
+                $existingKeys = $primary->items()->get()->map(fn ($i) => mb_strtolower(trim((string) $i->product_name)) . '|' . number_format((float) $i->sale_price, 2, '.', ''))->flip()->all();
+                foreach ($dups as $dup) {
+                    foreach ($dup->pages()->get() as $page) {
+                        $path = trim((string) $page->image_path);
+                        if ($path !== '' && in_array($path, $existingPaths, true)) {
+                            continue;
+                        }
+                        $existingPaths[] = $path;
+                        $pagesMoved++;
+                    }
+                    foreach ($dup->items()->get() as $item) {
+                        $key = mb_strtolower(trim((string) $item->product_name)) . '|' . number_format((float) $item->sale_price, 2, '.', '');
+                        if (isset($existingKeys[$key])) {
+                            continue;
+                        }
+                        $existingKeys[$key] = true;
+                        $itemsMoved++;
+                    }
+                    $flyersDeleted++;
+                }
+                $flyersMerged++;
 
-            $allItemsToMove = collect();
+                continue;
+            }
 
-            foreach ($dups as $dup) {
-                // Move flyer_pages unique
-                $pages = $dup->pages()->get();
-                foreach ($pages as $page) {
-                    $path = trim((string) $page->image_path);
-                    if ($path !== '' && in_array($path, $existingPaths, true)) {
-                        // Duplicate page image, skip
+            DB::transaction(function () use ($primary, $dups, &$pagesMoved, &$itemsMoved, &$flyersDeleted, &$flyersMerged): void {
+                $primaryFresh = Flyer::findOrFail($primary->id);
+
+                $existingPaths = $primaryFresh->pages()->pluck('image_path')->filter()->map(fn ($p) => trim((string) $p))->all();
+                $existingPaths = array_values(array_unique($existingPaths));
+
+                $existingKeys = $primaryFresh->items()->get()
+                    ->map(fn ($i) => mb_strtolower(trim((string) $i->product_name)) . '|' . number_format((float) $i->sale_price, 2, '.', ''))
+                    ->flip()->all();
+
+                // Next free page_number avoids UNIQUE(flyer_id, page_number) collision
+                $nextPageNumber = ((int) $primaryFresh->pages()->max('page_number')) + 1;
+                if ($nextPageNumber < 1) {
+                    $nextPageNumber = 1;
+                }
+
+                // old_page_id => new_page_id (same row id after move) or null if skipped
+                $pageIdMap = [];
+
+                foreach ($dups as $dup) {
+                    $dupFresh = Flyer::find($dup->id);
+                    if (! $dupFresh) {
                         continue;
                     }
-                    if (! $dryRun) {
-                        $page->update(['flyer_id' => $primary->id]);
+
+                    // 1) Move unique pages with fresh page_number
+                    $pages = $dupFresh->pages()->orderBy('page_number')->orderBy('id')->get();
+                    foreach ($pages as $page) {
+                        $path = trim((string) $page->image_path);
+                        if ($path !== '' && in_array($path, $existingPaths, true)) {
+                            // Duplicate image — leave for cascade delete
+                            $pageIdMap[$page->id] = null;
+                            Log::info("Deduplicate: skipping duplicate page image {$path} (flyer {$dupFresh->id} page {$page->id})");
+
+                            continue;
+                        }
+                        $oldId = $page->id;
+                        $page->update(['flyer_id' => $primaryFresh->id, 'page_number' => $nextPageNumber++]);
+                        $pageIdMap[$oldId] = $page->id;
+                        $existingPaths[] = $path;
+                        $pagesMoved++;
                     }
-                    $existingPaths[] = $path;
-                    $pagesMoved++;
+
+                    // 2) Move unique items BEFORE deleting dup (else cascade deletes them)
+                    $items = $dupFresh->items()->orderBy('id')->get();
+                    foreach ($items as $item) {
+                        $key = mb_strtolower(trim((string) $item->product_name)) . '|' . number_format((float) $item->sale_price, 2, '.', '');
+                        if (isset($existingKeys[$key])) {
+                            // Duplicate of primary — leave for cascade delete
+                            continue;
+                        }
+                        $oldPageId = $item->flyer_page_id;
+                        $newPageId = null;
+                        if ($oldPageId !== null) {
+                            if (array_key_exists($oldPageId, $pageIdMap)) {
+                                $newPageId = $pageIdMap[$oldPageId]; // null if page was skipped
+                            } else {
+                                // Item points to a page outside the dup (shouldn't happen) — detach
+                                $newPageId = null;
+                            }
+                        }
+                        $item->update(['flyer_id' => $primaryFresh->id, 'flyer_page_id' => $newPageId]);
+                        $existingKeys[$key] = true;
+                        $itemsMoved++;
+                    }
+
+                    // 3) Delete dup — only remaining (skipped) pages/items cascade
+                    $dupFresh->delete();
+                    $flyersDeleted++;
                 }
 
-                // Collect items to move
-                $items = $dup->items()->get();
-                foreach ($items as $item) {
-                    $allItemsToMove->push($item);
-                }
-
-                if (! $dryRun) {
-                    $dup->delete();
-                }
-                $flyersDeleted++;
-            }
-
-            // Move unique items (deduplicate by product_name+sale_price later, but move all first)
-            $uniqueItems = $allItemsToMove->unique(fn ($i) => $i->product_name . '|' . $i->sale_price);
-            foreach ($uniqueItems as $item) {
-                if (! $dryRun) {
-                    // Need to update flyer_id and possibly flyer_page_id after renumber? Keep original page_id if page moved, otherwise null
-                    $item->update(['flyer_id' => $primary->id]);
-                }
-                $itemsMoved++;
-            }
-
-            // Renumber pages sequentially
-            if (! $dryRun) {
-                $pages = $primary->pages()->orderBy('page_number')->orderBy('id')->get();
-                $seq = 1;
+                // 4) Safe renumber sequentially (two-phase to avoid unique collisions)
+                $pages = $primaryFresh->pages()->orderBy('page_number')->orderBy('id')->get();
+                $offset = 1000000;
+                $seq = 0;
                 foreach ($pages as $p) {
-                    $p->update(['page_number' => $seq++]);
+                    // Use query builder to avoid model events overhead; direct update
+                    DB::table('flyer_pages')->where('id', $p->id)->update(['page_number' => $offset + ($seq++), 'updated_at' => now()]);
                 }
-                $primary->update(['total_pages' => $pages->count()]);
-            }
-
-            $flyersMerged++;
+                $seq = 1;
+                $ordered = DB::table('flyer_pages')->where('flyer_id', $primaryFresh->id)->orderBy('page_number')->orderBy('id')->pluck('id');
+                foreach ($ordered as $pid) {
+                    DB::table('flyer_pages')->where('id', $pid)->update(['page_number' => $seq++, 'updated_at' => now()]);
+                }
+                $primaryFresh->update(['total_pages' => $ordered->count()]);
+                $flyersMerged++;
+            });
         }
         $this->info(" → مجموعات مكررة: {$flyersMerged} مجموعة، حذف {$flyersDeleted} مجلة مكررة، نقل {$pagesMoved} صفحة و {$itemsMoved} منتج");
 
@@ -194,5 +295,28 @@ final class DeduplicateFlyersCommand extends Command
         $this->info($dryRun ? 'انتهى الفحص الجاف.' : 'اكتمل التنظيف بنجاح - Zero Data Loss.');
 
         return self::SUCCESS;
+    }
+
+    /**
+     * Canonical grouping key: bim/bimmisr/bim-egypt → bim,
+     * kazyon/kazyonegypt → kazyon, carrefour/carrefouregypt → carrefour,
+     * «بيم مصر» → «بيم».
+     */
+    private static function canonicalRetailerKey(Retailer $retailer): string
+    {
+        $slug = mb_strtolower(trim((string) $retailer->slug));
+        $key = $slug !== '' ? $slug : mb_strtolower(trim((string) $retailer->name));
+
+        // Strip country/branch suffixes anchored at the end (suffix-only, never mid-word)
+        $key = (string) preg_replace('/(-|_|\s)*(egypt|misr|masr|مصر)$/iu', '', $key);
+        // Drop remaining separators so bim-misr / bim_misr also collapse
+        $key = (string) preg_replace('/[-_\s]+/u', '', $key);
+        $key = trim($key);
+
+        if ($key === '') {
+            $key = 'retailer-'.$retailer->id;
+        }
+
+        return $key;
     }
 }

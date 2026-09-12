@@ -24,7 +24,7 @@ final class HomeController extends Controller
         $selectedRetailerSlug = $request->string('retailer')->toString();
         $searchQuery = $request->string('q')->trim()->toString();
 
-        $retailers = Retailer::where('is_active', true)->orderBy('name')->get();
+        $retailers = Retailer::where('is_active', true)->whereNull('parent_id')->orderBy('name')->get()->unique('name')->values();
 
         // 1. استعلام المجلات السارية فقط
         $flyersQuery = Flyer::with(['retailer', 'pages'])
