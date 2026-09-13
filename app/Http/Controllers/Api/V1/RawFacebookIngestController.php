@@ -45,6 +45,61 @@ final class RawFacebookIngestController extends Controller
             // Zero data loss: persist every incoming payload
             $retailer = Retailer::where('slug', $retailerSlug)->firstOrFail();
 
+            // 24h content fingerprint: shifting scraper fallback hashes must not
+            // respawn Gemini classification jobs for identical post text.
+            $normalizedSnippet = mb_substr(trim((string) preg_replace('/\s+/u', ' ', $postText)), 0, 100);
+            if ($normalizedSnippet !== '') {
+                $likeSnippet = str_replace(['\\', '%', '_'], ['\\\\', '\\%', '\\_'], $normalizedSnippet);
+                $recentDuplicate = RawFacebookPost::where('retailer_id', $retailer->id)
+                    ->where('created_at', '>=', now()->subHours(24))
+                    ->where('post_text', 'like', $likeSnippet . '%')
+                    ->first();
+
+                if ($recentDuplicate !== null) {
+                    Log::info("[INGEST_DEDUP] Duplicate post text received within 24h for {$retailerSlug}, skipping duplicate job dispatch.");
+
+                    return new JsonResponse(
+                        data: [
+                            'message' => 'Post already processed (content match).',
+                            'facebook_post_id' => $recentDuplicate->facebook_post_id,
+                            'duplicate' => true,
+                        ],
+                        status: 202,
+                    );
+                }
+            }
+
+            // Idempotency: never clobber an administrative/terminal state.
+            // accepted / manually_approved / rejected posts keep their status;
+            // only genuinely new or retryable (pending/failed) posts re-enter the pipeline.
+            $existingPost = RawFacebookPost::where('retailer_id', $retailer->id)
+                ->where('facebook_post_id', $facebookPostId)
+                ->first();
+
+            if ($existingPost !== null && ! in_array($existingPost->status, ['pending', 'failed'], true)) {
+                $existingPost->update([
+                    'post_text' => $postText,
+                    'image_urls' => $imageUrls,
+                    'published_at' => $publishedAtUtc,
+                ]);
+
+                Log::info('Facebook post re-ingested with terminal status preserved, Gatekeeper NOT redispatched.', [
+                    'retailer_slug' => $retailerSlug,
+                    'facebook_post_id' => $facebookPostId,
+                    'status' => $existingPost->status,
+                ]);
+
+                return new JsonResponse(
+                    data: [
+                        'message' => 'Already processed.',
+                        'facebook_post_id' => $facebookPostId,
+                        'retailer_slug' => $retailerSlug,
+                        'queued' => false,
+                    ],
+                    status: 202,
+                );
+            }
+
             $rawPost = RawFacebookPost::updateOrCreate(
                 [
                     'retailer_id' => $retailer->id,

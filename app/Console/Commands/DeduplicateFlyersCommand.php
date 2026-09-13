@@ -14,7 +14,6 @@ use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
-use Illuminate\Support\Facades\Storage;
 
 final class DeduplicateFlyersCommand extends Command
 {
@@ -69,8 +68,11 @@ final class DeduplicateFlyersCommand extends Command
                         Flyer::where('retailer_id', $dup->id)->update(['retailer_id' => $primary->id]);
                         \App\Models\RawFacebookPost::where('retailer_id', $dup->id)->update(['retailer_id' => $primary->id]);
                         Retailer::where('parent_id', $dup->id)->update(['parent_id' => $primary->id]);
+                        // Atomic: deletion inside the transaction — re-parenting, re-linking
+                        // and delete succeed or roll back together. Observer side-effects
+                        // (purge dispatch) are queue jobs and unaffected by rollback.
+                        $dup->delete();
                     });
-                    $dup->delete();
                 }
 
                 $retailerMerged++;
@@ -106,8 +108,9 @@ final class DeduplicateFlyersCommand extends Command
                         Flyer::where('retailer_id', $dup->id)->update(['retailer_id' => $primary->id]);
                         \App\Models\RawFacebookPost::where('retailer_id', $dup->id)->update(['retailer_id' => $primary->id]);
                         Retailer::where('parent_id', $dup->id)->update(['parent_id' => $primary->id]);
+                        // Atomic: deletion inside the transaction (see primary pass).
+                        $dup->delete();
                     });
-                    $dup->delete();
                 }
                 $retailerMerged++;
                 $retailerDeleted++;
@@ -233,8 +236,16 @@ final class DeduplicateFlyersCommand extends Command
                         $itemsMoved++;
                     }
 
-                    // 3) Delete dup — only remaining (skipped) pages/items cascade
-                    $dupFresh->delete();
+                    // 3) Delete dup shell WITHOUT firing Eloquent observers.
+                    // Skipped pages share image_path with the PRIMARY flyer — an
+                    // Eloquent delete would fire FlyerObserver::deleted → bulk R2
+                    // delete of those shared objects (live 404s on the primary).
+                    // Query-builder deletes remove leftover rows + cascade items
+                    // while firing zero model events. Moved rows already carry
+                    // flyer_id = primary, so they are untouched.
+                    DB::table('flyer_items')->where('flyer_id', $dupFresh->id)->delete();
+                    DB::table('flyer_pages')->where('flyer_id', $dupFresh->id)->delete();
+                    DB::table('flyers')->where('id', $dupFresh->id)->delete();
                     $flyersDeleted++;
                 }
 
@@ -247,9 +258,8 @@ final class DeduplicateFlyersCommand extends Command
 
         // 3. Compress bloated flyers: identical images → keep first copy.
         // (e.g. 30 pages from 6x-merged 5-image album → 5 unique pages).
-        // R2 filenames are random ULIDs, so grouping uses the R2 object SIZE
-        // (HEAD metadata request — zero image bytes loaded into RAM, no OOM)
-        // with the OCR-extracted item identity set as DB-local fallback.
+        // Identity signals (no R2 reads at all): exact image_path match first,
+        // then the page's OCR item-identity fingerprint. No signal => keep.
         // Zero data loss: items on deleted pages are relinked to the surviving copy.
         $this->info('3) ضغط المجلات المتضخمة (صفحات مكررة بنفس المحتوى)...');
         Flyer::query()->orderBy('id')->chunk(50, function ($flyers) use ($dryRun, &$pagesCompressed, &$flyersCompressed, &$touchedFlyerIds): void {
@@ -385,9 +395,10 @@ final class DeduplicateFlyersCommand extends Command
      *
      * Two distinct passes respect UNIQUE(flyer_id, page_number):
      *  - Pass 1: single bulk offset (page_number + 100000) clears all collisions.
-     *  - Pass 2: re-assign consecutive integers in (page_number, id) order.
-     * Also refreshes the flyer's total_pages. Callers must honor --dry-run
-     * themselves — this method ALWAYS writes.
+     *  - Pass 2: ONE batched UPDATE with CASE..WHEN assigns consecutive integers
+     *    in (page_number, id) order — no per-row queries in a loop.
+     * Also refreshes the flyer's total_pages via direct DB count. Callers must
+     * honor --dry-run themselves — this method ALWAYS writes.
      */
     private function resequencePages(int $flyerId): void
     {
@@ -399,45 +410,45 @@ final class DeduplicateFlyersCommand extends Command
             ->where('flyer_id', $flyerId)
             ->orderBy('page_number')
             ->orderBy('id')
-            ->pluck('id');
+            ->pluck('id')
+            ->all();
 
-        $seq = 1;
-        foreach ($ordered as $pid) {
-            DB::table('flyer_pages')->where('id', $pid)->update(['page_number' => $seq++, 'updated_at' => now()]);
+        if ($ordered !== []) {
+            $cases = [];
+            $bindings = [];
+            foreach ($ordered as $index => $pid) {
+                $cases[] = 'WHEN id = ? THEN ?';
+                $bindings[] = $pid;
+                $bindings[] = $index + 1;
+            }
+            $bindings[] = now()->toDateTimeString();
+            $bindings[] = $flyerId;
+
+            DB::update(
+                'UPDATE flyer_pages SET page_number = CASE ' . implode(' ', $cases) . ' ELSE page_number END, updated_at = ? WHERE flyer_id = ?',
+                $bindings
+            );
         }
 
-        Flyer::where('id', $flyerId)->update(['total_pages' => $ordered->count()]);
+        $total = DB::table('flyer_pages')->where('flyer_id', $flyerId)->count();
+        Flyer::where('id', $flyerId)->update(['total_pages' => $total]);
     }
 
     /**
-     * OOM-safe content signature for a stored R2 page image.
+     * Collision-free content signature for a flyer page.
      *
-     * NEVER downloads the object body: the primary signal is the R2 object
-     * SIZE (HEAD metadata request — constant memory, negligible bandwidth).
-     * Same-source uploads produce byte-identical optimized WebP, hence equal size.
-     * Fallback (size unreadable): MD5 of the page's OCR-extracted item identity
-     * set — DB-local, zero R2 traffic. If neither signal exists the page gets a
-     * per-page unique key and is conservatively KEPT (zero data loss: never
-     * delete on an uncertain signal).
+     * Precedence (strongest semantic signal first):
+     *  1. OCR item-identity fingerprint (normalized_name|price MD5) — identical
+     *     product contents mean identical flyer content regardless of file
+     *     naming (random ULID keys). DB-local, zero R2 traffic.
+     *  2. Stored image_path string match — same R2 object => same bytes, guaranteed.
+     * NEVER uses file byte size: distinct 1200x1600 WebP pages routinely
+     * compress to identical byte counts, so size is NOT an identity signal.
+     * Otherwise returns 'keep-{id}' to conservatively KEEP the page
+     * (Strict Zero Data Loss: never delete on an uncertain signal).
      */
     private static function pageContentSignature(int $pageId, string $imagePath): string
     {
-        $path = trim($imagePath);
-        if ($path !== '') {
-            try {
-                $size = Storage::disk('r2')->size($path);
-                if (is_int($size) && $size > 0) {
-                    return 'size:' . $size;
-                }
-            } catch (\Throwable $e) {
-                Log::debug('Deduplicate: R2 size lookup failed, falling back to item identity.', [
-                    'page_id' => $pageId,
-                    'image_path' => $path,
-                    'error' => $e->getMessage(),
-                ]);
-            }
-        }
-
         try {
             $identities = FlyerItem::where('flyer_page_id', $pageId)
                 ->orderBy('id')
@@ -449,13 +460,18 @@ final class DeduplicateFlyersCommand extends Command
                 return 'items:' . md5(implode(';', $identities));
             }
         } catch (\Throwable $e) {
-            Log::debug('Deduplicate: item identity lookup failed, keeping page as unique.', [
+            Log::debug('Deduplicate: item identity lookup failed, falling back to path.', [
                 'page_id' => $pageId,
                 'error' => $e->getMessage(),
             ]);
         }
 
-        return 'unreadable-' . $pageId;
+        $path = trim($imagePath);
+        if ($path !== '') {
+            return 'path:' . $path;
+        }
+
+        return 'keep-' . $pageId;
     }
 
     /**

@@ -130,16 +130,25 @@ final class ProcessSinglePageJob implements ShouldQueue
                 return;
             }
 
-            // 1. Download raw image binary (defensive timeout)
+            // 1. Download raw image binary ONCE (defensive timeout).
+            // Every downstream step (R2 upload + Gemini OCR) reuses these bytes —
+            // never download the same asset twice within one job cycle.
             $rawBinary = $this->downloadRawImage($this->imageUrl);
 
-            // 2. Upload optimized WebP to R2 via ImageOptimizerService
+            // 2. Optimize in-memory and store the WebP on R2.
             // Use directory flyers/{flyerId}
             $directory = 'flyers/'.$this->flyerId;
 
             try {
-                // Prefer binary-based upload to avoid double download; fallback to URL-based
-                $r2Key = $optimizer->processAndUpload($this->imageUrl, $directory);
+                $path = (string) parse_url($this->imageUrl, PHP_URL_PATH);
+                if (str_ends_with(strtolower($path), '.pdf')) {
+                    // PDFs need multi-page rendering (optimizer entry point handles
+                    // download internally) — the only path allowed a second fetch.
+                    $r2Key = $optimizer->processAndUpload($this->imageUrl, $directory);
+                } else {
+                    $webpBinary = $optimizer->convertToWebp($rawBinary);
+                    $r2Key = $optimizer->storeWebp($webpBinary, $directory, 'r2');
+                }
             } catch (Throwable $e) {
                 Log::error('ImageOptimizerService failed, will attempt direct R2 upload fallback.', [
                     'flyer_id' => $this->flyerId,

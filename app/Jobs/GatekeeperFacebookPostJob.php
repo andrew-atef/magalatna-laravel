@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace App\Jobs;
 
 use App\Enums\FlyerStatus;
-use App\Jobs\PingIndexNowJob;
 use App\Jobs\PurgeCloudflareCacheJob;
 use App\Models\Flyer;
 use App\Models\RawFacebookPost;
@@ -487,7 +486,9 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
 
                     $flyer->bluf_summary = self::buildBlufSummary($flyer);
                     $flyer->editorial_overview = self::buildEditorialOverview($flyer);
-                    $flyer->save();
+                    // Quiet save: FlyerObserver stays silent so this callback's explicit
+                    // purge below remains the SINGLE purge authority (no observer cascade).
+                    $flyer->saveQuietly();
 
                     Log::info($autoPublish ? 'Flyer auto-published with BLUF.' : 'Flyer merged and pending_review with BLUF.', [
                         'flyer_id' => $flyer->id,
@@ -497,11 +498,13 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
 
                     if ($autoPublish) {
                         try {
+                            // Single authority: PurgeCloudflareCacheJob purges the Edge
+                            // AND fans out PingIndexNowJob internally — never dispatch
+                            // PingIndexNowJob alongside it (would double-ping).
                             $flyerUrl = route('flyers.show', $flyer->slug);
-                            PingIndexNowJob::dispatch($flyerUrl);
                             PurgeCloudflareCacheJob::dispatch([$flyerUrl]);
                         } catch (Throwable $e) {
-                            Log::warning('Failed to dispatch post-publish ping/purge.', [
+                            Log::warning('Failed to dispatch post-publish purge.', [
                                 'flyer_id' => $flyer->id,
                                 'error' => $e->getMessage(),
                             ]);

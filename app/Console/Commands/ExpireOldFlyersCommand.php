@@ -42,11 +42,13 @@ final class ExpireOldFlyersCommand extends Command
 
         try {
             // Single atomic transaction: any failure rolls back ALL status flips.
+            // Quiet saves: FlyerObserver::saved is suppressed so the observer does
+            // NOT dispatch per-flyer purges — the command below performs the ONE
+            // deduplicated, chunked purge dispatch for the whole batch.
             DB::transaction(function () use ($flyers, &$expiredIds): void {
                 foreach ($flyers as $flyer) {
                     $flyer->status = FlyerStatus::Expired;
-                    // Model save (not quiet): FlyerObserver fires per flyer (purge + sitemap forget).
-                    $flyer->save();
+                    $flyer->saveQuietly();
                     $expiredIds[] = (int) $flyer->id;
                 }
             });

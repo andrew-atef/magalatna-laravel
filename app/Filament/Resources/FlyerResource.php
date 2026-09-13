@@ -9,7 +9,6 @@ use App\Filament\Resources\FlyerResource\Pages;
 use App\Filament\Resources\FlyerResource\RelationManagers\ItemsRelationManager;
 use App\Jobs\PingIndexNowJob;
 use App\Models\Flyer;
-use App\Models\FlyerPage;
 use App\Services\ImageOptimizerService;
 use Filament\Forms;
 use Filament\Forms\Components\Actions\Action;
@@ -136,9 +135,29 @@ final class FlyerResource extends Resource
                         Forms\Components\Repeater::make('pages')
                             ->label('Flyer Pages')
                             ->relationship('pages')
+                            // orderColumn stays INTENTIONALLY: it is the single numbering
+                            // authority (dense 1..N by position, incl. new rows). It is safe
+                            // ONLY because the mutators below pre-lift every row into a
+                            // temp zone first — never use orderColumn on a
+                            // UNIQUE(flyer_id, page_number) index without that guard.
                             ->orderColumn('page_number')
                             ->collapsible()
                             ->itemLabel(fn (array $state): ?string => isset($state['page_number']) ? 'Page '.$state['page_number'] : 'New Page')
+                            ->mutateRelationshipDataBeforeSaveUsing(function (array $data, Repeater $component): array {
+                                // Phase 1 of the two-phase save (idempotent): lift rows out
+                                // of the way so the exact page_number writes below collide
+                                // with nothing. Runs before EVERY item write.
+                                self::offsetFlyerPagesForFormSave($component);
+
+                                return $data;
+                            })
+                            ->mutateRelationshipDataBeforeCreateUsing(function (array $data, Repeater $component): array {
+                                // Same guard before inserts: a mid-list insert's number is
+                                // always free once existing rows are lifted.
+                                self::offsetFlyerPagesForFormSave($component);
+
+                                return $data;
+                            })
                             ->extraItemActions([
                                 Action::make('movePageUp')
                                     ->label('Move page up')
@@ -439,28 +458,32 @@ final class FlyerResource extends Resource
     }
 
     /**
-     * Resolve a persisted repeater item key ("record-{id}") to its model ID.
-     * Returns null for not-yet-persisted (UUID-keyed) items.
+     * Phase 1 of the two-phase form save: lift every page row of the edited
+     * flyer into a temp zone (>= 100000) so subsequent exact page_number
+     * writes can never collide with UNIQUE(flyer_id, page_number).
+     * Idempotent per save (only rows below the temp zone move) and a no-op
+     * for not-yet-created flyers. Query-builder: fires zero model events.
      */
-    private static function repeaterRecordId(string $key): ?int
+    private static function offsetFlyerPagesForFormSave(Repeater $component): void
     {
-        if (! str_starts_with($key, 'record-')) {
-            return null;
+        $flyerId = $component->getRecord()?->getKey();
+        if (! $flyerId) {
+            return;
         }
 
-        $id = (int) substr($key, 7);
-
-        return $id > 0 ? $id : null;
+        DB::table('flyer_pages')
+            ->where('flyer_id', $flyerId)
+            ->where('page_number', '<', 100000)
+            ->update(['page_number' => DB::raw('page_number + 100000'), 'updated_at' => now()]);
     }
 
     /**
-     * Move a flyer page up/down by one position without ever colliding with
-     * UNIQUE(flyer_id, page_number).
+     * Move a flyer page up/down by one position — PURE Livewire state, zero
+     * database writes (form actions must never mutate the DB pre-submit).
      *
-     * Persisted rows swap via a temp high offset inside a DB transaction;
-     * the Livewire repeater state is mirrored so the UI matches without reload
-     * (unsaved edits in other fields are preserved). Unpersisted rows swap in
-     * state only — orderColumn() assigns safe sequential numbers on save.
+     * Swaps positions and mirrors page_number values so labels stay accurate;
+     * orderColumn() + the two-phase save guard persist the final order
+     * collision-free on submit. Unsaved edits elsewhere are preserved.
      */
     private static function moveFlyerPage(Repeater $component, string $uuid, int $direction): void
     {
@@ -476,41 +499,11 @@ final class FlyerResource extends Resource
         }
         $otherUuid = $keys[$pos + $direction];
 
-        $idA = self::repeaterRecordId($uuid);
-        $idB = self::repeaterRecordId($otherUuid);
-
-        $numA = null;
-        $numB = null;
-
-        if ($idA !== null && $idB !== null && $idA !== $idB) {
-            $pageA = FlyerPage::find($idA);
-            $pageB = FlyerPage::find($idB);
-            if ($pageA === null || $pageB === null || (int) $pageA->flyer_id !== (int) $pageB->flyer_id) {
-                return;
-            }
-
-            $numA = (int) $pageA->page_number;
-            $numB = (int) $pageB->page_number;
-
-            DB::transaction(function () use ($pageA, $pageB, $numA, $numB): void {
-                $pageA->update(['page_number' => $numA + 100000]);
-                $pageB->update(['page_number' => $numA]);
-                $pageA->update(['page_number' => $numB]);
-            });
-        }
-
-        // Mirror the swap in Livewire state: exchange positions, keep numbers
-        // in sync with the database (or swap local values for unpersisted rows).
         $rowA = $state[$uuid];
         $rowB = $state[$otherUuid];
-        if ($numA !== null && $numB !== null) {
-            $rowA['page_number'] = $numB;
-            $rowB['page_number'] = $numA;
-        } else {
-            $tmp = $rowA['page_number'] ?? null;
-            $rowA['page_number'] = $rowB['page_number'] ?? null;
-            $rowB['page_number'] = $tmp;
-        }
+        $tmp = $rowA['page_number'] ?? null;
+        $rowA['page_number'] = $rowB['page_number'] ?? null;
+        $rowB['page_number'] = $tmp;
 
         $orderedKeys = $keys;
         [$orderedKeys[$pos], $orderedKeys[$pos + $direction]] = [$orderedKeys[$pos + $direction], $orderedKeys[$pos]];

@@ -78,6 +78,17 @@ class Flyer extends Model
     }
 
     /**
+     * Cover page only (lowest page_number): O(1) alternative to hydrating
+     * the full pages collection for thumbnail cards.
+     *
+     * @return \Illuminate\Database\Eloquent\Relations\HasOne<FlyerPage, $this>
+     */
+    public function coverPage(): \Illuminate\Database\Eloquent\Relations\HasOne
+    {
+        return $this->hasOne(FlyerPage::class)->ofMany(['page_number' => 'min', 'id' => 'min']);
+    }
+
+    /**
      * @return HasMany<FlyerItem, $this>
      */
     public function items(): HasMany

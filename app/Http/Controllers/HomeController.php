@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Http\Controllers;
 
+use App\Enums\FlyerStatus;
 use App\Models\Flyer;
 use App\Models\FlyerItem;
 use App\Models\Retailer;
@@ -28,7 +29,7 @@ final class HomeController extends Controller
 
         // 1. استعلام المجلات السارية فقط
         $flyersQuery = Flyer::with(['retailer', 'pages'])
-            ->where('status', 'published')
+            ->where('status', FlyerStatus::Published)
             ->where('valid_until', '>=', $cairoToday)
             ->latest('valid_from');
 
@@ -58,7 +59,7 @@ final class HomeController extends Controller
             $matchingItems = FlyerItem::with('flyer.retailer')
                 ->where('normalized_name', 'like', "%{$normalizedQuery}%")
                 ->whereHas('flyer', function ($q) use ($cairoToday) {
-                    $q->where('status', 'published')->where('valid_until', '>=', $cairoToday);
+                    $q->where('status', FlyerStatus::Published)->where('valid_until', '>=', $cairoToday);
                 })
                 ->latest('id')
                 ->paginate(12, ['*'], 'items_page')
@@ -70,7 +71,7 @@ final class HomeController extends Controller
             // 3b. أقوى السلع المخفضة اليوم (أكبر نسبة توفير) - فقط عند عدم وجود بحث
             $hotItems = FlyerItem::with('flyer.retailer')
                 ->whereHas('flyer', function ($q) use ($cairoToday) {
-                    $q->where('status', 'published')->where('valid_until', '>=', $cairoToday);
+                    $q->where('status', FlyerStatus::Published)->where('valid_until', '>=', $cairoToday);
                 })
                 ->whereNotNull('discount_percent')
                 ->where('discount_percent', '>', 10)

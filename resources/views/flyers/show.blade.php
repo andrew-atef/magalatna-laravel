@@ -457,7 +457,7 @@
         </div>
         <div class="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4">
             @foreach ($sameRetailerFlyers as $related)
-                @php $cov = $related->pages->first(); $u = $cov ? \App\Support\R2Url::asset($cov->image_path) : '/img/placeholder-flyer.png'; @endphp
+                @php $cov = $related->coverPage ?? $related->pages->first(); $u = $cov ? \App\Support\R2Url::asset($cov->image_path) : '/img/placeholder-flyer.png'; @endphp
                 <a href="{{ route('flyers.show', $related->slug) }}" class="group flex flex-col overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm transition hover:border-[#039652] hover:shadow-md">
                     <div class="relative aspect-[3/4] overflow-hidden bg-slate-100">
                         <img src="{{ $u }}" alt="{{ $related->title }}" width="400" height="530" loading="lazy" class="h-full w-full object-cover transition duration-300 group-hover:scale-[1.03]">
@@ -482,7 +482,7 @@
         </div>
         <div class="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4">
             @foreach ($competitorFlyers as $comp)
-                @php $cov = $comp->pages->first(); $u = $cov ? \App\Support\R2Url::asset($cov->image_path) : '/img/placeholder-flyer.png'; @endphp
+                @php $cov = $comp->coverPage ?? $comp->pages->first(); $u = $cov ? \App\Support\R2Url::asset($cov->image_path) : '/img/placeholder-flyer.png'; @endphp
                 <a href="{{ route('flyers.show', $comp->slug) }}" class="group flex flex-col overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm transition hover:border-[#039652] hover:shadow-md">
                     <div class="relative aspect-[3/4] overflow-hidden bg-slate-100">
                         <img src="{{ $u }}" alt="{{ $comp->title }}" width="400" height="530" loading="lazy" class="h-full w-full object-cover transition duration-300 group-hover:scale-[1.03]">
@@ -510,7 +510,7 @@
         <p class="mb-4 text-xs text-slate-500">للمقارنة ومعرفة تطور الأسعار قبل الشراء — توثيق تاريخي لآخر 30 يوم</p>
         <div class="grid grid-cols-2 gap-4 sm:grid-cols-3">
             @foreach ($archiveFlyers as $arc)
-                @php $cov = $arc->pages->first(); $u = $cov ? \App\Support\R2Url::asset($cov->image_path) : '/img/placeholder-flyer.png'; @endphp
+                @php $cov = $arc->coverPage ?? $arc->pages->first(); $u = $cov ? \App\Support\R2Url::asset($cov->image_path) : '/img/placeholder-flyer.png'; @endphp
                 <a href="{{ route('flyers.show', $arc->slug) }}" class="flex flex-col overflow-hidden rounded-xl border border-slate-200 bg-white opacity-95 hover:opacity-100 hover:border-[#023b55]/20 transition">
                     <div class="relative aspect-[3/4] overflow-hidden bg-slate-100">
                         <img src="{{ $u }}" alt="{{ $arc->title }}" width="400" height="530" loading="lazy" class="h-full w-full object-cover grayscale hover:grayscale-0 transition">

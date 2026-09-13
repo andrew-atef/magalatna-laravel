@@ -24,10 +24,11 @@ final class RetailerController extends Controller
         $cairoToday = Carbon::today('Africa/Cairo')->toDateString();
         $thirtyDaysAgo = Carbon::today('Africa/Cairo')->subDays(30)->toDateString();
 
-        // Active published flyers for this retailer with valid_until >= Cairo today
+        // Active published flyers for this retailer with valid_until >= Cairo today.
+        // Only pages are eager-loaded (cover render); items are never read by the hub views.
         $activeFlyers = $retailer->flyers()
-            ->with(['pages', 'items'])
-            ->where('status', 'published')
+            ->with(['pages'])
+            ->where('status', FlyerStatus::Published)
             ->where('valid_until', '>=', $cairoToday)
             ->latest('valid_from')
             ->latest('id')
@@ -36,13 +37,13 @@ final class RetailerController extends Controller
 
         // Recently expired flyers (last 30 days) for price history tab/section
         $expiredFlyers = $retailer->flyers()
-            ->with(['pages', 'items'])
+            ->with(['pages'])
             ->where(function ($q) use ($cairoToday, $thirtyDaysAgo): void {
                 $q->where(function ($q2) use ($thirtyDaysAgo): void {
-                    $q2->where('status', 'expired')
+                    $q2->where('status', FlyerStatus::Expired)
                         ->whereBetween('valid_until', [$thirtyDaysAgo, Carbon::today('Africa/Cairo')->subDay()->toDateString()]);
                 })->orWhere(function ($q2) use ($cairoToday, $thirtyDaysAgo): void {
-                    $q2->where('status', 'published')
+                    $q2->where('status', FlyerStatus::Published)
                         ->where('valid_until', '<', $cairoToday)
                         ->where('valid_until', '>=', $thirtyDaysAgo);
                 });
@@ -53,7 +54,7 @@ final class RetailerController extends Controller
 
         // Truly active now (valid_from <= today <= valid_until) for accurate "سارية الآن" count
         $activeCount = $retailer->flyers()
-            ->where('status', 'published')
+            ->where('status', FlyerStatus::Published)
             ->where('valid_from', '<=', $cairoToday)
             ->where('valid_until', '>=', $cairoToday)
             ->count();

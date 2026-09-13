@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Http\Controllers;
 
+use App\Enums\FlyerStatus;
 use App\Models\Flyer;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
@@ -27,24 +28,24 @@ final class FlyerController extends Controller
 
         $cairoToday = Carbon::today('Africa/Cairo')->toDateString();
 
-        $sameRetailerFlyers = Flyer::with(['retailer', 'pages'])
+        $sameRetailerFlyers = Flyer::with(['retailer', 'coverPage'])
             ->where('retailer_id', $flyer->retailer_id)
             ->where('id', '!=', $flyer->id)
-            ->where('status', 'published')
+            ->where('status', FlyerStatus::Published)
             ->where('valid_until', '>=', $cairoToday)
             ->latest('valid_from')
             ->limit(4)
             ->get();
 
-        $competitorFlyers = Flyer::with(['retailer', 'pages'])
+        $competitorFlyers = Flyer::with(['retailer', 'coverPage'])
             ->where('retailer_id', '!=', $flyer->retailer_id)
-            ->where('status', 'published')
+            ->where('status', FlyerStatus::Published)
             ->where('valid_until', '>=', $cairoToday)
             ->latest('valid_from')
             ->limit(6)
             ->get();
 
-        $archiveFlyers = Flyer::with(['retailer', 'pages'])
+        $archiveFlyers = Flyer::with(['retailer', 'coverPage'])
             ->where('retailer_id', $flyer->retailer_id)
             ->where('valid_until', '<', $cairoToday)
             ->latest('valid_until')
