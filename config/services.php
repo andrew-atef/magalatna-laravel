@@ -40,6 +40,15 @@ return [
         'model' => env('GEMINI_MODEL', 'gemini-2.5-flash'),
     ],
 
+    'chromium' => [
+        'path' => env('CHROMIUM_PATH', '/usr/bin/chromium-browser'),
+    ],
+
+    'facebook_proxy' => [
+        'url' => env('FACEBOOK_PROXY_URL', ''),
+        'secret' => env('FACEBOOK_PROXY_SECRET', ''),
+    ],
+
     'internal_api' => [
         'key' => env('INTERNAL_API_KEY'),
     ],

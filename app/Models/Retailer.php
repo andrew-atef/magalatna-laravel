@@ -22,8 +22,10 @@ class Retailer extends Model
         'slug',
         'logo_path',
         'website_url',
+        'facebook_page_url',
         'currency',
         'is_active',
+        'auto_ingest_enabled',
     ];
 
     /**
@@ -33,6 +35,7 @@ class Retailer extends Model
     {
         return [
             'is_active' => 'boolean',
+            'auto_ingest_enabled' => 'boolean',
         ];
     }
 
@@ -78,5 +81,29 @@ class Retailer extends Model
     public function getCleanNameAttribute(): string
     {
         return trim((string) preg_replace('/\s+مصر$/u', '', (string) $this->name));
+    }
+
+    /**
+     * Canonical Facebook page handle for scrapers. Prefers the dedicated
+     * facebook_page_url; falls back to a Facebook website_url (legacy rows),
+     * then to the internal slug. Never mixes website_url semantics.
+     */
+    public function getFacebookHandleAttribute(): string
+    {
+        $url = trim((string) ($this->facebook_page_url ?: $this->website_url));
+        if ($url !== '') {
+            // Accept only facebook.com hosts for the dedicated field; a stray
+            // official-site URL must not become a scrape handle.
+            $host = strtolower((string) parse_url($url, PHP_URL_HOST));
+            if ($host === '' || str_ends_with($host, 'facebook.com')) {
+                $path = trim((string) parse_url($url, PHP_URL_PATH), '/');
+                $segments = array_values(array_filter(explode('/', $path)));
+                if (! empty($segments) && preg_match('/^[\w.\-]+$/', $segments[0])) {
+                    return $segments[0];
+                }
+            }
+        }
+
+        return $this->slug;
     }
 }

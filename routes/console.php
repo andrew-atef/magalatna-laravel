@@ -23,3 +23,11 @@ Schedule::command('flyers:deduplicate')
     ->timezone('Africa/Cairo')
     ->withoutOverlapping(60)
     ->onOneServer();
+
+// رادار فيسبوك: مسح كل دقيقة عبر Chromium المحلي — منع التداخل + تشغيل خلفي
+Schedule::command('flyers:radar-scan')
+    ->everyMinute()
+    ->withoutOverlapping(10)
+    ->onOneServer()
+    ->runInBackground()
+    ->appendOutputTo(storage_path('logs/facebook_radar.log'));

@@ -11,6 +11,7 @@ use App\Jobs\PurgeCloudflareCacheJob;
 use App\Models\Flyer;
 use App\Models\RawFacebookPost;
 use App\Support\FacebookMediaHelper;
+use Carbon\Carbon;
 use Filament\Forms;
 use Filament\Forms\Form;
 use Filament\Notifications\Notification;
@@ -184,8 +185,26 @@ final class RawFacebookPostResource extends Resource
 
                 Tables\Columns\TextColumn::make('published_at')
                     ->label('تاريخ النشر')
-                    ->dateTime('Y/m/d h:i A')
-                    ->timezone('Africa/Cairo')
+                    ->formatStateUsing(function ($state, RawFacebookPost $record): string {
+                        // Raw UTC digits (never the tz-mislabelled cast value).
+                        $raw = $record->getRawOriginal('published_at') ?? $state;
+                        if (! $raw) {
+                            return '—';
+                        }
+                        $utc = $raw instanceof \DateTimeInterface
+                            ? Carbon::instance($raw)->setTimezone('UTC')
+                            : Carbon::parse(trim((string) $raw), 'UTC');
+
+                        return $utc->setTimezone('Africa/Cairo')->format('Y/m/d h:i A');
+                    })
+                    ->description(function (RawFacebookPost $record): string {
+                        $cairo = $record->published_at_cairo;
+                        if (! $cairo) {
+                            return '';
+                        }
+
+                        return $cairo->diffForHumans();
+                    })
                     ->sortable()
                     ->toggleable(),
 

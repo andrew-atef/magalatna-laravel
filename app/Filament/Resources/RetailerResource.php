@@ -87,6 +87,14 @@ final class RetailerResource extends Resource
                             ->nullable()
                             ->placeholder('https://example.com'),
 
+                        Forms\Components\TextInput::make('facebook_page_url')
+                            ->label('رابط صفحة فيسبوك الرسمية (Facebook Page URL)')
+                            ->url()
+                            ->maxLength(255)
+                            ->nullable()
+                            ->placeholder('https://www.facebook.com/kazyonegypt')
+                            ->helperText('الرابط الذي يسحب منه السكرابر المجلات وصور العروض تلقائياً.'),
+
                         Forms\Components\TextInput::make('currency')
                             ->label('Currency')
                             ->default('EGP')
@@ -98,6 +106,12 @@ final class RetailerResource extends Resource
                             ->default(true)
                             ->inline(false)
                             ->helperText('Inactive retailers are hidden from storefront.'),
+
+                        Forms\Components\Toggle::make('auto_ingest_enabled')
+                            ->label('تفعيل السحب التلقائي (Auto Ingest)')
+                            ->default(true)
+                            ->inline(false)
+                            ->helperText('عند تفعيله، سيقوم السكرابر بفحص وتنزيل المجلات آلياً كل 5 دقائق.'),
                     ])
                     ->columns(2),
             ]);
@@ -129,6 +143,11 @@ final class RetailerResource extends Resource
 
                 Tables\Columns\IconColumn::make('is_active')
                     ->label('Active')
+                    ->boolean()
+                    ->sortable(),
+
+                Tables\Columns\IconColumn::make('auto_ingest_enabled')
+                    ->label('سحب آلي')
                     ->boolean()
                     ->sortable(),
 
