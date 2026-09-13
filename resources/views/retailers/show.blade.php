@@ -158,7 +158,7 @@
                             $from = \Carbon\Carbon::parse($flyer->valid_from, 'Africa/Cairo');
                             $until = \Carbon\Carbon::parse($flyer->valid_until, 'Africa/Cairo');
                             $isFuture = $from->isFuture();
-                            $isPast = $until->isPast();
+                            $isPast = $flyer->isExpired();
                         @endphp
                     <article class="group flex flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm transition hover:shadow-md">
                         <a href="{{ route('flyers.show', $flyer->slug) }}" class="relative aspect-[3/4] overflow-hidden bg-slate-100">

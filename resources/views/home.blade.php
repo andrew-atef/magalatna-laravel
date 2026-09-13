@@ -199,12 +199,12 @@
                             $until = \Carbon\Carbon::parse($flyer->valid_until, 'Africa/Cairo');
                         @endphp
                         <div class="mt-3 flex items-center justify-between border-t border-slate-100 pt-3 text-[11px]">
-                            @if ($from->isFuture())
-                                <span class="font-bold text-[#023b55]">يبدأ: {{ $from->format('d/m/Y') }}</span>
-                                <span class="rounded bg-[#fcc023] px-2 py-0.5 text-[10px] font-bold text-slate-900">قريباً</span>
-                            @elseif ($until->isPast())
+                            @if ($flyer->isExpired())
                                 <span class="text-slate-400">انتهى: {{ $until->format('d/m/Y') }}</span>
                                 <span class="rounded bg-slate-100 px-2 py-0.5 text-[10px] font-bold text-slate-500">منتهي</span>
+                            @elseif ($from->isFuture())
+                                <span class="font-bold text-[#023b55]">يبدأ: {{ $from->format('d/m/Y') }}</span>
+                                <span class="rounded bg-[#fcc023] px-2 py-0.5 text-[10px] font-bold text-slate-900">قريباً</span>
                             @else
                                 <span class="text-slate-500">سارٍ حتى: {{ $until->format('d/m/Y') }}</span>
                                 <span class="rounded bg-[#039652]/10 px-2 py-0.5 font-bold text-[#039652]">سارٍ الآن</span>
