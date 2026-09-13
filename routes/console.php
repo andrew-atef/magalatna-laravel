@@ -31,3 +31,13 @@ Schedule::command('flyers:radar-scan')
     ->onOneServer()
     ->runInBackground()
     ->appendOutputTo(storage_path('logs/facebook_radar.log'));
+
+// السحب المباشر لايف كل 5 دقائق (بدون dry-run): مجلات جديدة إلى raw_facebook_posts
+// + تشغيل Gatekeeper/Gemini تلقائياً — بتوقيت القاهرة
+Schedule::command('flyers:ingest-direct')
+    ->everyFiveMinutes()
+    ->timezone('Africa/Cairo')
+    ->withoutOverlapping(10)
+    ->onOneServer()
+    ->runInBackground()
+    ->appendOutputTo(storage_path('logs/facebook_ingest.log'));
