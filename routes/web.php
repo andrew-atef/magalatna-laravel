@@ -2,6 +2,7 @@
 
 declare(strict_types=1);
 
+use App\Enums\FlyerStatus;
 use App\Http\Controllers\FlyerController;
 use App\Http\Controllers\HomeController;
 use App\Http\Controllers\LlmsTxtController;
@@ -33,15 +34,24 @@ Route::permanentRedirect('/carrefour', '/carrefouregypt');
 Route::get('/llms.txt', [LlmsTxtController::class, 'index'])->name('llms.txt');
 
 // خريطة الموقع لمحركات البحث — cached 6h, invalidated via observers (FlyerObserver::saved/deleted)
+// Memory-guarded: max 300 flyers, column-selected, cover page only (no full pages hydration).
 Route::get('/sitemap.xml', function () {
     $xml = Cache::remember('sitemap_xml_content', 21600, function () {
         $retailers = Retailer::where('is_active', true)->get();
-        $activeFlyers = Flyer::where('status', 'published')
-            ->with(['retailer', 'pages'])
+        $activeFlyers = Flyer::where('status', FlyerStatus::Published)
+            ->select(['id', 'slug', 'retailer_id', 'title', 'updated_at'])
+            ->with([
+                'retailer' => static fn ($q) => $q->select(['id', 'name', 'slug', 'logo_path']),
+                'pages' => static fn ($q) => $q->select(['id', 'flyer_id', 'image_path', 'page_number'])
+                    ->where('page_number', 1)
+                    ->orderBy('page_number')
+                    ->limit(1),
+            ])
             ->latest('updated_at')
-            ->limit(1000)
+            ->limit(300)
             ->get();
-        $expiredFlyers = Flyer::where('status', 'expired')
+        $expiredFlyers = Flyer::where('status', FlyerStatus::Expired)
+            ->select(['id', 'slug', 'retailer_id', 'updated_at'])
             ->with(['retailer'])
             ->latest('updated_at')
             ->limit(200)
@@ -62,5 +72,5 @@ Route::get('/sitemap.xml', function () {
 // Retailer Hub — SEO-optimized dedicated pages /{retailer:slug}
 // MUST be last to avoid conflict with /offers/{slug}, /admin, /sitemap.xml, /about-us etc.
 Route::get('/{retailer:slug}', [RetailerController::class, 'show'])
-    ->where('retailer', '^(?!offers$|flyer$|flyers$|admin$|api$|storage$|sitemap\.xml$|llms\.txt$|about-us$|privacy-policy$|terms-of-use$|contact-us$).*')
+    ->where('retailer', '^(?!offers$|flyer$|flyers$|admin$|api$|storage$|up$|livewire$|build$|assets$|favicon\.ico$|sitemap\.xml$|llms\.txt$|about-us$|privacy-policy$|terms-of-use$|contact-us$).*')
     ->name('retailers.show');

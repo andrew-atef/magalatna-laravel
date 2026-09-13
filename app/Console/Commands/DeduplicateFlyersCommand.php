@@ -238,28 +238,18 @@ final class DeduplicateFlyersCommand extends Command
                     $flyersDeleted++;
                 }
 
-                // 4) Safe renumber sequentially (two-phase to avoid unique collisions)
-                $pages = $primaryFresh->pages()->orderBy('page_number')->orderBy('id')->get();
-                $offset = 1000000;
-                $seq = 0;
-                foreach ($pages as $p) {
-                    // Use query builder to avoid model events overhead; direct update
-                    DB::table('flyer_pages')->where('id', $p->id)->update(['page_number' => $offset + ($seq++), 'updated_at' => now()]);
-                }
-                $seq = 1;
-                $ordered = DB::table('flyer_pages')->where('flyer_id', $primaryFresh->id)->orderBy('page_number')->orderBy('id')->pluck('id');
-                foreach ($ordered as $pid) {
-                    DB::table('flyer_pages')->where('id', $pid)->update(['page_number' => $seq++, 'updated_at' => now()]);
-                }
-                $primaryFresh->update(['total_pages' => $ordered->count()]);
+                // 4) Resequence pages 1..N (UNIQUE-safe, see resequencePages())
+                $this->resequencePages((int) $primaryFresh->id);
                 $flyersMerged++;
             });
         }
         $this->info(" → مجموعات مكررة: {$flyersMerged} مجموعة، حذف {$flyersDeleted} مجلة مكررة، نقل {$pagesMoved} صفحة و {$itemsMoved} منتج");
 
-        // 3. Compress bloated flyers: identical R2 image content → keep first copy.
+        // 3. Compress bloated flyers: identical images → keep first copy.
         // (e.g. 30 pages from 6x-merged 5-image album → 5 unique pages).
-        // R2 filenames are random ULIDs, so only a content MD5 is a reliable signal.
+        // R2 filenames are random ULIDs, so grouping uses the R2 object SIZE
+        // (HEAD metadata request — zero image bytes loaded into RAM, no OOM)
+        // with the OCR-extracted item identity set as DB-local fallback.
         // Zero data loss: items on deleted pages are relinked to the surviving copy.
         $this->info('3) ضغط المجلات المتضخمة (صفحات مكررة بنفس المحتوى)...');
         Flyer::query()->orderBy('id')->chunk(50, function ($flyers) use ($dryRun, &$pagesCompressed, &$flyersCompressed, &$touchedFlyerIds): void {
@@ -273,7 +263,7 @@ final class DeduplicateFlyersCommand extends Command
                 /** @var array<int, int> $dupMap dupPageId => keptPageId */
                 $dupMap = [];
                 foreach ($pages as $page) {
-                    $sig = self::pageContentSignature(trim((string) $page->image_path), (int) $page->id);
+                    $sig = self::pageContentSignature((int) $page->id, trim((string) $page->image_path));
                     if (! isset($bySignature[$sig])) {
                         $bySignature[$sig] = $page;
 
@@ -296,19 +286,7 @@ final class DeduplicateFlyersCommand extends Command
                             FlyerPage::where('id', $dupId)->delete();
                         }
 
-                        // Resequence 1..N (two-phase to respect UNIQUE flyer_id+page_number)
-                        $offset = 1000000;
-                        $seq = 0;
-                        $ids = DB::table('flyer_pages')->where('flyer_id', $flyer->id)->orderBy('page_number')->orderBy('id')->pluck('id');
-                        foreach ($ids as $pid) {
-                            DB::table('flyer_pages')->where('id', $pid)->update(['page_number' => $offset + ($seq++), 'updated_at' => now()]);
-                        }
-                        $seq = 1;
-                        $ordered = DB::table('flyer_pages')->where('flyer_id', $flyer->id)->orderBy('page_number')->orderBy('id')->pluck('id');
-                        foreach ($ordered as $pid) {
-                            DB::table('flyer_pages')->where('id', $pid)->update(['page_number' => $seq++, 'updated_at' => now()]);
-                        }
-                        $flyer->update(['total_pages' => $ordered->count()]);
+                        $this->resequencePages((int) $flyer->id);
                     });
                 }
 
@@ -403,29 +381,76 @@ final class DeduplicateFlyersCommand extends Command
     }
 
     /**
-     * Content signature for a stored R2 page image.
+     * Resequence a flyer's pages to consecutive integers starting at 1.
      *
-     * R2 filenames are random ULIDs, so the key alone can never match duplicates —
-     * only an MD5 of the stored bytes is reliable. If the object is unreadable
-     * (R2 offline, missing key), returns a per-page unique key so the page is
-     * conservatively KEPT (zero data loss: never delete on uncertain signal).
+     * Two distinct passes respect UNIQUE(flyer_id, page_number):
+     *  - Pass 1: single bulk offset (page_number + 100000) clears all collisions.
+     *  - Pass 2: re-assign consecutive integers in (page_number, id) order.
+     * Also refreshes the flyer's total_pages. Callers must honor --dry-run
+     * themselves — this method ALWAYS writes.
      */
-    private static function pageContentSignature(string $imagePath, int $pageId): string
+    private function resequencePages(int $flyerId): void
+    {
+        DB::table('flyer_pages')
+            ->where('flyer_id', $flyerId)
+            ->update(['page_number' => DB::raw('page_number + 100000'), 'updated_at' => now()]);
+
+        $ordered = DB::table('flyer_pages')
+            ->where('flyer_id', $flyerId)
+            ->orderBy('page_number')
+            ->orderBy('id')
+            ->pluck('id');
+
+        $seq = 1;
+        foreach ($ordered as $pid) {
+            DB::table('flyer_pages')->where('id', $pid)->update(['page_number' => $seq++, 'updated_at' => now()]);
+        }
+
+        Flyer::where('id', $flyerId)->update(['total_pages' => $ordered->count()]);
+    }
+
+    /**
+     * OOM-safe content signature for a stored R2 page image.
+     *
+     * NEVER downloads the object body: the primary signal is the R2 object
+     * SIZE (HEAD metadata request — constant memory, negligible bandwidth).
+     * Same-source uploads produce byte-identical optimized WebP, hence equal size.
+     * Fallback (size unreadable): MD5 of the page's OCR-extracted item identity
+     * set — DB-local, zero R2 traffic. If neither signal exists the page gets a
+     * per-page unique key and is conservatively KEPT (zero data loss: never
+     * delete on an uncertain signal).
+     */
+    private static function pageContentSignature(int $pageId, string $imagePath): string
     {
         $path = trim($imagePath);
-        if ($path === '') {
-            return 'unreadable-' . $pageId;
+        if ($path !== '') {
+            try {
+                $size = Storage::disk('r2')->size($path);
+                if (is_int($size) && $size > 0) {
+                    return 'size:' . $size;
+                }
+            } catch (\Throwable $e) {
+                Log::debug('Deduplicate: R2 size lookup failed, falling back to item identity.', [
+                    'page_id' => $pageId,
+                    'image_path' => $path,
+                    'error' => $e->getMessage(),
+                ]);
+            }
         }
 
         try {
-            $binary = Storage::disk('r2')->get($path);
-            if (is_string($binary) && $binary !== '') {
-                return 'md5:' . md5($binary);
+            $identities = FlyerItem::where('flyer_page_id', $pageId)
+                ->orderBy('id')
+                ->get(['normalized_name', 'sale_price'])
+                ->map(fn ($i): string => mb_strtolower(trim((string) $i->normalized_name)) . '|' . number_format((float) $i->sale_price, 2, '.', ''))
+                ->all();
+
+            if ($identities !== []) {
+                return 'items:' . md5(implode(';', $identities));
             }
         } catch (\Throwable $e) {
-            Log::debug('Deduplicate: R2 read failed, keeping page as unique.', [
+            Log::debug('Deduplicate: item identity lookup failed, keeping page as unique.', [
                 'page_id' => $pageId,
-                'image_path' => $path,
                 'error' => $e->getMessage(),
             ]);
         }

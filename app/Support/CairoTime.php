@@ -18,9 +18,8 @@ final class CairoTime
             return now('Africa/Cairo')->toIso8601String();
         }
 
-        if ($date instanceof Carbon) {
-            // If already carbon, ensure it's evaluated against Africa/Cairo
-            return $date->copy()->setTimezone('Africa/Cairo')->toIso8601String();
+        if ($date instanceof \DateTimeInterface) {
+            return Carbon::instance($date)->setTimezone('Africa/Cairo')->toIso8601String();
         }
 
         $str = trim((string) $date);

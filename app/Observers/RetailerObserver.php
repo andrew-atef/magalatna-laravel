@@ -27,6 +27,7 @@ final class RetailerObserver
         try {
             Cache::forget('sitemap_xml_content');
             Cache::forget('llms_txt_content');
+            Cache::forget('layout:header_retailers');
             $urls = $this->collectUrls($retailer);
             if ($urls !== []) {
                 \App\Jobs\PurgeCloudflareCacheJob::dispatch($urls);
@@ -48,6 +49,7 @@ final class RetailerObserver
         try {
             Cache::forget('sitemap_xml_content');
             Cache::forget('llms_txt_content');
+            Cache::forget('layout:header_retailers');
 
             $urls = $this->collectUrls($retailer);
 

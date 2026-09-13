@@ -5,7 +5,9 @@ declare(strict_types=1);
 namespace App\Filament\Resources;
 
 use App\Filament\Resources\RawFacebookPostResource\Pages;
+use App\Jobs\GatekeeperFacebookPostJob;
 use App\Jobs\ProcessSinglePageJob;
+use App\Jobs\PurgeCloudflareCacheJob;
 use App\Models\Flyer;
 use App\Models\RawFacebookPost;
 use App\Support\FacebookMediaHelper;
@@ -15,7 +17,9 @@ use Filament\Notifications\Notification;
 use Filament\Resources\Resource;
 use Filament\Tables;
 use Filament\Tables\Table;
+use Illuminate\Bus\Batch;
 use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Support\Facades\Bus;
 use Illuminate\Support\Facades\Log;
 use Throwable;
 
@@ -348,14 +352,80 @@ final class RawFacebookPostResource extends Resource
                                 'flyer_id' => $flyer->id,
                             ]);
 
+                            // Atomic bus batch (mirrors GatekeeperFacebookPostJob::dispatchPageProcessingBatch):
+                            // the then() callback publishes the flyer, generates BLUF/editorial,
+                            // and purges CDN cache. Orphan dispatches are forbidden.
+                            $jobs = [];
                             foreach ($imageUrls as $index => $url) {
-                                $pageNumber = $startPage + $index + 1;
-                                ProcessSinglePageJob::dispatch(
+                                $jobs[] = new ProcessSinglePageJob(
                                     flyerId: $flyer->id,
                                     imageUrl: (string) $url,
-                                    pageNumber: $pageNumber,
+                                    pageNumber: $startPage + $index + 1,
                                 );
                             }
+
+                            $flyerId = $flyer->id;
+
+                            Bus::batch($jobs)
+                                ->name('flyer-' . $flyer->id . '-manual-approval')
+                                ->allowFailures()
+                                ->then(static function (Batch $batch) use ($flyerId): void {
+                                    try {
+                                        $flyer = Flyer::with('items')->find($flyerId);
+
+                                        if ($flyer === null) {
+                                            Log::error('ForceApprove batch: flyer not found.', ['flyer_id' => $flyerId]);
+
+                                            return;
+                                        }
+
+                                        // Exact recount from the DB — never a stale counter.
+                                        $flyer->total_pages = (int) $flyer->pages()->count();
+
+                                        $autoPublish = (bool) config('app.auto_publish_flyers', true);
+                                        $flyer->status = $autoPublish ? \App\Enums\FlyerStatus::Published : \App\Enums\FlyerStatus::PendingReview;
+
+                                        $flyer->bluf_summary = GatekeeperFacebookPostJob::buildBlufSummary($flyer);
+                                        $flyer->editorial_overview = GatekeeperFacebookPostJob::buildEditorialOverview($flyer);
+                                        $flyer->save();
+
+                                        Log::info($autoPublish ? 'ForceApprove: flyer auto-published with BLUF.' : 'ForceApprove: flyer pending_review with BLUF.', [
+                                            'flyer_id' => $flyer->id,
+                                            'batch_id' => $batch->id,
+                                            'status' => $flyer->status->value,
+                                        ]);
+
+                                        try {
+                                            PurgeCloudflareCacheJob::dispatch([route('flyers.show', $flyer->slug)]);
+                                        } catch (Throwable $e) {
+                                            Log::warning('ForceApprove: failed to dispatch purge.', [
+                                                'flyer_id' => $flyer->id,
+                                                'error' => $e->getMessage(),
+                                            ]);
+                                        }
+                                    } catch (Throwable $e) {
+                                        Log::error('ForceApprove batch then() failed.', [
+                                            'flyer_id' => $flyerId,
+                                            'error' => $e->getMessage(),
+                                            'trace' => $e->getTraceAsString(),
+                                        ]);
+                                    }
+                                })
+                                ->catch(function (Batch $batch, Throwable $e): void {
+                                    Log::error('ForceApprove batch caught failure.', [
+                                        'batch_id' => $batch->id,
+                                        'error' => $e->getMessage(),
+                                    ]);
+                                })
+                                ->finally(function (Batch $batch) use ($flyerId): void {
+                                    Log::info('ForceApprove batch finished.', [
+                                        'flyer_id' => $flyerId,
+                                        'batch_id' => $batch->id,
+                                        'failed_jobs' => $batch->failedJobs,
+                                    ]);
+                                })
+                                ->onQueue('default')
+                                ->dispatch();
 
                             Notification::make()
                                 ->title('تم تحويل المنشور إلى مجلة عروض بنجاح وجارٍ قراءة المنتجات.')

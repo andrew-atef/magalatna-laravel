@@ -54,6 +54,7 @@ final class RetailerResource extends Resource
                         Forms\Components\Select::make('parent_id')
                             ->label('Parent Company (Branch Link)')
                             ->relationship('parent', 'name')
+                            ->options(fn (?Retailer $record) => Retailer::when($record, fn ($q) => $q->where('id', '!=', $record->id))->pluck('name', 'id'))
                             ->searchable()
                             ->preload()
                             ->nullable()

@@ -38,8 +38,9 @@ final class RawFacebookIngestController extends Controller
             $postText = (string) $validated['post_text'];
             /** @var list<string> $imageUrls */
             $imageUrls = array_values($validated['image_urls']);
-            $publishedAtRaw = (string) $validated['published_at'];
-            $cairoPublishedAt = Carbon::parse($publishedAtRaw)->setTimezone('Africa/Cairo');
+            // Database temporal integrity: timestamps are ALWAYS stored in UTC.
+            // Presentation layers (Filament, Blade) convert to Africa/Cairo on render.
+            $publishedAtUtc = Carbon::parse((string) $validated['published_at'])->utc();
 
             // Zero data loss: persist every incoming payload
             $retailer = Retailer::where('slug', $retailerSlug)->firstOrFail();
@@ -50,9 +51,9 @@ final class RawFacebookIngestController extends Controller
                     'facebook_post_id' => $facebookPostId,
                 ],
                 [
-                    'post_text' => $postText ?? null,
+                    'post_text' => $postText,
                     'image_urls' => $imageUrls,
-                    'published_at' => $cairoPublishedAt,
+                    'published_at' => $publishedAtUtc,
                     'status' => 'pending',
                 ]
             );
@@ -63,7 +64,7 @@ final class RawFacebookIngestController extends Controller
                 facebookPostId: $facebookPostId,
                 postText: $postText,
                 imageUrls: $imageUrls,
-                publishedAt: $cairoPublishedAt->toIso8601String(),
+                publishedAt: $publishedAtUtc->toIso8601String(),
                 rawFacebookPostId: $rawPost->id,
             );
 

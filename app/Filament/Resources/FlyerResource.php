@@ -6,10 +6,14 @@ namespace App\Filament\Resources;
 
 use App\Enums\FlyerStatus;
 use App\Filament\Resources\FlyerResource\Pages;
+use App\Filament\Resources\FlyerResource\RelationManagers\ItemsRelationManager;
 use App\Jobs\PingIndexNowJob;
 use App\Models\Flyer;
+use App\Models\FlyerPage;
 use App\Services\ImageOptimizerService;
 use Filament\Forms;
+use Filament\Forms\Components\Actions\Action;
+use Filament\Forms\Components\Repeater;
 use Filament\Forms\Form;
 use Filament\Notifications\Notification;
 use Filament\Resources\Resource;
@@ -17,6 +21,7 @@ use Filament\Tables;
 use Filament\Tables\Table;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Collection;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 use Livewire\Features\SupportFileUploads\TemporaryUploadedFile;
@@ -126,20 +131,34 @@ final class FlyerResource extends Resource
                     ->columns(2),
 
                 Forms\Components\Section::make('Pages')
-                    ->description('Facebook image order — drag to reorder and fix sequence. Thumbnails from R2.')
+                    ->description('Facebook image order — use ↑ ↓ buttons to reorder safely. Thumbnails from R2.')
                     ->schema([
                         Forms\Components\Repeater::make('pages')
                             ->label('Flyer Pages')
                             ->relationship('pages')
-                            ->reorderable()
                             ->orderColumn('page_number')
                             ->collapsible()
-                            ->cloneable()
                             ->itemLabel(fn (array $state): ?string => isset($state['page_number']) ? 'Page '.$state['page_number'] : 'New Page')
+                            ->extraItemActions([
+                                Action::make('movePageUp')
+                                    ->label('Move page up')
+                                    ->icon('heroicon-m-chevron-up')
+                                    ->iconButton()
+                                    ->action(function (array $arguments, Repeater $component): void {
+                                        self::moveFlyerPage($component, (string) ($arguments['item'] ?? ''), -1);
+                                    }),
+                                Action::make('movePageDown')
+                                    ->label('Move page down')
+                                    ->icon('heroicon-m-chevron-down')
+                                    ->iconButton()
+                                    ->action(function (array $arguments, Repeater $component): void {
+                                        self::moveFlyerPage($component, (string) ($arguments['item'] ?? ''), 1);
+                                    }),
+                            ])
                             ->schema([
                                 Forms\Components\FileUpload::make('image_path')
                                     ->label('Page Image')
-                                    ->disk('r2')
+                                    ->disk(self::storageDisk())
                                     ->directory('flyers/pages')
                                     ->visibility('public')
                                     ->image()
@@ -152,7 +171,7 @@ final class FlyerResource extends Resource
                                     ->dehydrated(true)
                                     ->helperText(fn (): string => self::isR2Configured() ? 'Stored on R2 — سيتم ضغطه تلقائياً إلى WebP 1200px جودة 80.' : 'R2 not configured — stored locally (public/flyers/pages) كـ WebP.')
                                     ->saveUploadedFileUsing(function (TemporaryUploadedFile $file): string {
-                                        $disk = 'r2';
+                                        $disk = self::storageDisk();
                                         /** @var ImageOptimizerService $optimizer */
                                         $optimizer = app(ImageOptimizerService::class);
                                         try {
@@ -192,104 +211,6 @@ final class FlyerResource extends Resource
                             ->addActionLabel('Add Page'),
                     ]),
 
-                Forms\Components\Section::make('Items')
-                    ->description('Product offers extracted via Gemini — inline editable.')
-                    ->schema([
-                        Forms\Components\Repeater::make('items')
-                            ->label('Flyer Items')
-                            ->relationship('items')
-                            ->collapsible()
-                            ->cloneable()
-                            ->itemLabel(fn (array $state): ?string => $state['product_name'] ?? 'New Item')
-                            ->schema([
-                                Forms\Components\TextInput::make('product_name')
-                                    ->label('Product Name')
-                                    ->required()
-                                    ->maxLength(255)
-                                    ->live(onBlur: true)
-                                    ->afterStateUpdated(function (string $operation, $state, Forms\Set $set, Forms\Get $get): void {
-                                        $currentSlug = $get('slug');
-                                        if (blank($currentSlug) && filled($state)) {
-                                            $set('slug', Str::slug((string) $state).'-'.substr(Str::ulid()->toString(), -4));
-                                        }
-                                    })
-                                    ->columnSpanFull(),
-
-                                Forms\Components\TextInput::make('slug')
-                                    ->label('Slug')
-                                    ->maxLength(255)
-                                    ->placeholder('Auto-generated if empty')
-                                    ->helperText('Auto-generated from product name if left empty.'),
-
-                                Forms\Components\TextInput::make('sale_price')
-                                    ->label('Sale Price (EGP)')
-                                    ->numeric()
-                                    ->prefix('EGP')
-                                    ->step(0.01)
-                                    ->minValue(0)
-                                    ->required(),
-
-                                Forms\Components\TextInput::make('old_price')
-                                    ->label('Old Price (EGP)')
-                                    ->numeric()
-                                    ->prefix('EGP')
-                                    ->step(0.01)
-                                    ->minValue(0)
-                                    ->nullable()
-                                    ->helperText('Crossed-out price, null if single price.'),
-
-                                Forms\Components\TextInput::make('unit')
-                                    ->label('Unit')
-                                    ->placeholder('كجم / لتر / قطعة')
-                                    ->maxLength(50)
-                                    ->nullable(),
-
-                                Forms\Components\Select::make('brand_id')
-                                    ->label('Brand')
-                                    ->relationship('brand', 'name')
-                                    ->searchable()
-                                    ->preload()
-                                    ->nullable()
-                                    ->createOptionForm([
-                                        Forms\Components\TextInput::make('name')
-                                            ->required()
-                                            ->maxLength(255),
-                                        Forms\Components\TextInput::make('slug')
-                                            ->required()
-                                            ->maxLength(255),
-                                    ])
-                                    ->placeholder('— No brand —'),
-
-                                Forms\Components\Select::make('flyer_page_id')
-                                    ->label('Page')
-                                    ->relationship('flyerPage', 'page_number')
-                                    ->getOptionLabelFromRecordUsing(fn ($record) => 'Page '.$record->page_number)
-                                    ->searchable()
-                                    ->preload()
-                                    ->nullable()
-                                    ->helperText('Link item to specific page if known.'),
-
-                                Forms\Components\TextInput::make('bundle_condition')
-                                    ->label('Bundle Condition')
-                                    ->placeholder('حد أقصى 2 قطعة')
-                                    ->maxLength(255)
-                                    ->nullable()
-                                    ->columnSpanFull(),
-
-                                Forms\Components\KeyValue::make('extra_attributes')
-                                    ->label('Extra Attributes')
-                                    ->keyLabel('Key')
-                                    ->valueLabel('Value')
-                                    ->columnSpanFull(),
-
-                                Forms\Components\Toggle::make('is_featured')
-                                    ->label('Featured')
-                                    ->default(false),
-                            ])
-                            ->columns(2)
-                            ->defaultItems(0)
-                            ->addActionLabel('Add Item'),
-                    ]),
             ]);
     }
 
@@ -451,7 +372,9 @@ final class FlyerResource extends Resource
 
     public static function getRelations(): array
     {
-        return [];
+        return [
+            ItemsRelationManager::class,
+        ];
     }
 
     public static function getPages(): array
@@ -513,5 +436,90 @@ final class FlyerResource extends Resource
     private static function storageDisk(): string
     {
         return self::isR2Configured() ? 'r2' : 'public';
+    }
+
+    /**
+     * Resolve a persisted repeater item key ("record-{id}") to its model ID.
+     * Returns null for not-yet-persisted (UUID-keyed) items.
+     */
+    private static function repeaterRecordId(string $key): ?int
+    {
+        if (! str_starts_with($key, 'record-')) {
+            return null;
+        }
+
+        $id = (int) substr($key, 7);
+
+        return $id > 0 ? $id : null;
+    }
+
+    /**
+     * Move a flyer page up/down by one position without ever colliding with
+     * UNIQUE(flyer_id, page_number).
+     *
+     * Persisted rows swap via a temp high offset inside a DB transaction;
+     * the Livewire repeater state is mirrored so the UI matches without reload
+     * (unsaved edits in other fields are preserved). Unpersisted rows swap in
+     * state only — orderColumn() assigns safe sequential numbers on save.
+     */
+    private static function moveFlyerPage(Repeater $component, string $uuid, int $direction): void
+    {
+        $state = $component->getState();
+        if (! is_array($state) || ! array_key_exists($uuid, $state)) {
+            return;
+        }
+
+        $keys = array_keys($state);
+        $pos = array_search($uuid, $keys, true);
+        if ($pos === false || ! isset($keys[$pos + $direction])) {
+            return;
+        }
+        $otherUuid = $keys[$pos + $direction];
+
+        $idA = self::repeaterRecordId($uuid);
+        $idB = self::repeaterRecordId($otherUuid);
+
+        $numA = null;
+        $numB = null;
+
+        if ($idA !== null && $idB !== null && $idA !== $idB) {
+            $pageA = FlyerPage::find($idA);
+            $pageB = FlyerPage::find($idB);
+            if ($pageA === null || $pageB === null || (int) $pageA->flyer_id !== (int) $pageB->flyer_id) {
+                return;
+            }
+
+            $numA = (int) $pageA->page_number;
+            $numB = (int) $pageB->page_number;
+
+            DB::transaction(function () use ($pageA, $pageB, $numA, $numB): void {
+                $pageA->update(['page_number' => $numA + 100000]);
+                $pageB->update(['page_number' => $numA]);
+                $pageA->update(['page_number' => $numB]);
+            });
+        }
+
+        // Mirror the swap in Livewire state: exchange positions, keep numbers
+        // in sync with the database (or swap local values for unpersisted rows).
+        $rowA = $state[$uuid];
+        $rowB = $state[$otherUuid];
+        if ($numA !== null && $numB !== null) {
+            $rowA['page_number'] = $numB;
+            $rowB['page_number'] = $numA;
+        } else {
+            $tmp = $rowA['page_number'] ?? null;
+            $rowA['page_number'] = $rowB['page_number'] ?? null;
+            $rowB['page_number'] = $tmp;
+        }
+
+        $orderedKeys = $keys;
+        [$orderedKeys[$pos], $orderedKeys[$pos + $direction]] = [$orderedKeys[$pos + $direction], $orderedKeys[$pos]];
+
+        $newState = [];
+        foreach ($orderedKeys as $key) {
+            $newState[$key] = $key === $uuid ? $rowA : ($key === $otherUuid ? $rowB : $state[$key]);
+        }
+
+        $component->state($newState);
     }
 }

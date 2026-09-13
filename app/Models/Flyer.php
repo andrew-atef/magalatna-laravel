@@ -6,6 +6,7 @@ namespace App\Models;
 
 use App\Enums\FlyerStatus;
 use App\Services\FlyerSlugService;
+use App\Support\ArabicDateHelper;
 use Carbon\Carbon;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
@@ -85,7 +86,10 @@ class Flyer extends Model
     }
 
     /**
-     * Bulletproof Arabic Fallback Generator — يمنع الإنجليزية تماماً ويصلح HTML Entities
+     * Bulletproof Arabic Fallback Generator — يمنع الإنجليزية تماماً ويصلح HTML Entities.
+     *
+     * O(1): never touches the database. Reads only the stored attribute plus
+     * relations that the caller ALREADY eager-loaded (relationLoaded guard).
      */
     public function getBlufSummaryAttribute(): string
     {
@@ -98,29 +102,30 @@ class Flyer extends Model
             // Strict check: must be 2 sentences, contain discount and no English, not just title
             $isTwoSentences = count(preg_split('/[.!؟]+/u', $decoded, -1, PREG_SPLIT_NO_EMPTY)) >= 2;
             $hasDiscount = str_contains($decoded, '%') && str_contains($decoded, 'بخصومات');
-            $isShallowTitle = $decoded === $this->attributes['title'] ?? '' || mb_strlen($decoded) < 30;
+            $isShallowTitle = $decoded === ($this->attributes['title'] ?? '') || mb_strlen($decoded) < 30;
             if ($decoded !== '' && ! preg_match('/[a-zA-Z]/', $decoded) && $isTwoSentences && $hasDiscount && ! $isShallowTitle) {
                 return $decoded;
             }
         }
 
-        // Fallback high-CTR atomic 2-sentence — 2026 SEO
-        $titleForBluf = $this->title ?? 'العرض';
+        // Fallback high-CTR atomic 2-sentence — 2026 SEO (attribute/local data only)
+        $titleForBluf = $this->attributes['title'] ?? 'العرض';
         try {
-            $untilCarbon = Carbon::parse($this->valid_until);
+            $untilCarbon = Carbon::parse($this->attributes['valid_until'] ?? '');
             $untilText = $untilCarbon->locale('ar')->isoFormat('dddd D MMMM YYYY');
             if (! preg_match('/[\x{0600}-\x{06FF}]/u', $untilText)) {
-                $untilText = $this->arabicDayName($untilCarbon).' '.$untilCarbon->day.' '.$this->arabicMonthName((int) $untilCarbon->month).' '.$untilCarbon->year;
+                $untilText = ArabicDateHelper::formatArabicDate($untilCarbon);
             }
         } catch (\Throwable $e) {
-            $untilText = (string) $this->valid_until;
+            $untilText = (string) ($this->attributes['valid_until'] ?? '');
         }
-        $maxDiscount = $this->relationLoaded('items') ? $this->items->max('discount_percent') : $this->items()->max('discount_percent');
+
+        // Only use items when already loaded in memory — never query from an accessor.
+        $loadedItems = $this->relationLoaded('items') ? $this->items : collect();
+        $maxDiscount = $loadedItems->max('discount_percent');
         $discount = number_format((float) ($maxDiscount ?? 0), 2, '.', '');
         $discount = rtrim(rtrim($discount, '0'), '.');
-        $topProducts = $this->relationLoaded('items')
-            ? $this->items->take(5)->pluck('product_name')->filter()->implode('، ')
-            : $this->items()->limit(5)->pluck('product_name')->implode('، ');
+        $topProducts = $loadedItems->take(5)->pluck('product_name')->filter()->implode('، ');
         $topProducts = $topProducts !== '' ? $topProducts : 'سلع متنوعة';
 
         return "تصفح {$titleForBluf} الساري في مصر حتى {$untilText}، بخصومات تصل إلى {$discount}%. يشمل العرض تخفيضات قوية على {$topProducts} بجميع الفروع وحتى نفاذ الكمية.";
@@ -138,17 +143,22 @@ class Flyer extends Model
             }
         }
 
-        // Fallback 150-word 2 paragraphs if not yet generated
-        if (empty($this->title) || empty($this->valid_from) || empty($this->valid_until)) {
+        // Fallback 150-word 2 paragraphs if not yet generated (attribute/local data only)
+        $title = $this->attributes['title'] ?? null;
+        $validFrom = $this->attributes['valid_from'] ?? null;
+        $validUntil = $this->attributes['valid_until'] ?? null;
+        if (empty($title) || empty($validFrom) || empty($validUntil)) {
             return null;
         }
 
         try {
-            $from = Carbon::parse($this->valid_from)->locale('ar')->isoFormat('D MMMM YYYY');
-            $until = Carbon::parse($this->valid_until)->locale('ar')->isoFormat('D MMMM YYYY');
-            $discount = number_format((float) ($this->relationLoaded('items') ? $this->items->max('discount_percent') : $this->items()->max('discount_percent') ?? 0), 2, '.', '');
+            $from = Carbon::parse($validFrom)->locale('ar')->isoFormat('D MMMM YYYY');
+            $until = Carbon::parse($validUntil)->locale('ar')->isoFormat('D MMMM YYYY');
+            // Only use items when already loaded in memory — never query from an accessor.
+            $loadedItems = $this->relationLoaded('items') ? $this->items : collect();
+            $discount = number_format((float) ($loadedItems->max('discount_percent') ?? 0), 2, '.', '');
             $discount = rtrim(rtrim($discount, '0'), '.');
-            $topItems = $this->relationLoaded('items') ? $this->items->take(4) : $this->items()->limit(4)->get();
+            $topItems = $loadedItems->take(4);
             if ($topItems->isEmpty()) {
                 $topBullets = "- سلع غذائية متنوعة بأسعار مخفضة بجميع الفروع\n- منتجات ألبان ومخبوزات بعروض حصرية\n- منظفات ومستلزمات منزلية بخصومات قوية\n- تخفيضات على اللحوم والدواجن الطازجة";
             } else {
@@ -160,7 +170,8 @@ class Flyer extends Model
                     return "- {$item->product_name} بسعر {$sale}{$discount}";
                 })->implode("\n");
             }
-            $p1 = "تقدم مجلة {$this->title} من ".($this->retailer?->name ?? 'المتجر')." عروضاً حصرية سارية في مصر من {$from} حتى {$until}، بخصومات {$discount}% على تشكيلة واسعة من السلع الغذائية والمستلزمات المنزلية.";
+            $retailerName = $this->relationLoaded('retailer') && $this->retailer ? $this->retailer->name : 'المتجر';
+            $p1 = "تقدم مجلة {$title} من {$retailerName} عروضاً حصرية سارية في مصر من {$from} حتى {$until}، بخصومات {$discount}% على تشكيلة واسعة من السلع الغذائية والمستلزمات المنزلية.";
             $p2 = "أبرز الصفقات في هذا العدد:\n{$topBullets}";
             $text = $p1."\n\n".$p2;
             $text = (string) preg_replace('/(\d+)\.\s+(\d+%)/u', '$1.$2', $text);
@@ -169,39 +180,6 @@ class Flyer extends Model
         } catch (\Throwable $e) {
             return null;
         }
-    }
-
-    private function arabicMonthName(int $month): string
-    {
-        return match ($month) {
-            1 => 'يناير',
-            2 => 'فبراير',
-            3 => 'مارس',
-            4 => 'أبريل',
-            5 => 'مايو',
-            6 => 'يونيو',
-            7 => 'يوليو',
-            8 => 'أغسطس',
-            9 => 'سبتمبر',
-            10 => 'أكتوبر',
-            11 => 'نوفمبر',
-            12 => 'ديسمبر',
-            default => 'يناير',
-        };
-    }
-
-    private function arabicDayName(Carbon $date): string
-    {
-        return match ((int) $date->dayOfWeek) {
-            0 => 'الأحد',
-            1 => 'الإثنين',
-            2 => 'الثلاثاء',
-            3 => 'الأربعاء',
-            4 => 'الخميس',
-            5 => 'الجمعة',
-            6 => 'السبت',
-            default => $date->locale('ar')->isoFormat('dddd'),
-        };
     }
 
     public function isExpired(): bool

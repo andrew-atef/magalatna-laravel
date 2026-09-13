@@ -53,7 +53,8 @@ final class FlyerController extends Controller
 
         $wantsMarkdown = $request->header('Accept') === 'text/markdown'
             || str_contains((string) $request->header('Accept'), 'text/markdown')
-            || $request->query('_fmt') === 'md';
+            || $request->query('_fmt') === 'md'
+            || $request->query('format') === 'md';
 
         if ($wantsMarkdown) {
             return response()

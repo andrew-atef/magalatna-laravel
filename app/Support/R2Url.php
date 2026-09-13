@@ -67,4 +67,18 @@ final class R2Url
 
         return $base . '/' . ltrim($path, '/');
     }
+
+    /**
+     * Build a Cloudflare Image Resizing URL for a stored R2 path.
+     * Routes through self::base() so malformed protocols are normalized once.
+     */
+    public static function resizedAsset(?string $path, int $width = 600, string $format = 'webp'): ?string
+    {
+        $base = self::base();
+        if (blank($path) || $base === '') {
+            return null;
+        }
+
+        return $base . '/cdn-cgi/image/width=' . $width . ',format=' . $format . '/' . ltrim((string) $path, '/');
+    }
 }

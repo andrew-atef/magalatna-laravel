@@ -11,24 +11,22 @@ use Symfony\Component\HttpFoundation\Response;
 final class NegotiateMarkdownResponse
 {
     /**
-     * Handle an incoming request.
+     * Edge response filter ONLY.
      *
-     * Checks if client wants Markdown via Accept header or ?_fmt=md.
-     * Controllers also perform same check for view selection; this middleware
-     * ensures Vary header is set even for HTML responses.
+     * Performs zero database queries and renders nothing. Controllers own
+     * content negotiation and view selection; this middleware merely:
+     *  - appends `Vary: Accept` to every response (CDN cache differentiation), and
+     *  - tags AI/markdown responses with `X-Robots-Tag: noindex` (SEO protection).
      */
     public function handle(Request $request, Closure $next): Response
     {
         $response = $next($request);
 
-        $wantsMarkdown = $this->wantsMarkdown($request);
-
-        // Ensure Vary header for CDN caching differentiation
+        // Ensure Vary header for CDN caching differentiation on every response.
         $response->headers->set('Vary', 'Accept', false);
 
-        if ($wantsMarkdown && $response->headers->get('Content-Type') !== 'text/markdown; charset=UTF-8') {
-            // Controllers already return markdown with correct Content-Type when needed;
-            // middleware just ensures Vary is present.
+        if (self::wantsMarkdown($request)) {
+            $response->headers->set('X-Robots-Tag', 'noindex');
         }
 
         return $response;
@@ -38,8 +36,8 @@ final class NegotiateMarkdownResponse
     {
         $accept = (string) $request->header('Accept');
 
-        return $accept === 'text/markdown'
-            || str_contains($accept, 'text/markdown')
-            || $request->query('_fmt') === 'md';
+        return str_contains($accept, 'text/markdown')
+            || $request->query('_fmt') === 'md'
+            || $request->query('format') === 'md';
     }
 }

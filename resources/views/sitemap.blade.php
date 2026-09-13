@@ -17,8 +17,8 @@
             <priority>0.8</priority>
             @if ($retailer->logo_path)
                 <image:image>
-                    <image:loc>{{ rtrim((string) config('filesystems.disks.r2.url'), '/') . '/' . ltrim((string) $retailer->logo_path, '/') }}</image:loc>
-                    <image:title>{{ $retailer->name }}</image:title>
+                    <image:loc>{{ \App\Support\R2Url::asset($retailer->logo_path) }}</image:loc>
+                    <image:title>{!! htmlspecialchars((string) $retailer->name, ENT_XML1 | ENT_QUOTES, 'UTF-8') !!}</image:title>
                 </image:image>
             @endif
         </url>
@@ -31,11 +31,11 @@
             <lastmod>{{ \App\Support\CairoTime::toIso8601($flyer->getRawOriginal('updated_at') ?? $flyer->updated_at) }}</lastmod>
             <changefreq>daily</changefreq>
             <priority>0.9</priority>
-            @foreach ($flyer->pages->sortBy('page_number') as $page)
+            @foreach ($flyer->pages->sortBy('page_number')->take(5) as $page)
                 <image:image>
-                    <image:loc>{{ rtrim((string) config('filesystems.disks.r2.url'), '/') . '/' . ltrim((string) $page->image_path, '/') }}</image:loc>
-                    <image:title>{{ $flyer->title }} - صفحة {{ $page->page_number }}</image:title>
-                    <image:caption>أسعار وتخفيضات {{ $flyer->retailer->name }} في مصر - {{ $flyer->title }}</image:caption>
+                    <image:loc>{{ \App\Support\R2Url::asset($page->image_path) }}</image:loc>
+                    <image:title>{!! htmlspecialchars((string) $flyer->title . ' - صفحة ' . $page->page_number, ENT_XML1 | ENT_QUOTES, 'UTF-8') !!}</image:title>
+                    <image:caption>{!! htmlspecialchars('أسعار وتخفيضات ' . (string) $flyer->retailer->name . ' في مصر - ' . (string) $flyer->title, ENT_XML1 | ENT_QUOTES, 'UTF-8') !!}</image:caption>
                 </image:image>
             @endforeach
         </url>

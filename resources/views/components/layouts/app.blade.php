@@ -89,9 +89,6 @@
 </head>
 <body class="min-h-screen bg-[#f8fafc] text-slate-900 antialiased selection:bg-[#039652] selection:text-white">
 
-    @php
-        $headerRetailers = \App\Models\Retailer::where('is_active', true)->orderBy('name')->limit(12)->get();
-    @endphp
     <!-- Header - Deep Petrol Navy / Green system - Desktop + Mobile Search/Menu -->
     <header class="sticky top-0 z-40 border-b-2 border-[#023b55]/10 bg-white/95 backdrop-blur">
         <div class="mx-auto flex max-w-7xl items-center justify-between gap-2 px-4 py-3 sm:px-6">
@@ -106,11 +103,11 @@
             <nav class="hidden lg:flex items-center gap-3 xl:gap-4 text-xs font-bold text-[#023b55]">
                 <a href="{{ route('home') }}" class="hover:text-[#039652] transition-colors {{ request()->routeIs('home') && !request()->has('q') && !request()->has('type') ? 'text-[#039652]' : '' }}">الرئيسية</a>
                 @php $kazyon = $headerRetailers->firstWhere('slug','kazyon'); @endphp
-                <a href="{{ $kazyon ? route('retailers.show', $kazyon->slug) : route('retailers.show','kazyon') }}" class="hover:text-[#039652] transition-colors">كازيون</a>
+                <a href="{{ $kazyon ? route('retailers.show', ['retailer' => $kazyon->slug]) : '#' }}" class="hover:text-[#039652] transition-colors">كازيون</a>
                 @php $carrefour = $headerRetailers->firstWhere('slug','carrefouregypt') ?? $headerRetailers->firstWhere('slug','carrefour'); @endphp
-                <a href="{{ $carrefour ? route('retailers.show', $carrefour->slug) : route('retailers.show','carrefouregypt') }}" class="hover:text-[#039652] transition-colors">كارفور</a>
+                <a href="{{ $carrefour ? route('retailers.show', ['retailer' => $carrefour->slug]) : '#' }}" class="hover:text-[#039652] transition-colors">كارفور</a>
                 @php $bim = $headerRetailers->firstWhere('slug','bimmisr') ?? $headerRetailers->firstWhere('slug','bim'); @endphp
-                <a href="{{ $bim ? route('retailers.show', $bim->slug) : route('retailers.show','bimmisr') }}" class="hover:text-[#039652] transition-colors">بيم</a>
+                <a href="{{ $bim ? route('retailers.show', ['retailer' => $bim->slug]) : '#' }}" class="hover:text-[#039652] transition-colors">بيم</a>
                 <a href="{{ route('home', ['q' => 'اليوم الواحد']) }}" class="hover:text-[#039652] transition-colors">عروض اليوم الواحد</a>
                 <a href="{{ route('home', ['type' => 'magazines']) }}" class="hover:text-[#039652] transition-colors">جميع المجلات</a>
             </nav>
@@ -209,7 +206,7 @@
                 <span>•</span>
                 <a href="{{ route('pages.contact') }}" class="hover:text-white transition">اتصل بنا</a>
             </div>
-            <p class="mt-4 text-[#fcc023]/90">© {{ date('Y') }} {{ config('app.name', 'مجلاتنا') }} — منصة متابعة أسعار وتخفيضات السوبرماركت في مصر.</p>
+            <p class="mt-4 text-[#fcc023]/90">© {{ \Carbon\Carbon::now('Africa/Cairo')->year }} {{ config('app.name', 'مجلاتنا') }} — منصة متابعة أسعار وتخفيضات السوبرماركت في مصر.</p>
         </div>
     </footer>
 

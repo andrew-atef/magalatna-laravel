@@ -10,6 +10,7 @@ use App\Models\Flyer;
 use Carbon\Carbon;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Throwable;
 
@@ -21,7 +22,9 @@ final class ExpireOldFlyersCommand extends Command
 
     public function handle(): int
     {
-        $cairoToday = Carbon::today('Africa/Cairo')->toDateString();
+        // Cairo date boundary: a flyer expires only after its valid_until DAY
+        // has fully elapsed in Africa/Cairo (consistent with Flyer::isExpired()).
+        $cairoToday = Carbon::now('Africa/Cairo')->startOfDay()->toDateString();
 
         $flyers = Flyer::with('retailer')
             ->where('status', FlyerStatus::Published)
@@ -35,35 +38,46 @@ final class ExpireOldFlyersCommand extends Command
             return self::SUCCESS;
         }
 
-        $affected = 0;
-        $allUrls = [];
+        $expiredIds = [];
 
-        foreach ($flyers as $flyer) {
-            try {
-                $flyer->status = FlyerStatus::Expired;
-                $flyer->save(); // Fires FlyerObserver saved -> purge + sitemap forget
-
-                $affected++;
-
-                // Collect URLs for manual batch purge as fallback
-                try {
-                    $allUrls[] = route('flyers.show', $flyer->slug);
-                } catch (Throwable $e) {
-                    $allUrls[] = rtrim((string) config('app.url'), '/') . '/offers/' . $flyer->slug;
+        try {
+            // Single atomic transaction: any failure rolls back ALL status flips.
+            DB::transaction(function () use ($flyers, &$expiredIds): void {
+                foreach ($flyers as $flyer) {
+                    $flyer->status = FlyerStatus::Expired;
+                    // Model save (not quiet): FlyerObserver fires per flyer (purge + sitemap forget).
+                    $flyer->save();
+                    $expiredIds[] = (int) $flyer->id;
                 }
+            });
+        } catch (Throwable $e) {
+            Log::error('ExpireOldFlyersCommand: transaction rolled back, no flyer expired.', [
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
+            ]);
+            $this->error('فشلت الأرشفة وتم التراجع عن كل التغييرات: ' . $e->getMessage());
 
+            return self::FAILURE;
+        }
+
+        $affected = count($expiredIds);
+
+        // Collect purge URLs for the expired flyers (re-read inside fresh state).
+        $allUrls = [];
+        $expired = Flyer::with('retailer')->whereIn('id', $expiredIds)->get();
+        foreach ($expired as $flyer) {
+            try {
+                $allUrls[] = route('flyers.show', $flyer->slug);
+            } catch (Throwable $e) {
+                $allUrls[] = rtrim((string) config('app.url'), '/') . '/offers/' . $flyer->slug;
+            }
+
+            if ($flyer->retailer) {
                 try {
-                    if ($flyer->retailer) {
-                        $allUrls[] = route('retailers.show', $flyer->retailer->slug);
-                    }
+                    $allUrls[] = route('retailers.show', $flyer->retailer->slug);
                 } catch (Throwable $e) {
                     Log::warning('ExpireOldFlyersCommand: retailer URL failed.', ['flyer_id' => $flyer->id]);
                 }
-            } catch (Throwable $e) {
-                Log::error('ExpireOldFlyersCommand: Failed to expire flyer.', [
-                    'flyer_id' => $flyer->id,
-                    'error' => $e->getMessage(),
-                ]);
             }
         }
 
@@ -78,21 +92,28 @@ final class ExpireOldFlyersCommand extends Command
             $allUrls[] = $appUrl . '/sitemap.xml';
         }
 
-        $allUrls = array_values(array_unique(array_filter(array_map(static fn (string $u): string => trim($u), $allUrls))));
+        $allUrls = array_values(array_unique(array_filter(array_map(static fn (mixed $u): string => trim((string) $u), $allUrls))));
 
         Cache::forget('sitemap_xml_content');
 
-        if ($allUrls !== []) {
+        // Respect Cloudflare Edge API batch limits: max 30 URLs per purge job.
+        foreach (array_chunk($allUrls, 30) as $index => $chunk) {
             try {
-                PurgeCloudflareCacheJob::dispatch($allUrls);
-                Log::info('ExpireOldFlyersCommand: Dispatched batch purge for expired flyers.', [
-                    'affected' => $affected,
-                    'urls_count' => count($allUrls),
-                ]);
+                PurgeCloudflareCacheJob::dispatch($chunk);
             } catch (Throwable $e) {
-                Log::error('ExpireOldFlyersCommand: Failed to dispatch batch purge.', ['error' => $e->getMessage()]);
+                Log::error('ExpireOldFlyersCommand: failed to dispatch purge chunk.', [
+                    'chunk' => $index,
+                    'urls_count' => count($chunk),
+                    'error' => $e->getMessage(),
+                ]);
             }
         }
+
+        Log::info('ExpireOldFlyersCommand: expired flyers archived.', [
+            'affected' => $affected,
+            'urls_count' => count($allUrls),
+            'chunks' => (int) ceil(count($allUrls) / 30),
+        ]);
 
         $this->info("تمت أرشفة وتحديث {$affected} مجلة منتهية الصلاحية.");
 

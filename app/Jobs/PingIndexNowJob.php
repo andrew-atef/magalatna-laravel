@@ -48,7 +48,8 @@ final class PingIndexNowJob implements ShouldQueue
                 $url = route('flyers.show', $flyer->slug);
             }
 
-            $apiKey = (string) (config('services.indexnow.key') ?? config('services.indexnow_key') ?? env('INDEXNOW_KEY', ''));
+            // Config-only key (never env() — unavailable after config:cache).
+            $apiKey = (string) config('services.indexnow.key', '');
             $host = (string) parse_url((string) config('app.url'), PHP_URL_HOST);
 
             if (trim($apiKey) === '') {

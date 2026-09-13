@@ -27,6 +27,10 @@
             $eventId = $pageUrl . '#event';
             $itemListId = $pageUrl . '#itemlist';
 
+            // Page-id => absolute image URL map (from already-loaded pages: zero extra queries).
+            // Lets each Product carry its own page image instead of the shared cover.
+            $pageImages = $flyer->pages->mapWithKeys(fn ($p) => [$p->id => R2Url::asset($p->image_path)]);
+
             $graph = [
                 [
                     '@type' => 'Organization',
@@ -65,9 +69,9 @@
                     '@id' => $eventId,
                     'name' => $cleanTitle,
                     'description' => $bluf,
-                    'startDate' => \Carbon\Carbon::parse($flyer->valid_from)->startOfDay()->toIso8601String(),
-                    'endDate' => \Carbon\Carbon::parse($flyer->valid_until)->endOfDay()->toIso8601String(),
-                    'eventStatus' => $flyer->isExpired() ? 'https://schema.org/EventCancelled' : 'https://schema.org/EventScheduled',
+                    'startDate' => \App\Support\CairoTime::toIso8601(\Carbon\Carbon::parse($flyer->valid_from)->startOfDay()),
+                    'endDate' => \App\Support\CairoTime::toIso8601(\Carbon\Carbon::parse($flyer->valid_until)->endOfDay()),
+                    'eventStatus' => $flyer->isExpired() ? 'EventCancelled' : 'EventScheduled',
                     'eventAttendanceMode' => 'https://schema.org/OfflineEventAttendanceMode',
                     'location' => [
                         '@type' => 'Place',
@@ -84,7 +88,7 @@
                     '@id' => $itemListId,
                     'name' => 'قائمة أسعار وسلع ' . $cleanTitle,
                     'numberOfItems' => $flyer->items->count(),
-                    'itemListElement' => $flyer->items->take(50)->values()->map(function ($item, $idx) use ($pageUrl, $flyer, $coverImage) {
+                    'itemListElement' => $flyer->items->take(50)->values()->map(function ($item, $idx) use ($pageUrl, $flyer, $coverImage, $pageImages) {
                         $hasOld = $item->old_price && (float) $item->old_price > (float) $item->sale_price;
                         $offer = [
                             '@type' => 'Offer',
@@ -109,7 +113,7 @@
                             'item' => [
                                 '@type' => 'Product',
                                 'name' => $item->product_name,
-                                'image' => $coverImage,
+                                'image' => $pageImages[$item->flyer_page_id] ?? $coverImage,
                                 'url' => $pageUrl . '#item-' . $item->id,
                                 'brand' => ['@type' => 'Brand', 'name' => $item->brand?->name ?: $item->product_name],
                                 'offers' => $offer,
@@ -124,7 +128,7 @@
                 '@graph' => $graph,
             ];
         @endphp
-        <script type="application/ld+json">{!! json_encode($unifiedSchema, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) !!}</script>
+        <script type="application/ld+json">{!! json_encode($unifiedSchema, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE) !!}</script>
     @endpush
 
     <!-- Breadcrumb - Navy hover -->
@@ -233,12 +237,10 @@
                         صفحة رقم {{ $page->page_number }}
                     </div>
                     @php
-                        $r2Cdn = rtrim(config('filesystems.disks.r2.url'), '/');
-                        $heroImagePath = $page->image_path;
-                        $fullImageUrl = $r2Cdn . '/' . ltrim($heroImagePath, '/');
-                        $mobileOptimizedUrl = $r2Cdn . '/cdn-cgi/image/width=600,format=webp/' . ltrim($heroImagePath, '/');
+                        $fullImageUrl = R2Url::asset($page->image_path);
+                        $mobileOptimizedUrl = R2Url::resizedAsset($page->image_path, 600);
                     @endphp
-                    <button type="button" data-index="{{ $loop->index }}" aria-label="تكبير صفحة {{ $page->page_number }}" class="lightbox-trigger block w-full cursor-zoom-in focus:outline-none focus:ring-2 focus:ring-[#039652] focus:ring-offset-2">
+                    <button type="button" data-index="{{ $loop->index }}" aria-label="تكبير صفحة {{ $page->page_number }}" class="lightbox-trigger block w-full cursor-zoom-in focus:outline-none focus:ring-2 focus:ring-[#039652] focus:ring-offset-2" style="aspect-ratio: 3/4;">
                         <img
                             src="{{ $fullImageUrl }}"
                             srcset="{{ $fullImageUrl }} 1200w, {{ $mobileOptimizedUrl }} 600w"

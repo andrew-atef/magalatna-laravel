@@ -15,46 +15,39 @@ final class InternalApiKeyMiddleware
     /**
      * Handle an incoming request.
      *
-     * Validates Bearer token against INTERNAL_API_KEY.
+     * Validates the caller against the server-side internal API key.
+     * The expected key is read STRICTLY from config (never env() — env() is
+     * unavailable after `php artisan config:cache` in production).
      * Accepts either `Authorization: Bearer <key>` or `X-Internal-Key` header.
      */
     public function handle(Request $request, Closure $next): Response
     {
-        try {
-            $expected = (string) (config('services.internal_api.key') ?? config('services.internal_api_key') ?? env('INTERNAL_API_KEY', ''));
+        $expected = (string) config('services.internal_api.key', '');
 
-            if (trim($expected) === '') {
-                Log::warning('INTERNAL_API_KEY is not configured; rejecting ingestion request.');
+        if (trim($expected) === '') {
+            Log::warning('InternalApiKeyMiddleware: internal API key not configured; rejecting request.');
 
-                return new JsonResponse(['message' => 'Internal API key not configured.'], 500);
-            }
+            return new JsonResponse(['message' => 'Service unavailable. Internal API key not configured.'], 503);
+        }
 
-            $provided = $request->bearerToken();
+        $provided = $request->bearerToken();
 
-            if ($provided === null || trim($provided) === '') {
-                $provided = $request->header('X-Internal-Key');
-            }
+        if ($provided === null || trim($provided) === '') {
+            $provided = $request->header('X-Internal-Key');
+        }
 
-            if (! is_string($provided) || trim($provided) === '') {
-                return new JsonResponse(['message' => 'Unauthorized. Missing Bearer token.'], 401);
-            }
+        if (! is_string($provided) || trim($provided) === '') {
+            return new JsonResponse(['message' => 'Unauthorized. Missing credentials.'], 401);
+        }
 
-            if (! hash_equals($expected, trim($provided))) {
-                Log::warning('Invalid internal API key attempt.', [
-                    'ip' => $request->ip(),
-                    'user_agent' => $request->userAgent(),
-                ]);
-
-                return new JsonResponse(['message' => 'Unauthorized. Invalid token.'], 401);
-            }
-
-            return $next($request);
-        } catch (\Throwable $e) {
-            Log::error('InternalApiKeyMiddleware failed.', [
-                'error' => $e->getMessage(),
+        if (! hash_equals($expected, trim($provided))) {
+            Log::warning('InternalApiKeyMiddleware: invalid internal API key attempt.', [
+                'ip' => $request->ip(),
             ]);
 
-            return new JsonResponse(['message' => 'Unauthorized.'], 401);
+            return new JsonResponse(['message' => 'Unauthorized. Invalid credentials.'], 401);
         }
+
+        return $next($request);
     }
 }

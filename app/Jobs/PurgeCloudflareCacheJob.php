@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace App\Jobs;
 
 use App\Services\CloudflareCacheService;
-use App\Services\InstantIndexingService;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
@@ -33,7 +32,7 @@ final class PurgeCloudflareCacheJob implements ShouldQueue
      */
     public function __construct(public readonly array $urls) {}
 
-    public function handle(CloudflareCacheService $cache, InstantIndexingService $indexing): void
+    public function handle(CloudflareCacheService $cache): void
     {
         try {
             $urls = $this->normalize($this->urls);
@@ -52,28 +51,14 @@ final class PurgeCloudflareCacheJob implements ShouldQueue
                 ]);
             }
 
-            // For each public URL, asynchronously dispatch IndexNow and Google pings
+            // Decoupled: fan out one independent IndexNow worker per URL.
+            // No synchronous network calls here — each PingIndexNowJob runs
+            // on its own worker with its own retries.
             foreach ($urls as $url) {
                 try {
-                    // Dispatch IndexNow via existing job for async execution
                     PingIndexNowJob::dispatch($url);
                 } catch (Throwable $e) {
                     Log::warning('PurgeCloudflareCacheJob: Failed to dispatch IndexNow.', [
-                        'url' => $url,
-                        'error' => $e->getMessage(),
-                    ]);
-                    // Fallback to direct service call
-                    try {
-                        $indexing->notifyIndexNow($url);
-                    } catch (Throwable $e2) {
-                        Log::error('PurgeCloudflareCacheJob: IndexNow fallback failed.', ['url' => $url, 'error' => $e2->getMessage()]);
-                    }
-                }
-
-                try {
-                    $indexing->notifyGoogle($url);
-                } catch (Throwable $e) {
-                    Log::warning('PurgeCloudflareCacheJob: Google indexing failed.', [
                         'url' => $url,
                         'error' => $e->getMessage(),
                     ]);
