@@ -74,11 +74,12 @@ final class DirectFacebookPhotosIngestCommand extends Command
         // Timeline root first: server-renders full story units (complete
         // message text, creation_time, per-story viewer_image attachments).
         // photos_by variant second; photo grids last as media-only fallback.
+        // Desktop www endpoints only — mobile web suppresses timeline
+        // streams behind login walls and must never overwrite good HTML.
         $candidates = [
             "https://www.facebook.com/{$handle}",
             "https://www.facebook.com/{$handle}/photos_by",
             "https://www.facebook.com/{$handle}/photos",
-            "https://m.facebook.com/{$handle}/photos",
         ];
 
         $html = null;
@@ -744,10 +745,13 @@ final class DirectFacebookPhotosIngestCommand extends Command
     /**
      * Quick content check: does this HTML carry any photo identifiers or
      * usable images? Walls return 200 with empty content — detect and move on.
+     * Synced with detectNewestPostId (the Tier 1 gate): a candidate breaks
+     * the loop under exactly the same condition Tier 1 will accept, so a
+     * valid timeline response is never overwritten by later fallbacks.
      */
     private function hasExtractableContent(string $html): bool
     {
-        if ($this->extractPostId($html) !== null) {
+        if ($this->detectNewestPostId($html) !== null) {
             return true;
         }
 
