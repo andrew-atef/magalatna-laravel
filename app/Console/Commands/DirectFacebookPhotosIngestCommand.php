@@ -84,9 +84,16 @@ final class DirectFacebookPhotosIngestCommand extends Command
 
         $html = null;
         $target = $candidates[0];
-        foreach ($candidates as $candidate) {
+        $firstHtml = null;
+        foreach ($candidates as $index => $candidate) {
             $this->info("Fetching [{$retailer->slug}] via proxy mesh: {$candidate}");
             $html = $this->fetchViaProxyMesh($candidate);
+            if ($index === 0) {
+                $firstHtml = $html;
+            }
+            if ($html !== null && trim($html) !== '') {
+                $this->inspectHtmlAnatomy($retailer->slug, $candidate, $html);
+            }
             if ($html !== null && trim($html) !== '' && $this->hasExtractableContent($html)) {
                 $target = $candidate;
 
@@ -96,6 +103,7 @@ final class DirectFacebookPhotosIngestCommand extends Command
 
         if ($html === null || trim($html) === '') {
             $this->warn("No HTML retrieved for [{$retailer->slug}].");
+            $this->dumpRawHtml($retailer->slug, $firstHtml ?? $html);
 
             return ['status' => 'no-content', 'images' => 0];
         }
@@ -105,6 +113,7 @@ final class DirectFacebookPhotosIngestCommand extends Command
         $postId = $this->detectNewestPostId($html);
         if ($postId === null) {
             $this->warn("No identifiable post for [{$retailer->slug}] (login wall or empty page).");
+            $this->dumpRawHtml($retailer->slug, $firstHtml ?? $html);
 
             return ['status' => 'no-content', 'images' => 0];
         }
@@ -149,6 +158,7 @@ final class DirectFacebookPhotosIngestCommand extends Command
         $payload = $this->harvestFullPost($retailer, $postId, $html);
         if ($payload === null || $payload['images'] === []) {
             $this->warn("Harvest yielded nothing usable for [{$retailer->slug}:{$postId}].");
+            $this->dumpRawHtml($retailer->slug, $firstHtml ?? $html);
 
             return ['status' => 'no-content', 'images' => 0];
         }
@@ -181,13 +191,27 @@ final class DirectFacebookPhotosIngestCommand extends Command
     private function detectNewestPostId(string $html): ?string
     {
         if (preg_match('/\{"node":\{"__typename":"Story".*?"post_id":"(\d+)"/s', $html, $m)) {
-            return trim($m[1]);
-        }
-        if (preg_match('#"url":"[^"]*?/posts/(pfbid[\w]+)/#i', $html, $m)) {
-            return trim($m[1]);
-        }
+            $postId = trim($m[1]);
+            $this->line("  ├── [TRACE] Pattern 1 (Relay Story post_id): Match: {$postId}");
+            Log::debug('[TRACE] Pattern 1 (Relay Story post_id) matched.', ['post_id' => $postId]);
 
-        return $this->extractPostId($html);
+            return $postId;
+        }
+        $this->line('  ├── [TRACE] Pattern 1 (Relay Story post_id): NO_MATCH');
+        if (preg_match('#"url":"[^"]*?/posts/(pfbid[\w]+)/#i', $html, $m)) {
+            $postId = trim($m[1]);
+            $this->line("  ├── [TRACE] Pattern 2 (Story URL pfbid): Match: {$postId}");
+            Log::debug('[TRACE] Pattern 2 (Story URL pfbid) matched.', ['post_id' => $postId]);
+
+            return $postId;
+        }
+        $this->line('  ├── [TRACE] Pattern 2 (Story URL pfbid): NO_MATCH');
+        $fallback = $this->extractPostId($html);
+        $this->line('  ├── [TRACE] Pattern 3 (fbid in query/script): ' . ($fallback !== null ? "Match: {$fallback}" : 'NO_MATCH'));
+        $this->line('  └── [TRACE] RESOLVED_AS: ' . ($fallback ?? 'NULL'));
+        Log::debug('[TRACE] Post ID resolution finished.', ['post_id' => $fallback]);
+
+        return $fallback;
     }
 
     /**
@@ -574,10 +598,15 @@ final class DirectFacebookPhotosIngestCommand extends Command
 
         if ($proxyUrl !== '') {
             try {
+                $t0 = microtime(true);
+                $this->line("[DEBUG_NETWORK] OUTBOUND -> Target: {$targetUrl} via Vercel: {$proxyUrl}");
+                Log::debug("[DEBUG_NETWORK] OUTBOUND -> Target: {$targetUrl} via Vercel: {$proxyUrl}");
                 $headers = $secret !== '' ? ['x-proxy-secret' => $secret] : [];
                 $response = Http::timeout(self::REQUEST_TIMEOUT)
                     ->withHeaders($headers)
                     ->get($proxyUrl, ['url' => $targetUrl]);
+
+                $this->logResponseTelemetry('VERCEL_PROXY', $response, $t0);
 
                 if ($response->successful()) {
                     $html = $this->extractHtml($response);
@@ -586,9 +615,11 @@ final class DirectFacebookPhotosIngestCommand extends Command
                     }
                     Log::warning('[PROXY_EMPTY] Vercel proxy returned no usable HTML, using direct Azure egress.', ['target' => $targetUrl]);
                 } else {
+                    $this->line("[DEBUG_FALLBACK] Vercel failed (Status: {$response->status()}). Attempting DIRECT Azure egress...");
                     Log::warning("[PROXY_FALLBACK] Vercel proxy HTTP {$response->status()}, using direct Azure egress.", ['target' => $targetUrl]);
                 }
             } catch (Throwable $e) {
+                $this->line("[DEBUG_FALLBACK] Vercel exception ({$e->getMessage()}). Attempting DIRECT Azure egress...");
                 Log::warning('[PROXY_FALLBACK] Vercel proxy failed, using direct Azure egress.', [
                     'target' => $targetUrl,
                     'error' => $e->getMessage(),
@@ -597,6 +628,9 @@ final class DirectFacebookPhotosIngestCommand extends Command
         }
 
         try {
+            $t0 = microtime(true);
+            $this->line("[DEBUG_NETWORK] OUTBOUND -> Target: {$targetUrl} via AZURE_DIRECT");
+            Log::debug("[DEBUG_NETWORK] OUTBOUND -> Target: {$targetUrl} via AZURE_DIRECT");
             $response = Http::timeout(self::REQUEST_TIMEOUT)
                 ->withHeaders([
                     'User-Agent' => 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36',
@@ -604,11 +638,91 @@ final class DirectFacebookPhotosIngestCommand extends Command
                 ])
                 ->get($targetUrl);
 
+            $this->logResponseTelemetry('AZURE_DIRECT', $response, $t0);
+
             return $response->successful() ? (string) $response->body() : null;
         } catch (Throwable $e) {
+            $this->line("[DEBUG_FALLBACK] Azure direct exception ({$e->getMessage()}). No more routes.");
             Log::warning('Direct Azure egress fetch failed.', ['target' => $targetUrl, 'error' => $e->getMessage()]);
 
             return null;
+        }
+    }
+
+    /**
+     * Single-line forensic telemetry for one completed HTTP round-trip.
+     * Never throws; console + log mirror.
+     */
+    private function logResponseTelemetry(string $route, Response $response, float $t0): void
+    {
+        $elapsedMs = round((microtime(true) - $t0) * 1000, 2);
+        $upstreamStatus = $response->header('X-Upstream-Status') ?? (string) $response->status();
+        $contentLen = strlen((string) $response->body());
+        $contentType = $response->header('Content-Type') ?? 'unknown';
+        $line = "[DEBUG_RESPONSE] Route: {$route} | HTTP: {$response->status()} | Upstream Meta: {$upstreamStatus} | Size: {$contentLen} bytes | Time: {$elapsedMs}ms | Content-Type: {$contentType}";
+        $this->line($line);
+        Log::debug($line);
+    }
+
+    /**
+     * Granular per-candidate HTML anatomy: title, wall signals, Relay JSON
+     * density, image density, story presence, and a text preview.
+     */
+    private function inspectHtmlAnatomy(string $retailerSlug, string $candidate, string $html): void
+    {
+        preg_match('/<title[^>]*>([^<]*)<\/title>/i', $html, $titleMatch);
+        $pageTitle = trim($titleMatch[1] ?? 'NO_TITLE_FOUND');
+        $hasLoginForm = (bool) preg_match('/form[^>]+action*="login"|input[^>]+name="email"/i', $html);
+        $hasLoginKeyword = (bool) preg_match('/Log into Facebook|m-login-interstitial|تسجيل الدخول|login_dialog|checkpoint/i', $html);
+        $jsonScriptBlocks = preg_match_all('/<script type="application\/json"[^>]*>/i', $html);
+        $scontentImagesCount = preg_match_all('/https:\/\/[a-z0-9.\-]*scontent[^\s"\'<>]+/i', $html);
+        $hasStoryNode = str_contains($html, '"__typename":"Story"');
+        $preview = mb_substr(trim((string) preg_replace('/\s+/', ' ', strip_tags($html))), 0, 120);
+
+        $lines = [
+            "  ├── [ANATOMY] {$candidate} Title: \"{$pageTitle}\"",
+            '  ├── [ANATOMY] Login Form: ' . ($hasLoginForm ? 'YES (WALLED)' : 'NO') . ' | Login Keyword: ' . ($hasLoginKeyword ? 'YES' : 'NO'),
+            "  ├── [ANATOMY] JSON Scripts: {$jsonScriptBlocks} | scontent Images: {$scontentImagesCount} | Story Nodes: " . ($hasStoryNode ? 'YES' : 'NO'),
+            "  └── [ANATOMY] Body Preview: {$preview}",
+        ];
+        foreach ($lines as $line) {
+            $this->line($line);
+        }
+        Log::debug('[ANATOMY] Candidate inspected.', [
+            'retailer_slug' => $retailerSlug,
+            'candidate' => $candidate,
+            'title' => $pageTitle,
+            'login_form' => $hasLoginForm,
+            'login_keyword' => $hasLoginKeyword,
+            'json_scripts' => $jsonScriptBlocks,
+            'scontent_images' => $scontentImagesCount,
+            'story_nodes' => $hasStoryNode,
+        ]);
+    }
+
+    /**
+     * Persist the raw upstream HTML snapshot for unresolved retailers.
+     * Dumps are permanent by design — never auto-deleted. Never throws.
+     */
+    private function dumpRawHtml(string $retailerSlug, ?string $html): void
+    {
+        if ($html === null || trim($html) === '') {
+            return;
+        }
+        try {
+            $snapshotPath = storage_path("logs/fb_raw_{$retailerSlug}_" . date('Ymd_His') . '.html');
+            file_put_contents($snapshotPath, $html, LOCK_EX);
+            $this->error("  ⚠️ DUMP SAVED: Full raw HTML saved to: {$snapshotPath}");
+            Log::warning('[FORENSIC_DUMP] Raw upstream HTML snapshot saved.', [
+                'retailer_slug' => $retailerSlug,
+                'path' => $snapshotPath,
+                'bytes' => strlen($html),
+            ]);
+        } catch (Throwable $e) {
+            Log::warning('[FORENSIC_DUMP] Failed to save raw HTML snapshot.', [
+                'retailer_slug' => $retailerSlug,
+                'error' => $e->getMessage(),
+            ]);
         }
     }
 
