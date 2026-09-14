@@ -11,38 +11,36 @@ use Carbon\Carbon;
 use Firecrawl\Client\FirecrawlClient;
 use Firecrawl\Models\ScrapeOptions;
 use Illuminate\Console\Command;
-use Illuminate\Http\Client\Response;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
+use Symfony\Component\Process\Process;
 use Throwable;
 
 final class DirectFacebookPhotosIngestCommand extends Command
 {
     protected $signature = 'flyers:ingest-direct {--store= : Specific retailer slug} {--dry-run : Parse and report without saving or dispatching} {--force : Bypass the radar dedup gate and re-harvest even if the post ID already exists}';
 
-    protected $description = 'Direct HTTP Facebook photo ingest via Vercel proxy mesh with Azure fallback';
+    protected $description = 'Direct Chrome-TLS Facebook photo ingest via local curl-impersonate engine';
 
     private const MAX_IMAGES = 50;
 
     private const REQUEST_TIMEOUT = 10;
 
     /**
-     * Official Meta crawler header profiles. Recognized social-preview and
-     * catalog bots traverse a distinct SSR pipeline that may serve clean
-     * OpenGraph timeline nodes without interactive login barriers.
+     * Resolved curl-impersonate Chrome binary. Prefers the pinned install
+     * path, falls back to PATH lookup; missing binary degrades to null
+     * (never fatal — the loop simply records no-content).
      */
-    private const FB_BOT_HEADERS = [
-        'facebookexternalhit' => [
-            'User-Agent' => 'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)',
-            'Accept' => 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language' => 'ar-EG,ar;q=0.9,en;q=0.8',
-        ],
-        'facebookcatalog' => [
-            'User-Agent' => 'facebookcatalog/1.0',
-            'Accept' => 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language' => 'ar-EG,ar;q=0.9',
-        ],
-    ];
+    private function curlImpersonateBinary(): string
+    {
+        foreach (['/usr/local/bin/curl_chrome116', '/usr/bin/curl_chrome116'] as $path) {
+            if (is_executable($path)) {
+                return $path;
+            }
+        }
+
+        return 'curl_chrome116';
+    }
 
     public function handle(): int
     {
@@ -105,39 +103,20 @@ final class DirectFacebookPhotosIngestCommand extends Command
         $html = null;
         $target = $candidates[0];
         $firstHtml = null;
-        // Multi-vector probe: Meta bot signatures first (distinct SSR
-        // pipeline), desktop browser emulation last. Vectors run ONLY on the
-        // timeline root — the sole candidate able to yield story post IDs —
-        // keeping worst-case cost at 5 requests/retailer. Empty bot responses
-        // cascade silently to the next vector.
-        $vectors = [
-            'externalhit' => self::FB_BOT_HEADERS['facebookexternalhit'],
-            'catalog' => self::FB_BOT_HEADERS['facebookcatalog'],
-            'browser' => null,
-        ];
         foreach ($candidates as $index => $candidate) {
-            $probeVectors = $index === 0 ? $vectors : ['browser' => null];
-            foreach ($probeVectors as $vectorName => $headerProfile) {
-                $this->info("Fetching [{$retailer->slug}] via proxy mesh [{$vectorName}]: {$candidate}");
-                $html = $this->fetchViaProxyMesh($candidate, $headerProfile, $vectorName);
-                if ($index === 0) {
-                    // Forensic reference: latest timeline-root response across vectors.
-                    $firstHtml = $html;
-                }
-                if ($html !== null && trim($html) !== '') {
-                    $this->inspectHtmlAnatomy($retailer->slug, $candidate, $html);
-                }
-                if ($html !== null && trim($html) !== '' && $this->hasExtractableContent($html)) {
-                    $target = $candidate;
-                    if ($vectorName !== 'browser') {
-                        $this->line("[BOT_INGEST_HIT] Successfully captured {$retailer->slug} using {$vectorName} signature.");
-                        $this->safeLog('info', "[BOT_INGEST_HIT] Successfully captured {$retailer->slug} using {$vectorName} signature.", [
-                            'candidate' => $candidate,
-                        ]);
-                    }
+            $this->info("Fetching [{$retailer->slug}] via curl-impersonate: {$candidate}");
+            $html = $this->fetchViaCurlImpersonate($candidate);
+            if ($index === 0) {
+                // Forensic reference: timeline-root response.
+                $firstHtml = $html;
+            }
+            if ($html !== null && trim($html) !== '') {
+                $this->inspectHtmlAnatomy($retailer->slug, $candidate, $html);
+            }
+            if ($html !== null && trim($html) !== '' && $this->hasExtractableContent($html)) {
+                $target = $candidate;
 
-                    break 2;
-                }
+                break;
             }
         }
 
@@ -744,85 +723,50 @@ final class DirectFacebookPhotosIngestCommand extends Command
      * direct Azure egress when the proxy is unreachable. Never throws.
      */
     /**
-     * Fetch upstream HTML through the Vercel proxy mesh, falling back to
-     * direct Azure egress when the proxy is unreachable. Never throws.
-     *
-     * NOTE: the Vercel gateway applies its own Chrome 126 egress identity —
-     * a bot $headerProfile only takes effect on the AZURE_DIRECT fallback
-     * leg, where Meta sees this host's UA verbatim.
+     * Fetch upstream HTML via the local curl-impersonate Chrome engine.
+     * Every outbound Facebook request natively carries Chrome's TLS JA3/JA4
+     * fingerprint (< 15MB RAM, zero browser processes). Array-form Process
+     * construction — no shell interpolation. Never throws.
      */
-    private function fetchViaProxyMesh(string $targetUrl, ?array $headerProfile = null, string $vector = 'browser'): ?string
+    private function fetchViaCurlImpersonate(string $targetUrl): ?string
     {
-        // Strictly config-driven (never env() — breaks under config:cache).
-        $proxyUrl = trim((string) config('services.facebook_proxy.url'));
-        $secret = trim((string) config('services.facebook_proxy.secret', ''));
-
-        if ($proxyUrl !== '') {
-            try {
-                $t0 = microtime(true);
-                $this->line("[DEBUG_NETWORK] OUTBOUND -> Target: {$targetUrl} via Vercel: {$proxyUrl} | Vector: {$vector}");
-                $this->safeLog('debug', "[DEBUG_NETWORK] OUTBOUND -> Target: {$targetUrl} via Vercel: {$proxyUrl} | Vector: {$vector}");
-                $headers = $secret !== '' ? ['x-proxy-secret' => $secret] : [];
-                $response = Http::timeout(self::REQUEST_TIMEOUT)
-                    ->withHeaders($headers)
-                    ->get($proxyUrl, ['url' => $targetUrl]);
-
-                $this->logResponseTelemetry('VERCEL_PROXY', $response, $t0, $vector);
-
-                if ($response->successful()) {
-                    $html = $this->extractHtml($response);
-                    if ($html !== null) {
-                        return $html;
-                    }
-                    $this->safeLog('warning', '[PROXY_EMPTY] Vercel proxy returned no usable HTML, using direct Azure egress.', ['target' => $targetUrl]);
-                } else {
-                    $this->line("[DEBUG_FALLBACK] Vercel failed (Status: {$response->status()}). Attempting DIRECT Azure egress...");
-                    $this->safeLog('warning', "[PROXY_FALLBACK] Vercel proxy HTTP {$response->status()}, using direct Azure egress.", ['target' => $targetUrl]);
-                }
-            } catch (Throwable $e) {
-                $this->line("[DEBUG_FALLBACK] Vercel exception ({$e->getMessage()}). Attempting DIRECT Azure egress...");
-                $this->safeLog('warning', '[PROXY_FALLBACK] Vercel proxy failed, using direct Azure egress.', [
-                    'target' => $targetUrl,
-                    'error' => $e->getMessage(),
-                ]);
-            }
-        }
+        $t0 = microtime(true);
+        $this->line("[DEBUG_NETWORK] OUTBOUND -> Target: {$targetUrl} via curl_chrome116");
+        $this->safeLog('debug', "[DEBUG_NETWORK] OUTBOUND -> Target: {$targetUrl} via curl_chrome116");
 
         try {
-            $t0 = microtime(true);
-            $this->line("[DEBUG_NETWORK] OUTBOUND -> Target: {$targetUrl} via AZURE_DIRECT | Vector: {$vector}");
-            $this->safeLog('debug', "[DEBUG_NETWORK] OUTBOUND -> Target: {$targetUrl} via AZURE_DIRECT | Vector: {$vector}");
-            $response = Http::timeout(self::REQUEST_TIMEOUT)
-                ->withHeaders($headerProfile ?? [
-                    'User-Agent' => 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36',
-                    'Accept-Language' => 'ar-EG,ar;q=0.9,en-US;q=0.8',
-                ])
-                ->get($targetUrl);
+            $process = new Process([
+                $this->curlImpersonateBinary(),
+                '-s', '-L',
+                '--max-time', '15',
+                '-H', 'Accept-Language: ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7',
+                '-H', 'Sec-Fetch-Dest: document',
+                '-H', 'Sec-Fetch-Mode: navigate',
+                '-H', 'Sec-Fetch-Site: none',
+                $targetUrl,
+            ]);
+            $process->setTimeout(20);
+            $process->run();
 
-            $this->logResponseTelemetry('AZURE_DIRECT', $response, $t0, $vector);
+            $elapsedMs = round((microtime(true) - $t0) * 1000, 2);
 
-            return $response->successful() ? (string) $response->body() : null;
+            if ($process->isSuccessful()) {
+                $html = $process->getOutput();
+                $line = '[DEBUG_RESPONSE] Route: CURL_CHROME116 | Size: ' . strlen($html) . " bytes | Time: {$elapsedMs}ms";
+                $this->line($line);
+                $this->safeLog('debug', $line);
+
+                return $html;
+            }
+
+            $this->safeLog('warning', "[CURL_IMPERSONATE_ERROR] Failed to fetch {$targetUrl}: " . trim($process->getErrorOutput()));
+
+            return null;
         } catch (Throwable $e) {
-            $this->line("[DEBUG_FALLBACK] Azure direct exception ({$e->getMessage()}). No more routes.");
-            $this->safeLog('warning', 'Direct Azure egress fetch failed.', ['target' => $targetUrl, 'error' => $e->getMessage()]);
+            $this->safeLog('warning', "[CURL_IMPERSONATE_ERROR] Exception fetching {$targetUrl}: {$e->getMessage()}");
 
             return null;
         }
-    }
-
-    /**
-     * Single-line forensic telemetry for one completed HTTP round-trip.
-     * Never throws; console + log mirror.
-     */
-    private function logResponseTelemetry(string $route, Response $response, float $t0, string $vector = 'browser'): void
-    {
-        $elapsedMs = round((microtime(true) - $t0) * 1000, 2);
-        $upstreamStatus = $response->header('X-Upstream-Status') ?: (string) $response->status();
-        $contentLen = strlen((string) $response->body());
-        $contentType = $response->header('Content-Type') ?? 'unknown';
-        $line = "[DEBUG_RESPONSE] Route: {$route} | Vector: {$vector} | HTTP: {$response->status()} | Upstream Meta: {$upstreamStatus} | Size: {$contentLen} bytes | Time: {$elapsedMs}ms | Content-Type: {$contentType}";
-        $this->line($line);
-        $this->safeLog('debug', $line);
     }
 
     /**
@@ -907,34 +851,6 @@ final class DirectFacebookPhotosIngestCommand extends Command
                 'error' => $e->getMessage(),
             ]);
         }
-    }
-
-    /**
-     * Unwrap proxy response: raw HTML passes through, JSON envelopes
-     * ({html|body|content|data}) are unwrapped. Null when unusable.
-     */
-    private function extractHtml(Response $response): ?string
-    {
-        $body = (string) $response->body();
-        if (trim($body) === '') {
-            return null;
-        }
-
-        $first = ltrim($body)[0] ?? '';
-        if ($first !== '{' && $first !== '[') {
-            return $body;
-        }
-
-        $decoded = json_decode($body, true);
-        if (is_array($decoded)) {
-            foreach (['html', 'body', 'content', 'data'] as $key) {
-                if (isset($decoded[$key]) && is_string($decoded[$key]) && trim($decoded[$key]) !== '') {
-                    return $decoded[$key];
-                }
-            }
-        }
-
-        return null;
     }
 
     private const AVATAR_MARKERS = [
