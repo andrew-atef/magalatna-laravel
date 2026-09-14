@@ -38,10 +38,18 @@ return [
             'database' => env('DB_DATABASE', database_path('database.sqlite')),
             'prefix' => '',
             'foreign_key_constraints' => env('DB_FOREIGN_KEYS', true),
-            'busy_timeout' => null,
-            'journal_mode' => null,
-            'synchronous' => null,
+            // Concurrency hardening for 3x Supervisor queue workers on the
+            // database queue driver: WAL allows concurrent readers during
+            // writes; busy_timeout makes lock contention wait instead of
+            // throwing "database is locked". Applied by SQLiteConnector on
+            // every new connection (see vendor SQLiteConnector).
+            'busy_timeout' => 5000,
+            'journal_mode' => 'WAL',
+            'synchronous' => 'NORMAL',
             'transaction_mode' => 'DEFERRED',
+            'options' => [
+                PDO::ATTR_TIMEOUT => 5,
+            ],
         ],
 
         'mysql' => [

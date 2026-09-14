@@ -10,6 +10,7 @@ use App\Models\Retailer;
 use App\Observers\FlyerItemObserver;
 use App\Observers\FlyerObserver;
 use App\Observers\RetailerObserver;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\ServiceProvider;
 
 class AppServiceProvider extends ServiceProvider
@@ -30,5 +31,14 @@ class AppServiceProvider extends ServiceProvider
         Flyer::observe(FlyerObserver::class);
         FlyerItem::observe(FlyerItemObserver::class);
         Retailer::observe(RetailerObserver::class);
+
+        // Defense-in-depth SQLite concurrency guard (queue workers share one
+        // SQLite file): connector config already applies these per connection,
+        // re-assert here so artisan/tinker/octane boots are covered too.
+        if (DB::connection() instanceof \Illuminate\Database\SQLiteConnection) {
+            DB::statement('PRAGMA journal_mode=WAL;');
+            DB::statement('PRAGMA busy_timeout=5000;');
+            DB::statement('PRAGMA synchronous=NORMAL;');
+        }
     }
 }

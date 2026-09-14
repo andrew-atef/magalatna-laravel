@@ -284,6 +284,15 @@ final class DirectFacebookPhotosIngestCommand extends Command
                         $rawImages[] = str_replace('\\/', '/', trim($raw));
                     }
                 }
+                // Broad master-asset sweep: story viewer_image often exposes
+                // only the cover page while the remaining flyer pages ship as
+                // high-res t39 master assets further down the same story
+                // block. Never settle for a solitary page when masters exist.
+                if (count($rawImages) < 2) {
+                    foreach ($this->extractStoryMasterImages($chunk) as $master) {
+                        $rawImages[] = $master;
+                    }
+                }
                 $images = $this->purifyImageUrls($rawImages, self::MAX_IMAGES);
                 if ($images === []) {
                     continue;
@@ -325,6 +334,40 @@ final class DirectFacebookPhotosIngestCommand extends Command
         }
 
         return null;
+    }
+
+    /**
+     * Broad sweep for high-res flyer master assets inside a story block.
+     * Matches only full-size masters (t39.30808-6 / t39.99422-6) — avatar
+     * thumbnails (t39.30808-1) can never match this pattern. Decodes the
+     * `\/` unicode escapes and HTML entities up front; downstream
+     * purifyImageUrls() still dedups, re-scores, and caps at MAX_IMAGES.
+     *
+     * @return list<string>
+     */
+    private function extractStoryMasterImages(string $chunk): array
+    {
+        // Normalize first: server-rendered Relay JSON escapes every slash as
+        // `\/`, so match against the decoded form (idempotent when clean).
+        $clean = str_replace('\\/', '/', $chunk);
+        $patterns = [
+            "#https://scontent[^\\s\"'<>]+?/v/t39\\.(?:30808|99422)-6/[^\\s\"'<>]+#",
+            "#https://scontent[^\\s\"'<>]+?(?:mx2048|s960x960|p720x720)[^\\s\"'<>]+#",
+        ];
+        $found = [];
+        foreach ($patterns as $pattern) {
+            if (! preg_match_all($pattern, $clean, $m)) {
+                continue;
+            }
+            foreach ($m[0] as $raw) {
+                $url = html_entity_decode(trim($raw), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+                if ($url !== '' && str_contains($url, 'scontent')) {
+                    $found[] = $url;
+                }
+            }
+        }
+
+        return $found;
     }
 
     private function parseHarvesterTime(mixed $value): Carbon
