@@ -20,7 +20,7 @@ final class DirectFacebookPhotosIngestCommand extends Command
 
     protected $description = 'Direct HTTP Facebook photo ingest via Vercel proxy mesh with Azure fallback';
 
-    private const MAX_IMAGES = 20;
+    private const MAX_IMAGES = 50;
 
     private const REQUEST_TIMEOUT = 10;
 
@@ -44,8 +44,10 @@ final class DirectFacebookPhotosIngestCommand extends Command
         }
 
         foreach ($retailers as $retailer) {
+            $status = 'failed';
+            $images = 0;
             try {
-                $this->ingestRetailer($retailer, $dryRun);
+                ['status' => $status, 'images' => $images] = $this->ingestRetailer($retailer, $dryRun);
             } catch (Throwable $e) {
                 Log::error('Direct ingest failed for retailer.', [
                     'retailer_id' => $retailer->id,
@@ -54,12 +56,18 @@ final class DirectFacebookPhotosIngestCommand extends Command
                 ]);
                 $this->error("Ingest failed [{$retailer->slug}]: {$e->getMessage()}");
             }
+            $this->logTelemetry($retailer->slug, $status, $images);
         }
 
         return self::SUCCESS;
     }
 
-    private function ingestRetailer(Retailer $retailer, bool $dryRun): void
+    /**
+     * Single-line telemetry per retailer execution for rotation tracking.
+     *
+     * @return array{status: string, images: int}
+     */
+    private function ingestRetailer(Retailer $retailer, bool $dryRun): array
     {
         $handle = $retailer->facebook_handle;
         // Timeline root first: server-renders full story units (complete
@@ -87,147 +95,230 @@ final class DirectFacebookPhotosIngestCommand extends Command
         if ($html === null || trim($html) === '') {
             $this->warn("No HTML retrieved for [{$retailer->slug}].");
 
-            return;
+            return ['status' => 'no-content', 'images' => 0];
         }
 
-        // Story pipeline first: complete captions + timestamps + attachments.
-        $stories = $this->extractStoryUnits($html, $retailer);
-        if ($stories !== []) {
-            foreach ($stories as $story) {
-                $this->ingestSinglePost(
-                    $retailer,
-                    $story['post_id'],
-                    $story['caption'],
-                    $story['images'],
-                    $story['published_at'],
-                    $dryRun
-                );
-            }
+        // Tier 1 (lightweight radar): newest post id only — no browser, no
+        // heavy parsing. Story units first (true post ids), photo fbid fallback.
+        $postId = $this->detectNewestPostId($html);
+        if ($postId === null) {
+            $this->warn("No identifiable post for [{$retailer->slug}] (login wall or empty page).");
 
-            return;
+            return ['status' => 'no-content', 'images' => 0];
         }
 
-        // Photo-unit stream parsing: each photo edge becomes an isolated unit,
-        // grouped by album set so distinct posts never merge into one payload.
-        $units = $this->extractPhotoUnits($html);
+        // Dedup gate: ANY existing row means up-to-date — zero browser launches,
+        // zero quota. This also stops re-dispatch while a post is still pending.
+        if (RawFacebookPost::where('retailer_id', $retailer->id)->where('facebook_post_id', $postId)->exists()) {
+            Log::info("[RADAR_IDLE] Store {$retailer->slug} up-to-date (Latest: {$postId}).");
+            $this->info("Up-to-date [{$retailer->slug}:{$postId}], nothing new.");
 
-        if ($units !== []) {
-            $this->ingestUnitGroups($retailer, $units, $dryRun);
-
-            return;
+            return ['status' => 'up-to-date', 'images' => 0];
         }
 
-        // Task 3 fallback: no Relay edges (static HTML) — group photo links by
-        // album set; unattributable images ride with each set group and
-        // converge downstream via Gatekeeper photo-signature dedup.
-        $this->ingestFallbackGroups($retailer, $handle, $html, $dryRun);
+        Log::info("[RADAR_TRIGGER] New post {$postId} for {$retailer->slug}! Calling Full Browser Harvester.");
+        $this->info("New post detected [{$retailer->slug}:{$postId}], harvesting...");
+
+        if ($dryRun) {
+            $preview = $this->directPostPayload($retailer, $postId, $html);
+            $this->table(
+                ['Store', 'Post ID', 'Images (preview)', 'Caption head', 'Published (UTC)'],
+                [[
+                    $retailer->slug,
+                    $postId,
+                    $preview !== null ? count($preview['images']) . ' imgs (direct parse)' : '0 imgs',
+                    mb_substr($preview !== null && $preview['caption'] !== '' ? $preview['caption'] : "عروض {$retailer->name} الجديدة", 0, 60),
+                    ($preview !== null ? $preview['published_at'] : Carbon::now('UTC'))->format('Y-m-d H:i'),
+                ]]
+            );
+            $this->info('[DRY RUN] Live run would trigger the Cloudflare harvester for this post.');
+
+            return ['status' => 'dry-run', 'images' => $preview !== null ? count($preview['images']) : 0];
+        }
+
+        // Tier 2 (event only): full harvest, then persist + dispatch.
+        $payload = $this->harvestFullPost($retailer, $postId, $html);
+        if ($payload === null || $payload['images'] === []) {
+            $this->warn("Harvest yielded nothing usable for [{$retailer->slug}:{$postId}].");
+
+            return ['status' => 'no-content', 'images' => 0];
+        }
+
+        $rawPost = $this->persistPost($retailer, $postId, $payload['caption'], $payload['images'], $payload['published_at'], null);
+        $this->dispatchGatekeeper($retailer, $rawPost, $postId, $payload['caption'], $payload['images'], $payload['published_at']);
+
+        return ['status' => 'harvested', 'images' => count($payload['images'])];
     }
 
     /**
-     * Full-text story units from timeline Relay streams. Each story carries
-     * its complete untruncated message, creation_time, and own viewer_image
-     * attachments. Prefetch duplicates merge by post_id (longest caption and
-     * union images win). Cover/profile-change stories are skipped.
-     *
-     * @return list<array{post_id: string, caption: string, images: list<string>, published_at: Carbon}>
+     * Append the per-execution telemetry summary (rotation/health tracking).
      */
-    private function extractStoryUnits(string $html, Retailer $retailer): array
+    private function logTelemetry(string $retailerSlug, string $status, int $images): void
     {
-        if (! preg_match_all('/\{"node":\{"__typename":"Story"/', $html, $m, PREG_OFFSET_CAPTURE)) {
-            return [];
+        $line = sprintf(
+            '[INGEST_SUMMARY] Retailer: %s | Status: %s | Images: %d | Memory: %.2f MB' . PHP_EOL,
+            $retailerSlug,
+            $status,
+            $images,
+            round(memory_get_usage(true) / 1024 / 1024, 2)
+        );
+
+        file_put_contents(storage_path('logs/facebook_direct_ingest.log'), $line, FILE_APPEND | LOCK_EX);
+    }
+
+    /**
+     * Tier 1 identification: newest story post_id, else first photo fbid.
+     */
+    private function detectNewestPostId(string $html): ?string
+    {
+        if (preg_match('/\{"node":\{"__typename":"Story".*?"post_id":"(\d+)"/s', $html, $m)) {
+            return trim($m[1]);
+        }
+        if (preg_match('#"url":"[^"]*?/posts/(pfbid[\w]+)/#i', $html, $m)) {
+            return trim($m[1]);
         }
 
-        $offsets = array_column($m[0], 1);
-        $offsets[] = strlen($html);
+        return $this->extractPostId($html);
+    }
 
-        $byPost = [];
-        $total = count($m[0]);
-        for ($i = 0; $i < $total; $i++) {
-            $chunk = substr($html, $offsets[$i], min(60000, $offsets[$i + 1] - $offsets[$i]));
+    /**
+     * Tier 2: Cloudflare harvester first, local direct parse as fallback.
+     * Never throws; null when nothing usable.
+     *
+     * @return array{caption: string, images: list<string>, published_at: Carbon}|null
+     */
+    private function harvestFullPost(Retailer $retailer, string $postId, string $html): ?array
+    {
+        $harvesterUrl = trim((string) config('services.cloudflare_harvester.url'));
+        if ($harvesterUrl !== '') {
+            try {
+                $handle = $retailer->facebook_handle;
+                $response = Http::timeout(30)
+                    ->withHeaders(['Authorization' => 'Bearer ' . (string) config('services.cloudflare_harvester.secret')])
+                    ->post($harvesterUrl, [
+                        'retailer_slug' => $retailer->slug,
+                        'post_id' => $postId,
+                        'post_url' => "https://www.facebook.com/{$handle}/posts/{$postId}",
+                    ]);
 
-            // Skip cover/profile-change system stories — never flyers.
-            if (str_contains($chunk, '"cover_photo"') || str_contains($chunk, '"profilePhoto"')) {
-                continue;
-            }
-
-            $postId = null;
-            if (preg_match('/"post_id":"(\d+)"/', $chunk, $pm)) {
-                $postId = trim($pm[1]);
-            } elseif (preg_match('#"url":"[^"]*?/posts/(pfbid[\w]+)/#i', $chunk, $pm)) {
-                $postId = trim($pm[1]);
-            }
-            if ($postId === null || $postId === '') {
-                continue;
-            }
-
-            $publishedAt = Carbon::now('UTC');
-            if (preg_match('/"creation_time":(\d{10})/', $chunk, $tm)) {
-                try {
-                    $publishedAt = Carbon::createFromTimestampUTC((int) $tm[1]);
-                } catch (Throwable $e) {
-                    $publishedAt = Carbon::now('UTC');
-                }
-            }
-
-            $caption = '';
-            if (preg_match('/"message":\s*\{\s*"text":\s*"((?:[^"\\\\]|\\\\.)*)"/u', $chunk, $cm)) {
-                $decoded = json_decode('"' . $cm[1] . '"');
-                $caption = trim((string) ($decoded !== null ? $decoded : $cm[1]));
-            }
-            if ($caption === '' && preg_match_all('/"accessibility_caption":\s*"((?:[^"\\\\]|\\\\.)*)"/u', $chunk, $am)) {
-                $parts = [];
-                foreach (array_unique($am[1]) as $raw) {
-                    $decoded = json_decode('"' . $raw . '"');
-                    $text = trim((string) ($decoded !== null ? $decoded : $raw));
-                    if ($text !== '') {
-                        $parts[] = $text;
+                if ($response->successful()) {
+                    $data = $response->json();
+                    if (is_array($data)) {
+                        $images = $this->purifyImageUrls((array) ($data['images'] ?? []), self::MAX_IMAGES);
+                        if ($images !== []) {
+                            return [
+                                'caption' => mb_substr(trim((string) ($data['post_text'] ?? '')), 0, 10000),
+                                'images' => $images,
+                                'published_at' => $this->parseHarvesterTime($data['published_at'] ?? null),
+                            ];
+                        }
                     }
                 }
-                $caption = trim(implode("\n", $parts));
+                Log::warning('[HARVESTER_FALLBACK] Harvester yielded nothing usable, using local direct parse.', [
+                    'retailer_slug' => $retailer->slug,
+                    'post_id' => $postId,
+                    'status' => $response->status(),
+                ]);
+            } catch (Throwable $e) {
+                Log::warning('[HARVESTER_FALLBACK] Harvester unreachable, using local direct parse.', [
+                    'retailer_slug' => $retailer->slug,
+                    'post_id' => $postId,
+                    'error' => $e->getMessage(),
+                ]);
             }
-            if ($caption === '') {
-                $caption = "عروض {$retailer->name} الجديدة";
-            }
-            $caption = mb_substr($caption, 0, 10000);
+        }
 
-            $rawImages = [];
-            if (preg_match_all('/"viewer_image":\s*\{\s*"height":\s*\d+,"width":\s*\d+,"uri":\s*"((?:[^"\\\\]|\\\\.)*)"/', $chunk, $im)) {
-                foreach ($im[1] as $raw) {
-                    $rawImages[] = str_replace('\\/', '/', trim($raw));
+        return $this->directPostPayload($retailer, $postId, $html);
+    }
+
+    /**
+     * Local direct-parse fallback: story unit with this post_id, else the photo
+     * unit carrying this fbid. Pure HTML already in hand — zero extra fetches.
+     *
+     * @return array{caption: string, images: list<string>, published_at: Carbon}|null
+     */
+    private function directPostPayload(Retailer $retailer, string $postId, string $html): ?array
+    {
+        // Story path.
+        if (preg_match_all('/\{"node":\{"__typename":"Story"/', $html, $m, PREG_OFFSET_CAPTURE)) {
+            $offsets = array_column($m[0], 1);
+            $offsets[] = strlen($html);
+            foreach ($offsets as $i => $offset) {
+                if ($i >= count($m[0])) {
+                    break;
                 }
-            }
-            if ($rawImages === [] && preg_match_all('#https://[a-z0-9.\-]*scontent[a-z0-9.\-]*\.xx\.fbcdn\.net[^"\'\s<>]*#i', $chunk, $im)) {
-                $rawImages = $im[0];
-            }
-            $images = $this->purifyImageUrls($rawImages, self::MAX_IMAGES);
+                $chunk = substr($html, $offset, min(60000, $offsets[$i + 1] - $offset));
+                if (! str_contains($chunk, '"' . $postId . '"')) {
+                    continue;
+                }
+                $caption = '';
+                if (preg_match('/"message":\s*\{\s*"text":\s*"((?:[^"\\\\]|\\\\.)*)"/u', $chunk, $cm)) {
+                    $decoded = json_decode('"' . $cm[1] . '"');
+                    $caption = trim((string) ($decoded !== null ? $decoded : $cm[1]));
+                }
+                $rawImages = [];
+                if (preg_match_all('/"viewer_image":\s*\{\s*"height":\s*\d+,"width":\s*\d+,"uri":\s*"((?:[^"\\\\]|\\\\.)*)"/', $chunk, $im)) {
+                    foreach ($im[1] as $raw) {
+                        $rawImages[] = str_replace('\\/', '/', trim($raw));
+                    }
+                }
+                $images = $this->purifyImageUrls($rawImages, self::MAX_IMAGES);
+                if ($images === []) {
+                    continue;
+                }
+                $publishedAt = Carbon::now('UTC');
+                if (preg_match('/"creation_time":(\d{10})/', $chunk, $tm)) {
+                    try {
+                        $publishedAt = Carbon::createFromTimestampUTC((int) $tm[1]);
+                    } catch (Throwable $e) {
+                        $publishedAt = Carbon::now('UTC');
+                    }
+                }
 
+                return [
+                    'caption' => mb_substr($caption !== '' ? $caption : "عروض {$retailer->name} الجديدة", 0, 10000),
+                    'images' => $images,
+                    'published_at' => $publishedAt,
+                ];
+            }
+        }
+
+        // Photo-unit path: the single edge carrying this fbid.
+        foreach ($this->extractPhotoUnits($html) as $unit) {
+            if ($unit['fbid'] !== $postId) {
+                continue;
+            }
+            $images = $this->purifyImageUrls($unit['images'] ?? [], self::MAX_IMAGES);
             if ($images === []) {
                 continue;
             }
 
-            if (! isset($byPost[$postId])) {
-                $byPost[$postId] = [
-                    'post_id' => $postId,
-                    'caption' => $caption,
-                    'images' => $images,
-                    'published_at' => $publishedAt,
-                ];
-
-                continue;
-            }
-
-            // Prefetch duplicate of the same story: union images, keep the
-            // longer caption and the earliest timestamp.
-            $prev = $byPost[$postId];
-            $byPost[$postId] = [
-                'post_id' => $postId,
-                'caption' => mb_strlen($caption) > mb_strlen($prev['caption']) ? $caption : $prev['caption'],
-                'images' => array_values(array_unique([...$prev['images'], ...$images])),
-                'published_at' => $prev['published_at']->lessThan($publishedAt) ? $prev['published_at'] : $publishedAt,
+            return [
+                'caption' => mb_substr(trim($unit['caption']) !== '' ? $unit['caption'] : "عروض {$retailer->name} الجديدة", 0, 10000),
+                'images' => $images,
+                'published_at' => $unit['published_at'] !== null
+                    ? Carbon::createFromTimestampUTC($unit['published_at'])
+                    : Carbon::now('UTC'),
             ];
         }
 
-        return array_values($byPost);
+        return null;
+    }
+
+    private function parseHarvesterTime(mixed $value): Carbon
+    {
+        try {
+            if (is_int($value) || (is_string($value) && ctype_digit(trim($value)))) {
+                return Carbon::createFromTimestampUTC((int) $value);
+            }
+            if (is_string($value) && trim($value) !== '') {
+                return Carbon::parse(trim($value))->setTimezone('UTC');
+            }
+        } catch (Throwable $e) {
+            // fall through to now
+        }
+
+        return Carbon::now('UTC');
     }
 
     /**
@@ -353,145 +444,6 @@ final class DirectFacebookPhotosIngestCommand extends Command
         }
 
         return $excluded;
-    }
-
-    /**
-     * @param list<array{fbid: string, caption: string, images: list<string>, width: ?int, height: ?int, set: ?string, published_at: ?int}> $units
-     */
-    private function ingestUnitGroups(Retailer $retailer, array $units, bool $dryRun): void
-    {
-        // Strict per-photo posting: each edge is its own post with exactly its
-        // own image(s). Listing HTML carries no reliable post-boundary signal
-        // (fbids are not time-dense; sets span whole collections), so any
-        // merging here risks frankenstein flyers. Same-period singles converge
-        // downstream via Gatekeeper consolidation + signature dedup.
-        $dryRows = [];
-        foreach ($units as $unit) {
-            $postId = $unit['fbid'];
-            $caption = mb_substr(trim($unit['caption']), 0, 2000);
-            $images = $this->purifyImageUrls($unit['images'] ?? [], self::MAX_IMAGES);
-            $publishedAtUtc = $unit['published_at'] !== null
-                ? Carbon::createFromTimestampUTC($unit['published_at'])
-                : Carbon::now('UTC');
-
-            if ($images === []) {
-                $this->info("Skipping post {$postId}: no usable images.");
-
-                continue;
-            }
-
-            $existing = RawFacebookPost::where('retailer_id', $retailer->id)
-                ->where('facebook_post_id', $postId)
-                ->first();
-
-            if ($existing !== null && ! in_array($existing->status, ['pending', 'failed'], true)) {
-                $this->info("Already processed [{$postId}] (status: {$existing->status}), skipping.");
-
-                continue;
-            }
-
-            if ($dryRun) {
-                $dims = ($unit['width'] && $unit['height']) ? " {$unit['width']}x{$unit['height']}" : '';
-                $dryRows[] = [
-                    $retailer->slug,
-                    $postId,
-                    count($images) . ' imgs' . $dims,
-                    mb_substr($caption !== '' ? $caption : "عروض {$retailer->name} الجديدة", 0, 60),
-                    $publishedAtUtc->format('Y-m-d H:i'),
-                ];
-
-                continue;
-            }
-
-            $this->ingestSinglePost($retailer, $postId, $caption, $images, $publishedAtUtc, false);
-        }
-
-        if ($dryRun && $dryRows !== []) {
-            $this->table(
-                ['Store', 'Post ID', 'Images (preview)', 'Caption head', 'Published (UTC)'],
-                $dryRows
-            );
-        }
-    }
-
-    /**
-     * Task 3 fallback: static HTML without Relay edges. Photo links grouped by
-     * album set so different albums never merge; unattributable images ride
-     * with each set group and converge via Gatekeeper signature dedup.
-     */
-    private function ingestFallbackGroups(Retailer $retailer, string $handle, string $html, bool $dryRun): void
-    {
-        $bySet = [];
-        if (preg_match_all('#https://www\.facebook\.com/photo\.php\?fbid=(\d+)&set=([^&"\'\\\\ ]+)#', $html, $m, PREG_SET_ORDER)) {
-            foreach ($m as $match) {
-                $bySet[$match[2]][] = $match[1];
-            }
-        }
-
-        $rawUrls = [];
-        if (preg_match_all('#https://[a-z0-9.\-]*scontent[a-z0-9.\-]*\.xx\.fbcdn\.net[^"\'\s<>]*#i', $html, $im)) {
-            $rawUrls = $im[0];
-        }
-        $images = $this->purifyImageUrls($rawUrls, self::MAX_IMAGES);
-        $caption = $this->extractPostCaption($html, $retailer);
-
-        if ($bySet === []) {
-            // Single anonymous bucket (legacy behavior).
-            $postId = $this->extractPostId($html) ?? ('direct-' . md5($caption . ($images[0] ?? $handle) . $retailer->id));
-            $this->ingestSinglePost($retailer, $postId, $caption, $images, Carbon::now('UTC'), $dryRun);
-
-            return;
-        }
-
-        foreach ($bySet as $fbids) {
-            $fbids = array_values(array_unique($fbids));
-            $this->ingestSinglePost($retailer, $fbids[0], $caption, $images, Carbon::now('UTC'), $dryRun);
-        }
-    }
-
-    private function ingestSinglePost(
-        Retailer $retailer,
-        string $postId,
-        string $caption,
-        array $images,
-        Carbon $publishedAtUtc,
-        bool $dryRun
-    ): void {
-        if ($images === []) {
-            $this->warn("Nothing extractable for [{$retailer->slug}] (login wall or empty album).");
-
-            return;
-        }
-
-        $this->info("Candidate [{$retailer->slug}:{$postId}] — " . count($images) . ' images.');
-
-        $existing = RawFacebookPost::where('retailer_id', $retailer->id)
-            ->where('facebook_post_id', $postId)
-            ->first();
-
-        if ($existing !== null && ! in_array($existing->status, ['pending', 'failed'], true)) {
-            $this->info("Already processed [{$postId}] (status: {$existing->status}), skipping.");
-
-            return;
-        }
-
-        if ($dryRun) {
-            $this->table(
-                ['Store', 'Post ID', 'Images (preview)', 'Caption head', 'Published (UTC)'],
-                [[
-                    $retailer->slug,
-                    $postId,
-                    count($images) . ' imgs',
-                    mb_substr($caption !== '' ? $caption : "عروض {$retailer->name} الجديدة", 0, 60),
-                    $publishedAtUtc->format('Y-m-d H:i'),
-                ]]
-            );
-
-            return;
-        }
-
-        $rawPost = $this->persistPost($retailer, $postId, $caption, $images, $publishedAtUtc, $existing);
-        $this->dispatchGatekeeper($retailer, $rawPost, $postId, $caption, $images, $publishedAtUtc);
     }
 
     private function persistPost(
@@ -684,7 +636,7 @@ final class DirectFacebookPhotosIngestCommand extends Command
      * @param list<mixed> $urls
      * @return list<string>
      */
-    private function purifyImageUrls(array $urls, int $max = 20): array
+    private function purifyImageUrls(array $urls, int $max = self::MAX_IMAGES): array
     {
         $seen = [];
         $scored = [];
@@ -741,38 +693,4 @@ final class DirectFacebookPhotosIngestCommand extends Command
         return false;
     }
 
-    /**
-     * Multi-layered caption extraction. NEVER returns the page-bio
-     * og:description from listing pages (generic "About" text, not the offer).
-     *  1. Embedded Relay post message (unicode escapes decoded).
-     *  2. Photo accessibility captions (carry OCR product/price/date text).
-     *  3. Explicit generic fallback naming the retailer.
-     */
-    private function extractPostCaption(string $html, Retailer $retailer): string
-    {
-        if (preg_match('/"message":\s*\{\s*"text":\s*"([^"]+)"\}/u', $html, $m) && trim($m[1]) !== '') {
-            $decoded = json_decode('"' . $m[1] . '"');
-            $text = trim((string) ($decoded !== null ? $decoded : $m[1]));
-            if ($text !== '') {
-                return mb_substr($text, 0, 2000);
-            }
-        }
-
-        if (preg_match_all('/"accessibility_caption":\s*"([^"]+)"/u', $html, $m) && $m[1] !== []) {
-            $captions = [];
-            foreach (array_unique($m[1]) as $raw) {
-                $decoded = json_decode('"' . $raw . '"');
-                $text = trim((string) ($decoded !== null ? $decoded : $raw));
-                if ($text !== '') {
-                    $captions[] = $text;
-                }
-            }
-            $joined = trim(implode("\n", $captions));
-            if ($joined !== '') {
-                return mb_substr($joined, 0, 2000);
-            }
-        }
-
-        return "عروض {$retailer->name} الجديدة";
-    }
 }

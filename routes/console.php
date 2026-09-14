@@ -24,20 +24,9 @@ Schedule::command('flyers:deduplicate')
     ->withoutOverlapping(60)
     ->onOneServer();
 
-// رادار فيسبوك: مسح كل دقيقة عبر Chromium المحلي — منع التداخل + تشغيل خلفي
-Schedule::command('flyers:radar-scan')
-    ->everyMinute()
-    ->withoutOverlapping(10)
-    ->onOneServer()
-    ->runInBackground()
-    ->appendOutputTo(storage_path('logs/facebook_radar.log'));
-
-// السحب المباشر لايف كل 5 دقائق (بدون dry-run): مجلات جديدة إلى raw_facebook_posts
-// + تشغيل Gatekeeper/Gemini تلقائياً — بتوقيت القاهرة
+// السحب المباشر الخفيف كل 5 دقائق (بدون متصفح — Vercel/Cloudflare فقط)
 Schedule::command('flyers:ingest-direct')
     ->everyFiveMinutes()
-    ->timezone('Africa/Cairo')
     ->withoutOverlapping(10)
-    ->onOneServer()
     ->runInBackground()
-    ->appendOutputTo(storage_path('logs/facebook_ingest.log'));
+    ->appendOutputTo(storage_path('logs/facebook_direct_ingest.log'));

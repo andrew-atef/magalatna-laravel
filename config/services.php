@@ -40,13 +40,14 @@ return [
         'model' => env('GEMINI_MODEL', 'gemini-2.5-flash'),
     ],
 
-    'chromium' => [
-        'path' => env('CHROMIUM_PATH', '/usr/bin/chromium-browser'),
-    ],
-
     'facebook_proxy' => [
         'url' => env('FACEBOOK_PROXY_URL', ''),
         'secret' => env('FACEBOOK_PROXY_SECRET', ''),
+    ],
+
+    'cloudflare_harvester' => [
+        'url' => env('CLOUDFLARE_HARVESTER_URL', ''),
+        'secret' => env('INTERNAL_API_KEY', ''),
     ],
 
     'internal_api' => [
