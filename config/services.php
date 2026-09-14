@@ -45,6 +45,10 @@ return [
         'secret' => env('FACEBOOK_PROXY_SECRET', ''),
     ],
 
+    'firecrawl' => [
+        'api_key' => env('FIRECRAWL_API_KEY', ''),
+    ],
+
     'cloudflare_harvester' => [
         'url' => env('CLOUDFLARE_HARVESTER_URL', ''),
         'secret' => env('INTERNAL_API_KEY', ''),

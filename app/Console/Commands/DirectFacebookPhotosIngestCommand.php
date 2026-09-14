@@ -8,6 +8,8 @@ use App\Jobs\GatekeeperFacebookPostJob;
 use App\Models\RawFacebookPost;
 use App\Models\Retailer;
 use Carbon\Carbon;
+use Firecrawl\Client\FirecrawlClient;
+use Firecrawl\Models\ScrapeOptions;
 use Illuminate\Console\Command;
 use Illuminate\Http\Client\Response;
 use Illuminate\Support\Facades\Http;
@@ -115,7 +117,10 @@ final class DirectFacebookPhotosIngestCommand extends Command
             $this->warn("No identifiable post for [{$retailer->slug}] (login wall or empty page).");
             $this->dumpRawHtml($retailer->slug, $firstHtml ?? $html);
 
-            return ['status' => 'no-content', 'images' => 0];
+            // Managed-cloud last resort: Firecrawl's hosted browser hydrates
+            // the wall away. Credit-guarded — only reached when the free
+            // Vercel probe extracted nothing.
+            return $this->tryFirecrawlFallback($retailer, $dryRun, $force);
         }
 
         // KV / Database gate (Tier 1 radar dedup): LIKE match catches stored
@@ -276,6 +281,116 @@ final class DirectFacebookPhotosIngestCommand extends Command
         }
 
         return $this->directPostPayload($retailer, $postId, $html);
+    }
+
+    /**
+     * Managed-cloud last resort for login-walled pages: delegate the timeline
+     * URL to Firecrawl's hosted browser (full JS hydration), then run the
+     * standard extraction stack on the rendered HTML. Reached ONLY when the
+     * free Vercel probe extracted nothing — preserves Firecrawl credits.
+     * Never throws; null-payload means "still nothing usable".
+     *
+     * @return array{status: string, images: int}
+     */
+    private function tryFirecrawlFallback(Retailer $retailer, bool $dryRun, bool $force): array
+    {
+        $apiKey = trim((string) config('services.firecrawl.api_key'));
+        if ($apiKey === '' || ! class_exists(FirecrawlClient::class)) {
+            Log::debug('[FIRECRAWL_SKIP] Managed fallback unavailable (no API key or SDK missing).', [
+                'retailer_slug' => $retailer->slug,
+            ]);
+
+            return ['status' => 'no-content', 'images' => 0];
+        }
+
+        $this->line("[FIRECRAWL_TRIGGER] Page {$retailer->slug} is login-walled. Delegating to Firecrawl Cloud Browser...");
+        Log::info("[FIRECRAWL_TRIGGER] Page {$retailer->slug} is login-walled. Delegating to Firecrawl Cloud Browser...");
+
+        try {
+            $firecrawl = FirecrawlClient::create($apiKey);
+            $doc = $firecrawl->scrape(
+                "https://www.facebook.com/{$retailer->facebook_handle}",
+                ScrapeOptions::with(formats: ['html', 'markdown'], waitFor: 3000)
+            );
+        } catch (Throwable $e) {
+            $this->warn("[FIRECRAWL_FAIL] Managed scrape failed for [{$retailer->slug}]: {$e->getMessage()}");
+            Log::warning('[FIRECRAWL_FAIL] Managed scrape threw.', [
+                'retailer_slug' => $retailer->slug,
+                'error' => $e->getMessage(),
+            ]);
+
+            return ['status' => 'no-content', 'images' => 0];
+        }
+
+        $renderedHtml = (string) ($doc->getHtml() ?? '');
+        $extraImages = [];
+        foreach ((array) ($doc->getImages() ?? []) as $img) {
+            if (is_string($img)) {
+                $extraImages[] = $img;
+            } elseif (is_array($img) && isset($img['url']) && is_string($img['url'])) {
+                $extraImages[] = $img['url'];
+            }
+        }
+
+        if (trim($renderedHtml) === '' && $extraImages === []) {
+            $this->warn("[FIRECRAWL_FAIL] Empty render for [{$retailer->slug}].");
+
+            return ['status' => 'no-content', 'images' => 0];
+        }
+
+        $postId = $this->detectNewestPostId($renderedHtml);
+        $payload = $postId !== null ? $this->directPostPayload($retailer, $postId, $renderedHtml) : null;
+        if (($payload === null || $payload['images'] === []) && $extraImages !== [] && $postId !== null) {
+            $images = $this->purifyImageUrls($extraImages, self::MAX_IMAGES);
+            if ($images !== []) {
+                $payload = [
+                    'caption' => "عروض {$retailer->name} الجديدة",
+                    'images' => $images,
+                    'published_at' => Carbon::now('UTC'),
+                ];
+            }
+        }
+        if ($payload === null || $payload['images'] === [] || $postId === null) {
+            $this->warn("[FIRECRAWL_FAIL] Render carried no usable post for [{$retailer->slug}].");
+
+            return ['status' => 'no-content', 'images' => 0];
+        }
+
+        $like = '%' . addcslashes($postId, '\\%_') . '%';
+        $alreadyExists = RawFacebookPost::where('retailer_id', $retailer->id)
+            ->where('facebook_post_id', 'like', $like)
+            ->exists();
+        if ($alreadyExists && ! $force) {
+            Log::info("[RADAR_IDLE] Store {$retailer->slug} up-to-date (ID: {$postId}).");
+            $this->info("Up-to-date [{$retailer->slug}:{$postId}], nothing new.");
+
+            return ['status' => 'up-to-date', 'images' => 0];
+        }
+
+        if ($dryRun) {
+            $this->table(
+                ['Store', 'Post ID', 'Images (preview)', 'Caption head', 'Published (UTC)'],
+                [[
+                    $retailer->slug,
+                    $postId,
+                    count($payload['images']) . ' imgs (firecrawl render)',
+                    mb_substr($payload['caption'] !== '' ? $payload['caption'] : "عروض {$retailer->name} الجديدة", 0, 60),
+                    $payload['published_at']->format('Y-m-d H:i'),
+                ]]
+            );
+            $this->info('[DRY RUN] Live run would persist this Firecrawl render and dispatch Gatekeeper.');
+
+            return ['status' => 'dry-run', 'images' => count($payload['images'])];
+        }
+
+        $rawPost = $this->persistPost($retailer, $postId, $payload['caption'], $payload['images'], $payload['published_at'], null);
+        $this->dispatchGatekeeper($retailer, $rawPost, $postId, $payload['caption'], $payload['images'], $payload['published_at']);
+        Log::info("[FIRECRAWL_SUCCESS] Ingested {$retailer->slug} via Firecrawl cloud engine.", [
+            'post_id' => $postId,
+            'images' => count($payload['images']),
+        ]);
+
+        return ['status' => 'harvested-via-firecrawl', 'images' => count($payload['images'])];
     }
 
     /**
@@ -656,7 +771,7 @@ final class DirectFacebookPhotosIngestCommand extends Command
     private function logResponseTelemetry(string $route, Response $response, float $t0): void
     {
         $elapsedMs = round((microtime(true) - $t0) * 1000, 2);
-        $upstreamStatus = $response->header('X-Upstream-Status') ?? (string) $response->status();
+        $upstreamStatus = $response->header('X-Upstream-Status') ?: (string) $response->status();
         $contentLen = strlen((string) $response->body());
         $contentType = $response->header('Content-Type') ?? 'unknown';
         $line = "[DEBUG_RESPONSE] Route: {$route} | HTTP: {$response->status()} | Upstream Meta: {$upstreamStatus} | Size: {$contentLen} bytes | Time: {$elapsedMs}ms | Content-Type: {$contentType}";
