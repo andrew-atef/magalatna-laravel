@@ -70,7 +70,7 @@ final class DirectFacebookPhotosIngestCommand extends Command
             try {
                 ['status' => $status, 'images' => $images] = $this->ingestRetailer($retailer, $dryRun, $force);
             } catch (Throwable $e) {
-                Log::error('Direct ingest failed for retailer.', [
+                $this->safeLog('error', 'Direct ingest failed for retailer.', [
                     'retailer_id' => $retailer->id,
                     'retailer_slug' => $retailer->slug,
                     'error' => $e->getMessage(),
@@ -131,7 +131,7 @@ final class DirectFacebookPhotosIngestCommand extends Command
                     $target = $candidate;
                     if ($vectorName !== 'browser') {
                         $this->line("[BOT_INGEST_HIT] Successfully captured {$retailer->slug} using {$vectorName} signature.");
-                        Log::info("[BOT_INGEST_HIT] Successfully captured {$retailer->slug} using {$vectorName} signature.", [
+                        $this->safeLog('info', "[BOT_INGEST_HIT] Successfully captured {$retailer->slug} using {$vectorName} signature.", [
                             'candidate' => $candidate,
                         ]);
                     }
@@ -171,13 +171,13 @@ final class DirectFacebookPhotosIngestCommand extends Command
             ->exists();
 
         if ($alreadyExists && ! $force) {
-            Log::info("[RADAR_IDLE] Store {$retailer->slug} up-to-date (ID: {$postId}).");
+            $this->safeLog('info', "[RADAR_IDLE] Store {$retailer->slug} up-to-date (ID: {$postId}).");
             $this->info("Up-to-date [{$retailer->slug}:{$postId}], nothing new.");
 
             return ['status' => 'up-to-date', 'images' => 0];
         }
 
-        Log::info("[RADAR_TRIGGER] New post {$postId} detected for {$retailer->slug}! Calling Cloudflare Browser Harvester...");
+        $this->safeLog('info', "[RADAR_TRIGGER] New post {$postId} detected for {$retailer->slug}! Calling Cloudflare Browser Harvester...");
         $this->info("New post detected [{$retailer->slug}:{$postId}], harvesting...");
 
         if ($dryRun) {
@@ -236,7 +236,7 @@ final class DirectFacebookPhotosIngestCommand extends Command
         if (preg_match('/\{"node":\{"__typename":"Story".*?"post_id":"(\d+)"/s', $html, $m)) {
             $postId = trim($m[1]);
             $this->line("  ├── [TRACE] Pattern 1 (Relay Story post_id): Match: {$postId}");
-            Log::debug('[TRACE] Pattern 1 (Relay Story post_id) matched.', ['post_id' => $postId]);
+            $this->safeLog('debug', '[TRACE] Pattern 1 (Relay Story post_id) matched.', ['post_id' => $postId]);
 
             return $postId;
         }
@@ -244,7 +244,7 @@ final class DirectFacebookPhotosIngestCommand extends Command
         if (preg_match('#"url":"[^"]*?/posts/(pfbid[\w]+)/#i', $html, $m)) {
             $postId = trim($m[1]);
             $this->line("  ├── [TRACE] Pattern 2 (Story URL pfbid): Match: {$postId}");
-            Log::debug('[TRACE] Pattern 2 (Story URL pfbid) matched.', ['post_id' => $postId]);
+            $this->safeLog('debug', '[TRACE] Pattern 2 (Story URL pfbid) matched.', ['post_id' => $postId]);
 
             return $postId;
         }
@@ -252,7 +252,7 @@ final class DirectFacebookPhotosIngestCommand extends Command
         $fallback = $this->extractPostId($html);
         $this->line('  ├── [TRACE] Pattern 3 (fbid in query/script): ' . ($fallback !== null ? "Match: {$fallback}" : 'NO_MATCH'));
         $this->line('  └── [TRACE] RESOLVED_AS: ' . ($fallback ?? 'NULL'));
-        Log::debug('[TRACE] Post ID resolution finished.', ['post_id' => $fallback]);
+        $this->safeLog('debug', '[TRACE] Post ID resolution finished.', ['post_id' => $fallback]);
 
         return $fallback;
     }
@@ -292,7 +292,7 @@ final class DirectFacebookPhotosIngestCommand extends Command
                             ? (int) $data['images_count']
                             : count($images);
                         if ($imagesCount >= 1 && $images !== []) {
-                            Log::info("[HARVEST_SUCCESS] Successfully ingested {$postId} with {$imagesCount} 2K images.", [
+                            $this->safeLog('info', "[HARVEST_SUCCESS] Successfully ingested {$postId} with {$imagesCount} 2K images.", [
                                 'retailer_slug' => $retailer->slug,
                             ]);
 
@@ -304,13 +304,13 @@ final class DirectFacebookPhotosIngestCommand extends Command
                         }
                     }
                 }
-                Log::warning('[HARVESTER_FALLBACK] Harvester yielded nothing usable, using local direct parse.', [
+                $this->safeLog('warning', '[HARVESTER_FALLBACK] Harvester yielded nothing usable, using local direct parse.', [
                     'retailer_slug' => $retailer->slug,
                     'post_id' => $postId,
                     'status' => $response->status(),
                 ]);
             } catch (Throwable $e) {
-                Log::warning('[HARVESTER_FALLBACK] Harvester unreachable, using local direct parse.', [
+                $this->safeLog('warning', '[HARVESTER_FALLBACK] Harvester unreachable, using local direct parse.', [
                     'retailer_slug' => $retailer->slug,
                     'post_id' => $postId,
                     'error' => $e->getMessage(),
@@ -334,7 +334,7 @@ final class DirectFacebookPhotosIngestCommand extends Command
     {
         $apiKey = trim((string) config('services.firecrawl.api_key'));
         if ($apiKey === '' || ! class_exists(FirecrawlClient::class)) {
-            Log::debug('[FIRECRAWL_SKIP] Managed fallback unavailable (no API key or SDK missing).', [
+            $this->safeLog('debug', '[FIRECRAWL_SKIP] Managed fallback unavailable (no API key or SDK missing).', [
                 'retailer_slug' => $retailer->slug,
             ]);
 
@@ -342,7 +342,7 @@ final class DirectFacebookPhotosIngestCommand extends Command
         }
 
         $this->line("[FIRECRAWL_TRIGGER] Page {$retailer->slug} is login-walled. Delegating to Firecrawl Cloud Browser...");
-        Log::info("[FIRECRAWL_TRIGGER] Page {$retailer->slug} is login-walled. Delegating to Firecrawl Cloud Browser...");
+        $this->safeLog('info', "[FIRECRAWL_TRIGGER] Page {$retailer->slug} is login-walled. Delegating to Firecrawl Cloud Browser...");
 
         try {
             $firecrawl = FirecrawlClient::create($apiKey);
@@ -352,7 +352,7 @@ final class DirectFacebookPhotosIngestCommand extends Command
             );
         } catch (Throwable $e) {
             $this->warn("[FIRECRAWL_FAIL] Managed scrape failed for [{$retailer->slug}]: {$e->getMessage()}");
-            Log::warning('[FIRECRAWL_FAIL] Managed scrape threw.', [
+            $this->safeLog('warning', '[FIRECRAWL_FAIL] Managed scrape threw.', [
                 'retailer_slug' => $retailer->slug,
                 'error' => $e->getMessage(),
             ]);
@@ -399,7 +399,7 @@ final class DirectFacebookPhotosIngestCommand extends Command
             ->where('facebook_post_id', 'like', $like)
             ->exists();
         if ($alreadyExists && ! $force) {
-            Log::info("[RADAR_IDLE] Store {$retailer->slug} up-to-date (ID: {$postId}).");
+            $this->safeLog('info', "[RADAR_IDLE] Store {$retailer->slug} up-to-date (ID: {$postId}).");
             $this->info("Up-to-date [{$retailer->slug}:{$postId}], nothing new.");
 
             return ['status' => 'up-to-date', 'images' => 0];
@@ -423,7 +423,7 @@ final class DirectFacebookPhotosIngestCommand extends Command
 
         $rawPost = $this->persistPost($retailer, $postId, $payload['caption'], $payload['images'], $payload['published_at'], null);
         $this->dispatchGatekeeper($retailer, $rawPost, $postId, $payload['caption'], $payload['images'], $payload['published_at']);
-        Log::info("[FIRECRAWL_SUCCESS] Ingested {$retailer->slug} via Firecrawl cloud engine.", [
+        $this->safeLog('info', "[FIRECRAWL_SUCCESS] Ingested {$retailer->slug} via Firecrawl cloud engine.", [
             'post_id' => $postId,
             'images' => count($payload['images']),
         ]);
@@ -735,7 +735,7 @@ final class DirectFacebookPhotosIngestCommand extends Command
             rawFacebookPostId: $rawPost->id,
         );
 
-        Log::info("[INGEST_DISPATCHED] Dispatched Gatekeeper for {$retailer->slug}:{$postId} with " . count($images) . ' high-res pages.');
+        $this->safeLog('info', "[INGEST_DISPATCHED] Dispatched Gatekeeper for {$retailer->slug}:{$postId} with " . count($images) . ' high-res pages.');
         $this->info("Dispatched Gatekeeper for [{$retailer->slug}:{$postId}].");
     }
 
@@ -761,7 +761,7 @@ final class DirectFacebookPhotosIngestCommand extends Command
             try {
                 $t0 = microtime(true);
                 $this->line("[DEBUG_NETWORK] OUTBOUND -> Target: {$targetUrl} via Vercel: {$proxyUrl} | Vector: {$vector}");
-                Log::debug("[DEBUG_NETWORK] OUTBOUND -> Target: {$targetUrl} via Vercel: {$proxyUrl} | Vector: {$vector}");
+                $this->safeLog('debug', "[DEBUG_NETWORK] OUTBOUND -> Target: {$targetUrl} via Vercel: {$proxyUrl} | Vector: {$vector}");
                 $headers = $secret !== '' ? ['x-proxy-secret' => $secret] : [];
                 $response = Http::timeout(self::REQUEST_TIMEOUT)
                     ->withHeaders($headers)
@@ -774,14 +774,14 @@ final class DirectFacebookPhotosIngestCommand extends Command
                     if ($html !== null) {
                         return $html;
                     }
-                    Log::warning('[PROXY_EMPTY] Vercel proxy returned no usable HTML, using direct Azure egress.', ['target' => $targetUrl]);
+                    $this->safeLog('warning', '[PROXY_EMPTY] Vercel proxy returned no usable HTML, using direct Azure egress.', ['target' => $targetUrl]);
                 } else {
                     $this->line("[DEBUG_FALLBACK] Vercel failed (Status: {$response->status()}). Attempting DIRECT Azure egress...");
-                    Log::warning("[PROXY_FALLBACK] Vercel proxy HTTP {$response->status()}, using direct Azure egress.", ['target' => $targetUrl]);
+                    $this->safeLog('warning', "[PROXY_FALLBACK] Vercel proxy HTTP {$response->status()}, using direct Azure egress.", ['target' => $targetUrl]);
                 }
             } catch (Throwable $e) {
                 $this->line("[DEBUG_FALLBACK] Vercel exception ({$e->getMessage()}). Attempting DIRECT Azure egress...");
-                Log::warning('[PROXY_FALLBACK] Vercel proxy failed, using direct Azure egress.', [
+                $this->safeLog('warning', '[PROXY_FALLBACK] Vercel proxy failed, using direct Azure egress.', [
                     'target' => $targetUrl,
                     'error' => $e->getMessage(),
                 ]);
@@ -791,7 +791,7 @@ final class DirectFacebookPhotosIngestCommand extends Command
         try {
             $t0 = microtime(true);
             $this->line("[DEBUG_NETWORK] OUTBOUND -> Target: {$targetUrl} via AZURE_DIRECT | Vector: {$vector}");
-            Log::debug("[DEBUG_NETWORK] OUTBOUND -> Target: {$targetUrl} via AZURE_DIRECT | Vector: {$vector}");
+            $this->safeLog('debug', "[DEBUG_NETWORK] OUTBOUND -> Target: {$targetUrl} via AZURE_DIRECT | Vector: {$vector}");
             $response = Http::timeout(self::REQUEST_TIMEOUT)
                 ->withHeaders($headerProfile ?? [
                     'User-Agent' => 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36',
@@ -804,7 +804,7 @@ final class DirectFacebookPhotosIngestCommand extends Command
             return $response->successful() ? (string) $response->body() : null;
         } catch (Throwable $e) {
             $this->line("[DEBUG_FALLBACK] Azure direct exception ({$e->getMessage()}). No more routes.");
-            Log::warning('Direct Azure egress fetch failed.', ['target' => $targetUrl, 'error' => $e->getMessage()]);
+            $this->safeLog('warning', 'Direct Azure egress fetch failed.', ['target' => $targetUrl, 'error' => $e->getMessage()]);
 
             return null;
         }
@@ -822,7 +822,7 @@ final class DirectFacebookPhotosIngestCommand extends Command
         $contentType = $response->header('Content-Type') ?? 'unknown';
         $line = "[DEBUG_RESPONSE] Route: {$route} | Vector: {$vector} | HTTP: {$response->status()} | Upstream Meta: {$upstreamStatus} | Size: {$contentLen} bytes | Time: {$elapsedMs}ms | Content-Type: {$contentType}";
         $this->line($line);
-        Log::debug($line);
+        $this->safeLog('debug', $line);
     }
 
     /**
@@ -849,7 +849,7 @@ final class DirectFacebookPhotosIngestCommand extends Command
         foreach ($lines as $line) {
             $this->line($line);
         }
-        Log::debug('[ANATOMY] Candidate inspected.', [
+        $this->safeLog('debug', '[ANATOMY] Candidate inspected.', [
             'retailer_slug' => $retailerSlug,
             'candidate' => $candidate,
             'title' => $pageTitle,
@@ -862,8 +862,23 @@ final class DirectFacebookPhotosIngestCommand extends Command
     }
 
     /**
+     * Crash-proof log shim. A broken log sink (rotated file owned by another
+     * OS user, full disk) must NEVER convert a recoverable fetch failure
+     * into a fatal command crash — console output continues regardless.
+     */
+    private function safeLog(string $level, string $message, array $context = []): void
+    {
+        try {
+            Log::log($level, $message, $context);
+        } catch (Throwable) {
+            // Intentionally silent.
+        }
+    }
+
+    /**
      * Persist the raw upstream HTML snapshot for unresolved retailers.
-     * Dumps are permanent by design — never auto-deleted. Never throws.
+     * Keeps the newest 10 snapshots per store: bounds scheduler disk growth
+     * (~5MB/store) while preserving forensic evidence. Never throws.
      */
     private function dumpRawHtml(string $retailerSlug, ?string $html): void
     {
@@ -874,13 +889,20 @@ final class DirectFacebookPhotosIngestCommand extends Command
             $snapshotPath = storage_path("logs/fb_raw_{$retailerSlug}_" . date('Ymd_His') . '.html');
             file_put_contents($snapshotPath, $html, LOCK_EX);
             $this->error("  ⚠️ DUMP SAVED: Full raw HTML saved to: {$snapshotPath}");
-            Log::warning('[FORENSIC_DUMP] Raw upstream HTML snapshot saved.', [
+            $this->safeLog('warning',  '[FORENSIC_DUMP] Raw upstream HTML snapshot saved.', [
                 'retailer_slug' => $retailerSlug,
                 'path' => $snapshotPath,
                 'bytes' => strlen($html),
             ]);
+            $snapshots = glob(storage_path("logs/fb_raw_{$retailerSlug}_*.html")) ?: [];
+            if (count($snapshots) > 10) {
+                rsort($snapshots);
+                foreach (array_slice($snapshots, 10) as $stale) {
+                    @unlink($stale);
+                }
+            }
         } catch (Throwable $e) {
-            Log::warning('[FORENSIC_DUMP] Failed to save raw HTML snapshot.', [
+            $this->safeLog('warning',  '[FORENSIC_DUMP] Failed to save raw HTML snapshot.', [
                 'retailer_slug' => $retailerSlug,
                 'error' => $e->getMessage(),
             ]);
