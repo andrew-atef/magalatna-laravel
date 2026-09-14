@@ -26,6 +26,24 @@ final class DirectFacebookPhotosIngestCommand extends Command
 
     private const REQUEST_TIMEOUT = 10;
 
+    /**
+     * Official Meta crawler header profiles. Recognized social-preview and
+     * catalog bots traverse a distinct SSR pipeline that may serve clean
+     * OpenGraph timeline nodes without interactive login barriers.
+     */
+    private const FB_BOT_HEADERS = [
+        'facebookexternalhit' => [
+            'User-Agent' => 'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)',
+            'Accept' => 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language' => 'ar-EG,ar;q=0.9,en;q=0.8',
+        ],
+        'facebookcatalog' => [
+            'User-Agent' => 'facebookcatalog/1.0',
+            'Accept' => 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language' => 'ar-EG,ar;q=0.9',
+        ],
+    ];
+
     public function handle(): int
     {
         $dryRun = (bool) $this->option('dry-run');
@@ -87,19 +105,39 @@ final class DirectFacebookPhotosIngestCommand extends Command
         $html = null;
         $target = $candidates[0];
         $firstHtml = null;
+        // Multi-vector probe: Meta bot signatures first (distinct SSR
+        // pipeline), desktop browser emulation last. Vectors run ONLY on the
+        // timeline root — the sole candidate able to yield story post IDs —
+        // keeping worst-case cost at 5 requests/retailer. Empty bot responses
+        // cascade silently to the next vector.
+        $vectors = [
+            'externalhit' => self::FB_BOT_HEADERS['facebookexternalhit'],
+            'catalog' => self::FB_BOT_HEADERS['facebookcatalog'],
+            'browser' => null,
+        ];
         foreach ($candidates as $index => $candidate) {
-            $this->info("Fetching [{$retailer->slug}] via proxy mesh: {$candidate}");
-            $html = $this->fetchViaProxyMesh($candidate);
-            if ($index === 0) {
-                $firstHtml = $html;
-            }
-            if ($html !== null && trim($html) !== '') {
-                $this->inspectHtmlAnatomy($retailer->slug, $candidate, $html);
-            }
-            if ($html !== null && trim($html) !== '' && $this->hasExtractableContent($html)) {
-                $target = $candidate;
+            $probeVectors = $index === 0 ? $vectors : ['browser' => null];
+            foreach ($probeVectors as $vectorName => $headerProfile) {
+                $this->info("Fetching [{$retailer->slug}] via proxy mesh [{$vectorName}]: {$candidate}");
+                $html = $this->fetchViaProxyMesh($candidate, $headerProfile, $vectorName);
+                if ($index === 0) {
+                    // Forensic reference: latest timeline-root response across vectors.
+                    $firstHtml = $html;
+                }
+                if ($html !== null && trim($html) !== '') {
+                    $this->inspectHtmlAnatomy($retailer->slug, $candidate, $html);
+                }
+                if ($html !== null && trim($html) !== '' && $this->hasExtractableContent($html)) {
+                    $target = $candidate;
+                    if ($vectorName !== 'browser') {
+                        $this->line("[BOT_INGEST_HIT] Successfully captured {$retailer->slug} using {$vectorName} signature.");
+                        Log::info("[BOT_INGEST_HIT] Successfully captured {$retailer->slug} using {$vectorName} signature.", [
+                            'candidate' => $candidate,
+                        ]);
+                    }
 
-                break;
+                    break 2;
+                }
             }
         }
 
@@ -705,7 +743,15 @@ final class DirectFacebookPhotosIngestCommand extends Command
      * Fetch upstream HTML through the Vercel proxy mesh, falling back to
      * direct Azure egress when the proxy is unreachable. Never throws.
      */
-    private function fetchViaProxyMesh(string $targetUrl): ?string
+    /**
+     * Fetch upstream HTML through the Vercel proxy mesh, falling back to
+     * direct Azure egress when the proxy is unreachable. Never throws.
+     *
+     * NOTE: the Vercel gateway applies its own Chrome 126 egress identity —
+     * a bot $headerProfile only takes effect on the AZURE_DIRECT fallback
+     * leg, where Meta sees this host's UA verbatim.
+     */
+    private function fetchViaProxyMesh(string $targetUrl, ?array $headerProfile = null, string $vector = 'browser'): ?string
     {
         // Strictly config-driven (never env() — breaks under config:cache).
         $proxyUrl = trim((string) config('services.facebook_proxy.url'));
@@ -714,14 +760,14 @@ final class DirectFacebookPhotosIngestCommand extends Command
         if ($proxyUrl !== '') {
             try {
                 $t0 = microtime(true);
-                $this->line("[DEBUG_NETWORK] OUTBOUND -> Target: {$targetUrl} via Vercel: {$proxyUrl}");
-                Log::debug("[DEBUG_NETWORK] OUTBOUND -> Target: {$targetUrl} via Vercel: {$proxyUrl}");
+                $this->line("[DEBUG_NETWORK] OUTBOUND -> Target: {$targetUrl} via Vercel: {$proxyUrl} | Vector: {$vector}");
+                Log::debug("[DEBUG_NETWORK] OUTBOUND -> Target: {$targetUrl} via Vercel: {$proxyUrl} | Vector: {$vector}");
                 $headers = $secret !== '' ? ['x-proxy-secret' => $secret] : [];
                 $response = Http::timeout(self::REQUEST_TIMEOUT)
                     ->withHeaders($headers)
                     ->get($proxyUrl, ['url' => $targetUrl]);
 
-                $this->logResponseTelemetry('VERCEL_PROXY', $response, $t0);
+                $this->logResponseTelemetry('VERCEL_PROXY', $response, $t0, $vector);
 
                 if ($response->successful()) {
                     $html = $this->extractHtml($response);
@@ -744,16 +790,16 @@ final class DirectFacebookPhotosIngestCommand extends Command
 
         try {
             $t0 = microtime(true);
-            $this->line("[DEBUG_NETWORK] OUTBOUND -> Target: {$targetUrl} via AZURE_DIRECT");
-            Log::debug("[DEBUG_NETWORK] OUTBOUND -> Target: {$targetUrl} via AZURE_DIRECT");
+            $this->line("[DEBUG_NETWORK] OUTBOUND -> Target: {$targetUrl} via AZURE_DIRECT | Vector: {$vector}");
+            Log::debug("[DEBUG_NETWORK] OUTBOUND -> Target: {$targetUrl} via AZURE_DIRECT | Vector: {$vector}");
             $response = Http::timeout(self::REQUEST_TIMEOUT)
-                ->withHeaders([
+                ->withHeaders($headerProfile ?? [
                     'User-Agent' => 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36',
                     'Accept-Language' => 'ar-EG,ar;q=0.9,en-US;q=0.8',
                 ])
                 ->get($targetUrl);
 
-            $this->logResponseTelemetry('AZURE_DIRECT', $response, $t0);
+            $this->logResponseTelemetry('AZURE_DIRECT', $response, $t0, $vector);
 
             return $response->successful() ? (string) $response->body() : null;
         } catch (Throwable $e) {
@@ -768,13 +814,13 @@ final class DirectFacebookPhotosIngestCommand extends Command
      * Single-line forensic telemetry for one completed HTTP round-trip.
      * Never throws; console + log mirror.
      */
-    private function logResponseTelemetry(string $route, Response $response, float $t0): void
+    private function logResponseTelemetry(string $route, Response $response, float $t0, string $vector = 'browser'): void
     {
         $elapsedMs = round((microtime(true) - $t0) * 1000, 2);
         $upstreamStatus = $response->header('X-Upstream-Status') ?: (string) $response->status();
         $contentLen = strlen((string) $response->body());
         $contentType = $response->header('Content-Type') ?? 'unknown';
-        $line = "[DEBUG_RESPONSE] Route: {$route} | HTTP: {$response->status()} | Upstream Meta: {$upstreamStatus} | Size: {$contentLen} bytes | Time: {$elapsedMs}ms | Content-Type: {$contentType}";
+        $line = "[DEBUG_RESPONSE] Route: {$route} | Vector: {$vector} | HTTP: {$response->status()} | Upstream Meta: {$upstreamStatus} | Size: {$contentLen} bytes | Time: {$elapsedMs}ms | Content-Type: {$contentType}";
         $this->line($line);
         Log::debug($line);
     }
