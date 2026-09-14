@@ -16,7 +16,7 @@ use Throwable;
 
 final class DirectFacebookPhotosIngestCommand extends Command
 {
-    protected $signature = 'flyers:ingest-direct {--store= : Specific retailer slug} {--dry-run : Parse and report without saving or dispatching}';
+    protected $signature = 'flyers:ingest-direct {--store= : Specific retailer slug} {--dry-run : Parse and report without saving or dispatching} {--force : Bypass the radar dedup gate and re-harvest even if the post ID already exists}';
 
     protected $description = 'Direct HTTP Facebook photo ingest via Vercel proxy mesh with Azure fallback';
 
@@ -28,6 +28,7 @@ final class DirectFacebookPhotosIngestCommand extends Command
     {
         $dryRun = (bool) $this->option('dry-run');
         $store = trim((string) ($this->option('store') ?? ''));
+        $force = (bool) $this->option('force');
 
         if ($dryRun) {
             $this->info('--- DRY RUN: preview only, no saves or dispatches ---');
@@ -47,7 +48,7 @@ final class DirectFacebookPhotosIngestCommand extends Command
             $status = 'failed';
             $images = 0;
             try {
-                ['status' => $status, 'images' => $images] = $this->ingestRetailer($retailer, $dryRun);
+                ['status' => $status, 'images' => $images] = $this->ingestRetailer($retailer, $dryRun, $force);
             } catch (Throwable $e) {
                 Log::error('Direct ingest failed for retailer.', [
                     'retailer_id' => $retailer->id,
@@ -67,7 +68,7 @@ final class DirectFacebookPhotosIngestCommand extends Command
      *
      * @return array{status: string, images: int}
      */
-    private function ingestRetailer(Retailer $retailer, bool $dryRun): array
+    private function ingestRetailer(Retailer $retailer, bool $dryRun, bool $force = false): array
     {
         $handle = $retailer->facebook_handle;
         // Timeline root first: server-renders full story units (complete
@@ -107,16 +108,23 @@ final class DirectFacebookPhotosIngestCommand extends Command
             return ['status' => 'no-content', 'images' => 0];
         }
 
-        // Dedup gate: ANY existing row means up-to-date — zero browser launches,
-        // zero quota. This also stops re-dispatch while a post is still pending.
-        if (RawFacebookPost::where('retailer_id', $retailer->id)->where('facebook_post_id', $postId)->exists()) {
-            Log::info("[RADAR_IDLE] Store {$retailer->slug} up-to-date (Latest: {$postId}).");
+        // KV / Database gate (Tier 1 radar dedup): LIKE match catches stored
+        // id variants (bare fbid vs pfbid-wrapped rows). Seen id + no --force
+        // means up-to-date — zero harvester calls, zero quota. --force
+        // bypasses the gate for manual re-harvests.
+        $like = '%' . addcslashes($postId, '\\%_') . '%';
+        $alreadyExists = RawFacebookPost::where('retailer_id', $retailer->id)
+            ->where('facebook_post_id', 'like', $like)
+            ->exists();
+
+        if ($alreadyExists && ! $force) {
+            Log::info("[RADAR_IDLE] Store {$retailer->slug} up-to-date (ID: {$postId}).");
             $this->info("Up-to-date [{$retailer->slug}:{$postId}], nothing new.");
 
             return ['status' => 'up-to-date', 'images' => 0];
         }
 
-        Log::info("[RADAR_TRIGGER] New post {$postId} for {$retailer->slug}! Calling Full Browser Harvester.");
+        Log::info("[RADAR_TRIGGER] New post {$postId} detected for {$retailer->slug}! Calling Cloudflare Browser Harvester...");
         $this->info("New post detected [{$retailer->slug}:{$postId}], harvesting...");
 
         if ($dryRun) {
@@ -189,23 +197,37 @@ final class DirectFacebookPhotosIngestCommand extends Command
      */
     private function harvestFullPost(Retailer $retailer, string $postId, string $html): ?array
     {
-        $harvesterUrl = trim((string) config('services.cloudflare_harvester.url'));
+        $harvesterUrl = rtrim(trim((string) config('services.cloudflare_harvester.url')), '/');
         if ($harvesterUrl !== '') {
             try {
                 $handle = $retailer->facebook_handle;
-                $response = Http::timeout(30)
-                    ->withHeaders(['Authorization' => 'Bearer ' . (string) config('services.cloudflare_harvester.secret')])
+                $postUrl = "https://www.facebook.com/{$handle}/posts/{$postId}";
+                $response = Http::timeout(45)
+                    ->withHeaders([
+                        'X-Internal-Worker' => 'true',
+                        'Content-Type' => 'application/json',
+                        'Authorization' => 'Bearer ' . (string) config('services.cloudflare_harvester.secret'),
+                    ])
                     ->post($harvesterUrl, [
                         'retailer_slug' => $retailer->slug,
+                        'post_url' => $postUrl,
                         'post_id' => $postId,
-                        'post_url' => "https://www.facebook.com/{$handle}/posts/{$postId}",
                     ]);
 
                 if ($response->successful()) {
                     $data = $response->json();
                     if (is_array($data)) {
                         $images = $this->purifyImageUrls((array) ($data['images'] ?? []), self::MAX_IMAGES);
-                        if ($images !== []) {
+                        // Spec gate: images_count >= 1. Key absent (legacy worker
+                        // payloads) falls back to the purified-images check.
+                        $imagesCount = array_key_exists('images_count', $data)
+                            ? (int) $data['images_count']
+                            : count($images);
+                        if ($imagesCount >= 1 && $images !== []) {
+                            Log::info("[HARVEST_SUCCESS] Successfully ingested {$postId} with {$imagesCount} 2K images.", [
+                                'retailer_slug' => $retailer->slug,
+                            ]);
+
                             return [
                                 'caption' => mb_substr(trim((string) ($data['post_text'] ?? '')), 0, 10000),
                                 'images' => $images,
