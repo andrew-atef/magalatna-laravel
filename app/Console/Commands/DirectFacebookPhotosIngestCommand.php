@@ -8,10 +8,7 @@ use App\Jobs\GatekeeperFacebookPostJob;
 use App\Models\RawFacebookPost;
 use App\Models\Retailer;
 use Carbon\Carbon;
-use Firecrawl\Client\FirecrawlClient;
-use Firecrawl\Models\ScrapeOptions;
 use Illuminate\Console\Command;
-use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Symfony\Component\Process\Process;
 use Throwable;
@@ -134,15 +131,12 @@ final class DirectFacebookPhotosIngestCommand extends Command
             $this->warn("No identifiable post for [{$retailer->slug}] (login wall or empty page).");
             $this->dumpRawHtml($retailer->slug, $firstHtml ?? $html);
 
-            // Managed-cloud last resort: Firecrawl's hosted browser hydrates
-            // the wall away. Credit-guarded — only reached when the free
-            // Vercel probe extracted nothing.
-            return $this->tryFirecrawlFallback($retailer, $dryRun, $force);
+            return ['status' => 'no-content', 'images' => 0];
         }
 
         // KV / Database gate (Tier 1 radar dedup): LIKE match catches stored
         // id variants (bare fbid vs pfbid-wrapped rows). Seen id + no --force
-        // means up-to-date — zero harvester calls, zero quota. --force
+        // means up-to-date — zero extra fetches. --force
         // bypasses the gate for manual re-harvests.
         $like = '%' . addcslashes($postId, '\\%_') . '%';
         $alreadyExists = RawFacebookPost::where('retailer_id', $retailer->id)
@@ -156,8 +150,8 @@ final class DirectFacebookPhotosIngestCommand extends Command
             return ['status' => 'up-to-date', 'images' => 0];
         }
 
-        $this->safeLog('info', "[RADAR_TRIGGER] New post {$postId} detected for {$retailer->slug}! Calling Cloudflare Browser Harvester...");
-        $this->info("New post detected [{$retailer->slug}:{$postId}], harvesting...");
+        $this->safeLog('info', "[RADAR_TRIGGER] New post {$postId} detected for {$retailer->slug}! Parsing Relay payload.");
+        $this->info("New post detected [{$retailer->slug}:{$postId}], parsing...");
 
         if ($dryRun) {
             $preview = $this->directPostPayload($retailer, $postId, $html);
@@ -171,15 +165,15 @@ final class DirectFacebookPhotosIngestCommand extends Command
                     ($preview !== null ? $preview['published_at'] : Carbon::now('UTC'))->format('Y-m-d H:i'),
                 ]]
             );
-            $this->info('[DRY RUN] Live run would trigger the Cloudflare harvester for this post.');
+            $this->info('[DRY RUN] Live run would persist this Relay payload and dispatch Gatekeeper.');
 
             return ['status' => 'dry-run', 'images' => $preview !== null ? count($preview['images']) : 0];
         }
 
-        // Tier 2 (event only): full harvest, then persist + dispatch.
-        $payload = $this->harvestFullPost($retailer, $postId, $html);
+        // Tier 2 (self-contained): parse the Relay payload, persist + dispatch.
+        $payload = $this->directPostPayload($retailer, $postId, $html);
         if ($payload === null || $payload['images'] === []) {
-            $this->warn("Harvest yielded nothing usable for [{$retailer->slug}:{$postId}].");
+            $this->warn("Relay parse yielded nothing usable for [{$retailer->slug}:{$postId}].");
             $this->dumpRawHtml($retailer->slug, $firstHtml ?? $html);
 
             return ['status' => 'no-content', 'images' => 0];
@@ -236,179 +230,9 @@ final class DirectFacebookPhotosIngestCommand extends Command
         return $fallback;
     }
 
-    /**
-     * Tier 2: Cloudflare harvester first, local direct parse as fallback.
-     * Never throws; null when nothing usable.
-     *
-     * @return array{caption: string, images: list<string>, published_at: Carbon}|null
-     */
-    private function harvestFullPost(Retailer $retailer, string $postId, string $html): ?array
-    {
-        $harvesterUrl = rtrim(trim((string) config('services.cloudflare_harvester.url')), '/');
-        if ($harvesterUrl !== '') {
-            try {
-                $handle = $retailer->facebook_handle;
-                $postUrl = "https://www.facebook.com/{$handle}/posts/{$postId}";
-                $response = Http::timeout(45)
-                    ->withHeaders([
-                        'X-Internal-Worker' => 'true',
-                        'Content-Type' => 'application/json',
-                        'Authorization' => 'Bearer ' . (string) config('services.cloudflare_harvester.secret'),
-                    ])
-                    ->post($harvesterUrl, [
-                        'retailer_slug' => $retailer->slug,
-                        'post_url' => $postUrl,
-                        'post_id' => $postId,
-                    ]);
-
-                if ($response->successful()) {
-                    $data = $response->json();
-                    if (is_array($data)) {
-                        $images = $this->purifyImageUrls((array) ($data['images'] ?? []), self::MAX_IMAGES);
-                        // Spec gate: images_count >= 1. Key absent (legacy worker
-                        // payloads) falls back to the purified-images check.
-                        $imagesCount = array_key_exists('images_count', $data)
-                            ? (int) $data['images_count']
-                            : count($images);
-                        if ($imagesCount >= 1 && $images !== []) {
-                            $this->safeLog('info', "[HARVEST_SUCCESS] Successfully ingested {$postId} with {$imagesCount} 2K images.", [
-                                'retailer_slug' => $retailer->slug,
-                            ]);
-
-                            return [
-                                'caption' => mb_substr(trim((string) ($data['post_text'] ?? '')), 0, 10000),
-                                'images' => $images,
-                                'published_at' => $this->parseHarvesterTime($data['published_at'] ?? null),
-                            ];
-                        }
-                    }
-                }
-                $this->safeLog('warning', '[HARVESTER_FALLBACK] Harvester yielded nothing usable, using local direct parse.', [
-                    'retailer_slug' => $retailer->slug,
-                    'post_id' => $postId,
-                    'status' => $response->status(),
-                ]);
-            } catch (Throwable $e) {
-                $this->safeLog('warning', '[HARVESTER_FALLBACK] Harvester unreachable, using local direct parse.', [
-                    'retailer_slug' => $retailer->slug,
-                    'post_id' => $postId,
-                    'error' => $e->getMessage(),
-                ]);
-            }
-        }
-
-        return $this->directPostPayload($retailer, $postId, $html);
-    }
-
-    /**
-     * Managed-cloud last resort for login-walled pages: delegate the timeline
-     * URL to Firecrawl's hosted browser (full JS hydration), then run the
-     * standard extraction stack on the rendered HTML. Reached ONLY when the
-     * free Vercel probe extracted nothing — preserves Firecrawl credits.
-     * Never throws; null-payload means "still nothing usable".
-     *
-     * @return array{status: string, images: int}
-     */
-    private function tryFirecrawlFallback(Retailer $retailer, bool $dryRun, bool $force): array
-    {
-        $apiKey = trim((string) config('services.firecrawl.api_key'));
-        if ($apiKey === '' || ! class_exists(FirecrawlClient::class)) {
-            $this->safeLog('debug', '[FIRECRAWL_SKIP] Managed fallback unavailable (no API key or SDK missing).', [
-                'retailer_slug' => $retailer->slug,
-            ]);
-
-            return ['status' => 'no-content', 'images' => 0];
-        }
-
-        $this->line("[FIRECRAWL_TRIGGER] Page {$retailer->slug} is login-walled. Delegating to Firecrawl Cloud Browser...");
-        $this->safeLog('info', "[FIRECRAWL_TRIGGER] Page {$retailer->slug} is login-walled. Delegating to Firecrawl Cloud Browser...");
-
-        try {
-            $firecrawl = FirecrawlClient::create($apiKey);
-            $doc = $firecrawl->scrape(
-                "https://www.facebook.com/{$retailer->facebook_handle}",
-                ScrapeOptions::with(formats: ['html', 'markdown'], waitFor: 3000)
-            );
-        } catch (Throwable $e) {
-            $this->warn("[FIRECRAWL_FAIL] Managed scrape failed for [{$retailer->slug}]: {$e->getMessage()}");
-            $this->safeLog('warning', '[FIRECRAWL_FAIL] Managed scrape threw.', [
-                'retailer_slug' => $retailer->slug,
-                'error' => $e->getMessage(),
-            ]);
-
-            return ['status' => 'no-content', 'images' => 0];
-        }
-
-        $renderedHtml = (string) ($doc->getHtml() ?? '');
-        $extraImages = [];
-        foreach ((array) ($doc->getImages() ?? []) as $img) {
-            if (is_string($img)) {
-                $extraImages[] = $img;
-            } elseif (is_array($img) && isset($img['url']) && is_string($img['url'])) {
-                $extraImages[] = $img['url'];
-            }
-        }
-
-        if (trim($renderedHtml) === '' && $extraImages === []) {
-            $this->warn("[FIRECRAWL_FAIL] Empty render for [{$retailer->slug}].");
-
-            return ['status' => 'no-content', 'images' => 0];
-        }
-
-        $postId = $this->detectNewestPostId($renderedHtml);
-        $payload = $postId !== null ? $this->directPostPayload($retailer, $postId, $renderedHtml) : null;
-        if (($payload === null || $payload['images'] === []) && $extraImages !== [] && $postId !== null) {
-            $images = $this->purifyImageUrls($extraImages, self::MAX_IMAGES);
-            if ($images !== []) {
-                $payload = [
-                    'caption' => "عروض {$retailer->name} الجديدة",
-                    'images' => $images,
-                    'published_at' => Carbon::now('UTC'),
-                ];
-            }
-        }
-        if ($payload === null || $payload['images'] === [] || $postId === null) {
-            $this->warn("[FIRECRAWL_FAIL] Render carried no usable post for [{$retailer->slug}].");
-
-            return ['status' => 'no-content', 'images' => 0];
-        }
-
-        $like = '%' . addcslashes($postId, '\\%_') . '%';
-        $alreadyExists = RawFacebookPost::where('retailer_id', $retailer->id)
-            ->where('facebook_post_id', 'like', $like)
-            ->exists();
-        if ($alreadyExists && ! $force) {
-            $this->safeLog('info', "[RADAR_IDLE] Store {$retailer->slug} up-to-date (ID: {$postId}).");
-            $this->info("Up-to-date [{$retailer->slug}:{$postId}], nothing new.");
-
-            return ['status' => 'up-to-date', 'images' => 0];
-        }
-
-        if ($dryRun) {
-            $this->table(
-                ['Store', 'Post ID', 'Images (preview)', 'Caption head', 'Published (UTC)'],
-                [[
-                    $retailer->slug,
-                    $postId,
-                    count($payload['images']) . ' imgs (firecrawl render)',
-                    mb_substr($payload['caption'] !== '' ? $payload['caption'] : "عروض {$retailer->name} الجديدة", 0, 60),
-                    $payload['published_at']->format('Y-m-d H:i'),
-                ]]
-            );
-            $this->info('[DRY RUN] Live run would persist this Firecrawl render and dispatch Gatekeeper.');
-
-            return ['status' => 'dry-run', 'images' => count($payload['images'])];
-        }
-
-        $rawPost = $this->persistPost($retailer, $postId, $payload['caption'], $payload['images'], $payload['published_at'], null);
-        $this->dispatchGatekeeper($retailer, $rawPost, $postId, $payload['caption'], $payload['images'], $payload['published_at']);
-        $this->safeLog('info', "[FIRECRAWL_SUCCESS] Ingested {$retailer->slug} via Firecrawl cloud engine.", [
-            'post_id' => $postId,
-            'images' => count($payload['images']),
-        ]);
-
-        return ['status' => 'harvested-via-firecrawl', 'images' => count($payload['images'])];
-    }
+    // NOTE: curl_chrome116 is the sole, self-contained extraction layer.
+    // External cloud scrapers were decommissioned (see git history):
+    // directPostPayload() below parses the Relay payload exhaustively.
 
     /**
      * Local direct-parse fallback: story unit with this post_id, else the photo
@@ -430,13 +254,35 @@ final class DirectFacebookPhotosIngestCommand extends Command
                 if (! str_contains($chunk, '"' . $postId . '"')) {
                     continue;
                 }
+                // Primary: Relay JSON message body (unclipped full caption).
                 $caption = '';
                 if (preg_match('/"message":\s*\{\s*"text":\s*"((?:[^"\\\\]|\\\\.)*)"/u', $chunk, $cm)) {
-                    $decoded = json_decode('"' . $cm[1] . '"');
-                    $caption = trim((string) ($decoded !== null ? $decoded : $cm[1]));
+                    $decoded = json_decode('"' . $cm[1] . '"', true);
+                    if (is_string($decoded) && trim($decoded) !== '') {
+                        $caption = trim($decoded);
+                    }
                 }
+                // Secondary: aggregated accessibility captions (image
+                // descriptions), skipping reaction counters and placeholders.
+                if ($caption === '' && preg_match_all('/"accessibility_caption":\s*"((?:[^"\\\\]|\\\\.)*)"/u', $chunk, $am)) {
+                    $parts = [];
+                    foreach (array_unique($am[1]) as $raw) {
+                        $decoded = json_decode('"' . $raw . '"', true);
+                        $text = trim((string) ($decoded !== null ? $decoded : $raw));
+                        if ($text !== '' && ! str_contains($text, 'likes') && ! str_contains($text, 'May be an image')) {
+                            $parts[] = $text;
+                        }
+                    }
+                    $caption = trim(implode("\n", $parts));
+                }
+                // Tertiary: neutral fallback (never raw \uXXXX escapes).
+                if ($caption === '') {
+                    $caption = "عروض {$retailer->name} الجديدة";
+                }
+                // Primary media: EVERY scontent uri in the story unit —
+                // viewer_image covers plus all subattachment originals.
                 $rawImages = [];
-                if (preg_match_all('/"viewer_image":\s*\{\s*"height":\s*\d+,"width":\s*\d+,"uri":\s*"((?:[^"\\\\]|\\\\.)*)"/', $chunk, $im)) {
+                if (preg_match_all('/"uri":\s*"((?:[^"\\\\]|\\\\.)*scontent(?:[^"\\\\]|\\\\.)*)"/i', $chunk, $im)) {
                     foreach ($im[1] as $raw) {
                         $rawImages[] = str_replace('\\/', '/', trim($raw));
                     }
@@ -525,22 +371,6 @@ final class DirectFacebookPhotosIngestCommand extends Command
         }
 
         return $found;
-    }
-
-    private function parseHarvesterTime(mixed $value): Carbon
-    {
-        try {
-            if (is_int($value) || (is_string($value) && ctype_digit(trim($value)))) {
-                return Carbon::createFromTimestampUTC((int) $value);
-            }
-            if (is_string($value) && trim($value) !== '') {
-                return Carbon::parse(trim($value))->setTimezone('UTC');
-            }
-        } catch (Throwable $e) {
-            // fall through to now
-        }
-
-        return Carbon::now('UTC');
     }
 
     /**
