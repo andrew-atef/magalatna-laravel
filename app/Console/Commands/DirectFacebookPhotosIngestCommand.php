@@ -242,6 +242,11 @@ final class DirectFacebookPhotosIngestCommand extends Command
      */
     private function directPostPayload(Retailer $retailer, string $postId, string $html): ?array
     {
+        // Cover shield reference: page cover / profile photo ids that must
+        // never appear in flyer page arrays (they never change while albums
+        // grow — keying on them would freeze change detection).
+        $excludedIds = $this->systemPhotoIds($html);
+
         // Story path.
         if (preg_match_all('/\{"node":\{"__typename":"Story"/', $html, $m, PREG_OFFSET_CAPTURE)) {
             $offsets = array_column($m[0], 1);
@@ -295,6 +300,26 @@ final class DirectFacebookPhotosIngestCommand extends Command
                     foreach ($this->extractStoryMasterImages($chunk) as $master) {
                         $rawImages[] = $master;
                     }
+                }
+                // Cover shield: discard immediately any rendition carrying a
+                // system photo id (page cover / profile photo). Strict
+                // substring match on the immutable numeric id.
+                if ($excludedIds !== []) {
+                    $filtered = [];
+                    foreach ($rawImages as $candidate) {
+                        $blocked = false;
+                        foreach ($excludedIds as $excludedId => $_) {
+                            if ($excludedId !== '' && str_contains($candidate, (string) $excludedId)) {
+                                $blocked = true;
+
+                                break;
+                            }
+                        }
+                        if (! $blocked) {
+                            $filtered[] = $candidate;
+                        }
+                    }
+                    $rawImages = $filtered;
                 }
                 $images = $this->purifyImageUrls($rawImages, self::MAX_IMAGES);
                 if ($images === []) {
@@ -553,7 +578,11 @@ final class DirectFacebookPhotosIngestCommand extends Command
      * direct Azure egress when the proxy is unreachable. Never throws.
      */
     /**
-     * Fetch upstream HTML via the local curl-impersonate Chrome engine.
+     * Fetch upstream HTML via the local curl-impersonate Chrome engine routed
+     * through Cloudflare WARP consumer VPN (Proxy Mode, SOCKS5 127.0.0.1:40000).
+     * Masks the Azure datacenter IP behind Cloudflare's trusted consumer
+     * network — obliterates Meta's IP blocks at zero cost. socks5h:// (with
+     * 'h') resolves DNS remotely through the tunnel, no DNS leak to Meta.
      * Every outbound Facebook request natively carries Chrome's TLS JA3/JA4
      * fingerprint (< 15MB RAM, zero browser processes). Array-form Process
      * construction — no shell interpolation. Never throws.
@@ -561,28 +590,29 @@ final class DirectFacebookPhotosIngestCommand extends Command
     private function fetchViaCurlImpersonate(string $targetUrl): ?string
     {
         $t0 = microtime(true);
-        $this->line("[DEBUG_NETWORK] OUTBOUND -> Target: {$targetUrl} via curl_chrome116");
-        $this->safeLog('debug', "[DEBUG_NETWORK] OUTBOUND -> Target: {$targetUrl} via curl_chrome116");
+        $this->line("[DEBUG_NETWORK] OUTBOUND -> Target: {$targetUrl} via curl_chrome116 + WARP");
+        $this->safeLog('debug', "[DEBUG_NETWORK] OUTBOUND -> Target: {$targetUrl} via curl_chrome116 + WARP");
 
         try {
             $process = new Process([
                 $this->curlImpersonateBinary(),
                 '-s', '-L',
-                '--max-time', '15',
+                '-x', 'socks5h://127.0.0.1:40000', // Route traffic through WARP
+                '--max-time', '20',
                 '-H', 'Accept-Language: ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7',
                 '-H', 'Sec-Fetch-Dest: document',
                 '-H', 'Sec-Fetch-Mode: navigate',
                 '-H', 'Sec-Fetch-Site: none',
                 $targetUrl,
             ]);
-            $process->setTimeout(20);
+            $process->setTimeout(25);
             $process->run();
 
             $elapsedMs = round((microtime(true) - $t0) * 1000, 2);
 
             if ($process->isSuccessful()) {
                 $html = $process->getOutput();
-                $line = '[DEBUG_RESPONSE] Route: CURL_CHROME116 | Size: ' . strlen($html) . " bytes | Time: {$elapsedMs}ms";
+                $line = '[DEBUG_RESPONSE] Route: CURL_CHROME116+WARP | Size: ' . strlen($html) . " bytes | Time: {$elapsedMs}ms";
                 $this->line($line);
                 $this->safeLog('debug', $line);
 
@@ -739,23 +769,46 @@ final class DirectFacebookPhotosIngestCommand extends Command
     }
 
     /**
-     * Purify scontent URLs: reject avatars/thumbnails, prioritize full-size
-     * uploads (t39.30808-6, mx2048, s960x960, p720x720), unique, capped.
+     * Purify scontent URLs into unique 2K/3K masters — exactly one rendition
+     * per immutable photo signature.
+     *
+     * - Rejects avatars/thumbnails (AVATAR_MARKERS: t39.30808-1, s50x50,
+     *   s75x75, s100x100, s150x150, s320x320, p50x50, p100x100, rsrc.php,
+     *   emoji.php).
+     * - Groups renditions by immutable photo signature
+     *   (FacebookMediaHelper::extractPhotoSignature) so rotating subdomains
+     *   and duplicate sizes of the same page collapse to one entry.
+     * - Per signature keeps ONLY the highest-scoring rendition — JPEG masters
+     *   (t39.30808-6) and PNG masters (t39.99422-6) have full parity:
+     *   Master 2K/3K (mx3090, mx2048, mx1638, s2048x2048, t39.99422-6,
+     *   t39.30808-6) = 100; Mid (mx1199, s960x960, s1080x1080, p720x720) = 50;
+     *   Low (s320x320, p240x240, fb50) = 1; unrecognized = 0.
+     * - Wild-format tiebreak: live CDN URLs carry the asset class (t39.x-6)
+     *   on EVERY rendition while the true size ships in cstp/ctp/stp params,
+     *   so same-photo renditions routinely tie at 100. Ties break by size
+     *   rank (mx3090 > s2048x2048 > mx2048 > mx1638 > mx1199 > s1080x1080 >
+     *   s960x960 > p720x720 > bare master class > unknown > p240x240 >
+     *   s320x320/fb50), then first-seen — a 320px thumb can never shadow a
+     *   2K master regardless of HTML order.
+     * - Sorts unique masters by score desc, size rank desc, first-seen, caps
+     *   at $max. URLs are selected whole — Meta's `oh=` HMAC signatures are
+     *   preserved byte-for-byte (never rewritten, `stp=` never touched).
      *
      * @param list<mixed> $urls
      * @return list<string>
      */
     private function purifyImageUrls(array $urls, int $max = self::MAX_IMAGES): array
     {
-        $seen = [];
-        $scored = [];
-        $index = 0;
+        $seenUrls = [];
+        /** @var array<string, array{url: string, score: int, size: int, index: int}> $best */
+        $best = [];
+        $order = 0;
         foreach ($urls as $u) {
             $u = trim(html_entity_decode((string) $u, ENT_QUOTES | ENT_HTML5, 'UTF-8'));
-            if ($u === '' || ! str_contains($u, 'scontent') || isset($seen[$u])) {
+            if ($u === '' || ! str_contains($u, 'scontent') || isset($seenUrls[$u])) {
                 continue;
             }
-            $seen[$u] = true;
+            $seenUrls[$u] = true;
 
             $lower = strtolower($u);
             $isAvatar = false;
@@ -770,19 +823,62 @@ final class DirectFacebookPhotosIngestCommand extends Command
                 continue;
             }
 
-            $score = 0;
-            if (str_contains($u, 't39.30808-6')) {
-                $score += 2;
+            if (
+                str_contains($lower, 'mx3090') || str_contains($lower, 'mx2048')
+                || str_contains($lower, 'mx1638') || str_contains($lower, 's2048x2048')
+                || str_contains($lower, 't39.99422-6') || str_contains($lower, 't39.30808-6')
+            ) {
+                $score = 100;
+            } elseif (
+                str_contains($lower, 'mx1199') || str_contains($lower, 's960x960')
+                || str_contains($lower, 's1080x1080') || str_contains($lower, 'p720x720')
+            ) {
+                $score = 50;
+            } elseif (
+                str_contains($lower, 's320x320') || str_contains($lower, 'p240x240')
+                || str_contains($lower, 'fb50')
+            ) {
+                $score = 1;
+            } else {
+                $score = 0;
             }
-            if (str_contains($u, 'mx2048') || str_contains($u, 's960x960') || str_contains($u, 'p720x720')) {
-                $score += 1;
+
+            // Size rank: secondary ordering within the same score band.
+            $size = 20;
+            foreach ([
+                'mx3090' => 70, 's2048x2048' => 65, 'mx2048' => 60, 'mx1638' => 55,
+                'mx1199' => 45, 's1080x1080' => 42, 's960x960' => 40, 'p720x720' => 38,
+                't39.99422-6' => 30, 't39.30808-6' => 30,
+                'p240x240' => 12, 's320x320' => 10, 'fb50' => 10,
+            ] as $token => $rank) {
+                if (str_contains($lower, $token) && $rank > $size) {
+                    $size = $rank;
+                }
             }
-            $scored[] = ['url' => $u, 'score' => $score, 'index' => $index++];
+            // Known-thumb signal (wild URLs carry class + thumb-size together):
+            // unless a genuinely larger size token is present, a thumbnail
+            // sinks below size-unknown URLs; bare master-class URLs
+            // (unconstrained originals) keep rank 30.
+            $hasLow = str_contains($lower, 's320x320') || str_contains($lower, 'p240x240')
+                || str_contains($lower, 'fb50');
+            if ($hasLow && $size <= 30) {
+                $size = -5;
+            }
+
+            $key = \App\Support\FacebookMediaHelper::extractPhotoSignature($u);
+            if (! isset($best[$key]) || $score > $best[$key]['score']
+                || ($score === $best[$key]['score'] && $size > $best[$key]['size'])) {
+                $best[$key] = ['url' => $u, 'score' => $score, 'size' => $size, 'index' => $order];
+            }
+            $order++;
         }
 
-        usort($scored, static fn (array $a, array $b): int => $b['score'] <=> $a['score'] ?: $a['index'] <=> $b['index']);
+        $masters = array_values($best);
+        usort($masters, static fn (array $a, array $b): int => $b['score'] <=> $a['score']
+            ?: $b['size'] <=> $a['size']
+            ?: $a['index'] <=> $b['index']);
 
-        return array_slice(array_column($scored, 'url'), 0, $max);
+        return array_slice(array_column($masters, 'url'), 0, $max);
     }
 
     /**
