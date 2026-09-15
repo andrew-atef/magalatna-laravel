@@ -311,15 +311,23 @@ final class DirectFacebookPhotosIngestCommand extends Command
                 // a ~5-photo preview collage; the remaining catalog pages hide
                 // behind the album/media set id (set=a.XXX / set=pcb.XXX).
                 // When the story yields fewer than 25 unique images, fetch the
-                // dedicated album page via WARP and merge its master assets.
+                // dedicated album page via WARP (plus its type=3 grid variant,
+                // which SSR-renders a different slice) and merge master assets.
                 if (count(array_unique($rawImages)) < 25
                     && preg_match('#[?&]set=(a\.\d+|pcb\.\d+)#i', $chunk, $setMatch)) {
-                    $albumHtml = $this->fetchViaCurlImpersonate(
-                        'https://www.facebook.com/media/set/?set=' . $setMatch[1]
-                    );
-                    if ($albumHtml !== null && trim($albumHtml) !== '') {
-                        foreach ($this->extractStoryMasterImages($albumHtml) as $master) {
-                            $rawImages[] = $master;
+                    $albumUrls = [
+                        'https://www.facebook.com/media/set/?set=' . $setMatch[1],
+                        'https://www.facebook.com/media/set/?set=' . $setMatch[1] . '&type=3',
+                    ];
+                    foreach ($albumUrls as $albumUrl) {
+                        $albumHtml = $this->fetchViaCurlImpersonate($albumUrl);
+                        if ($albumHtml !== null && trim($albumHtml) !== '') {
+                            foreach ($this->extractStoryMasterImages($albumHtml) as $master) {
+                                $rawImages[] = $master;
+                            }
+                        }
+                        if (count(array_unique($rawImages)) >= 25) {
+                            break;
                         }
                     }
                 }
@@ -784,6 +792,15 @@ final class DirectFacebookPhotosIngestCommand extends Command
     ];
 
     /**
+     * Video-poster / preview asset classes: animated/video thumbnails
+     * (m1/v/t6 blobs) that ride along story payloads but are NEVER flyer
+     * pages. Rejected in purifyImageUrls like avatars.
+     */
+    private const VIDEO_MARKERS = [
+        '/m1/v/t6/', '/v/t6/',
+    ];
+
+    /**
      * Match all modern Facebook post identifier formats; returns the first
      * valid numeric or pfbid identifier found (post-specific patterns first,
      * generic JSON id keys last to avoid actor/page-id false positives).
@@ -886,6 +903,15 @@ final class DirectFacebookPhotosIngestCommand extends Command
                     $isAvatar = true;
 
                     break;
+                }
+            }
+            if (! $isAvatar) {
+                foreach (self::VIDEO_MARKERS as $marker) {
+                    if (str_contains($lower, $marker)) {
+                        $isAvatar = true;
+
+                        break;
+                    }
                 }
             }
             if ($isAvatar) {
