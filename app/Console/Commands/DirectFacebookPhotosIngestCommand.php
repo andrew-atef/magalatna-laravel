@@ -19,7 +19,7 @@ final class DirectFacebookPhotosIngestCommand extends Command
 
     protected $description = 'Direct Chrome-TLS Facebook photo ingest via local curl-impersonate engine';
 
-    private const MAX_IMAGES = 50;
+    private const MAX_IMAGES = 80;
 
     private const REQUEST_TIMEOUT = 10;
 
@@ -259,7 +259,10 @@ final class DirectFacebookPhotosIngestCommand extends Command
                 if ($i >= count($m[0])) {
                     break;
                 }
-                $chunk = substr($html, $offset, min(60000, $offsets[$i + 1] - $offset));
+                // Full story boundary: large multi-image catalogs exceed 150KB,
+                // so the chunk must NEVER be truncated — scan to the next
+                // story node (or end of HTML for the last story).
+                $chunk = substr($html, $offset, max(0, $offsets[$i + 1] - $offset));
                 if (! str_contains($chunk, '"' . $postId . '"')) {
                     continue;
                 }
@@ -296,13 +299,28 @@ final class DirectFacebookPhotosIngestCommand extends Command
                         $rawImages[] = str_replace('\\/', '/', trim($raw));
                     }
                 }
-                // Broad master-asset sweep: story viewer_image often exposes
-                // only the cover page while the remaining flyer pages ship as
-                // high-res t39 master assets further down the same story
-                // block. Never settle for a solitary page when masters exist.
-                if (count($rawImages) < 2) {
-                    foreach ($this->extractStoryMasterImages($chunk) as $master) {
-                        $rawImages[] = $master;
+                // Broad master-asset sweep (UNCONDITIONAL): story viewer_image
+                // often exposes only the preview collage while the remaining
+                // catalog pages ship as high-res t39 master assets further
+                // down the same story block. Never settle for a solitary page
+                // when masters exist — no count gate.
+                foreach ($this->extractStoryMasterImages($chunk) as $master) {
+                    $rawImages[] = $master;
+                }
+                // Deep album set fetcher: Meta throttles the timeline SSR to
+                // a ~5-photo preview collage; the remaining catalog pages hide
+                // behind the album/media set id (set=a.XXX / set=pcb.XXX).
+                // When the story yields fewer than 25 unique images, fetch the
+                // dedicated album page via WARP and merge its master assets.
+                if (count(array_unique($rawImages)) < 25
+                    && preg_match('#[?&]set=(a\.\d+|pcb\.\d+)#i', $chunk, $setMatch)) {
+                    $albumHtml = $this->fetchViaCurlImpersonate(
+                        'https://www.facebook.com/media/set/?set=' . $setMatch[1]
+                    );
+                    if ($albumHtml !== null && trim($albumHtml) !== '') {
+                        foreach ($this->extractStoryMasterImages($albumHtml) as $master) {
+                            $rawImages[] = $master;
+                        }
                     }
                 }
                 // Cover shield: discard immediately any rendition carrying a
