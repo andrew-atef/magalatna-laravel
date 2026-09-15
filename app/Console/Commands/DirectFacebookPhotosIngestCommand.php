@@ -310,10 +310,11 @@ final class DirectFacebookPhotosIngestCommand extends Command
                 // Deep album set fetcher: Meta throttles the timeline SSR to
                 // a ~5-photo preview collage; the remaining catalog pages hide
                 // behind the album/media set id (set=a.XXX / set=pcb.XXX).
-                // When the story yields fewer than 25 unique images, fetch the
-                // dedicated album page via WARP (plus its type=3 grid variant,
-                // which SSR-renders a different slice) and merge master assets.
-                if (count(array_unique($rawImages)) < 25
+                // When the story yields fewer than 25 UNIQUE photos (by
+                // immutable signature), fetch the dedicated album page via
+                // WARP (plus its type=3 grid variant, which SSR-renders a
+                // different slice) and merge master assets.
+                if ($this->countUniqueSignatures($rawImages) < 25
                     && preg_match('#[?&]set=(a\.\d+|pcb\.\d+)#i', $chunk, $setMatch)) {
                     $albumUrls = [
                         'https://www.facebook.com/media/set/?set=' . $setMatch[1],
@@ -326,7 +327,7 @@ final class DirectFacebookPhotosIngestCommand extends Command
                                 $rawImages[] = $master;
                             }
                         }
-                        if (count(array_unique($rawImages)) >= 25) {
+                        if ($this->countUniqueSignatures($rawImages) >= 25) {
                             break;
                         }
                     }
@@ -560,6 +561,21 @@ final class DirectFacebookPhotosIngestCommand extends Command
         }
 
         return $excluded;
+    }
+
+    /**
+     * Count distinct photos by immutable signature (dedupes renditions).
+     *
+     * @param list<mixed> $urls
+     */
+    private function countUniqueSignatures(array $urls): int
+    {
+        $seen = [];
+        foreach ($urls as $u) {
+            $seen[\App\Support\FacebookMediaHelper::extractPhotoSignature((string) $u)] = true;
+        }
+
+        return count($seen);
     }
 
     /**
