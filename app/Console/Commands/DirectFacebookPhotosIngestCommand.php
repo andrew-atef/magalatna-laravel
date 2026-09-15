@@ -244,8 +244,12 @@ final class DirectFacebookPhotosIngestCommand extends Command
     {
         // Cover shield reference: page cover / profile photo ids that must
         // never appear in flyer page arrays (they never change while albums
-        // grow — keying on them would freeze change detection).
+        // grow — keying on them would freeze change detection). NOTE: the
+        // cover fbid NEVER occurs inside its own CDN URL (filename segments
+        // are asset ids), so ids alone cannot catch it — signatures below
+        // exclude the actual cover/profile display images.
         $excludedIds = $this->systemPhotoIds($html);
+        $excludedSignatures = $this->systemPhotoSignatures($html);
 
         // Story path.
         if (preg_match_all('/\{"node":\{"__typename":"Story"/', $html, $m, PREG_OFFSET_CAPTURE)) {
@@ -320,6 +324,15 @@ final class DirectFacebookPhotosIngestCommand extends Command
                         }
                     }
                     $rawImages = $filtered;
+                }
+                // Cover-signature shield: the cover fbid never appears in its
+                // CDN URL, so drop any rendition whose immutable photo
+                // signature matches the page cover / profile display image.
+                if ($excludedSignatures !== []) {
+                    $rawImages = array_values(array_filter(
+                        $rawImages,
+                        static fn ($candidate): bool => ! isset($excludedSignatures[\App\Support\FacebookMediaHelper::extractPhotoSignature((string) $candidate)])
+                    ));
                 }
                 $images = $this->purifyImageUrls($rawImages, self::MAX_IMAGES);
                 if ($images === []) {
@@ -516,6 +529,40 @@ final class DirectFacebookPhotosIngestCommand extends Command
             if (preg_match_all($xp, $html, $xm)) {
                 foreach ($xm[1] as $id) {
                     $excluded[trim($id)] = true;
+                }
+            }
+        }
+
+        return $excluded;
+    }
+
+    /**
+     * Signatures of the page cover / profile display images.
+     *
+     * Forensics (el.montag.live): the cover fbid (e.g. 121260350672717)
+     * NEVER occurs inside its own CDN URL — filename segments are asset
+     * ids — so id-substring matching cannot catch the cover. Exclude the
+     * actual display-image URIs found inside the cover_photo / profilePhoto
+     * blocks by immutable photo signature instead.
+     *
+     * @return array<string, true>
+     */
+    private function systemPhotoSignatures(string $html): array
+    {
+        $excluded = [];
+        $clean = str_replace('\\/', '/', $html);
+        foreach ([
+            // "cover_photo":{... "photo":{... "image":{"uri":"...cover..."}}}
+            '/"cover_photo":\s*\{(?:.{0,2000}?)"image":\s*\{\s*"uri":\s*"([^"]*scontent[^"]*)"/s',
+            '/"profilePhoto":\s*\{(?:.{0,2000}?)"image":\s*\{\s*"uri":\s*"([^"]*scontent[^"]*)"/s',
+            '/"profile_picture":\s*\{(?:.{0,2000}?)"uri":\s*"([^"]*scontent[^"]*)"/s',
+        ] as $xp) {
+            if (preg_match_all($xp, $clean, $xm)) {
+                foreach ($xm[1] as $raw) {
+                    $url = trim(html_entity_decode((string) $raw, ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+                    if ($url !== '') {
+                        $excluded[\App\Support\FacebookMediaHelper::extractPhotoSignature($url)] = true;
+                    }
                 }
             }
         }
@@ -785,14 +832,18 @@ final class DirectFacebookPhotosIngestCommand extends Command
      *   Low (s320x320, p240x240, fb50) = 1; unrecognized = 0.
      * - Wild-format tiebreak: live CDN URLs carry the asset class (t39.x-6)
      *   on EVERY rendition while the true size ships in cstp/ctp/stp params,
-     *   so same-photo renditions routinely tie at 100. Ties break by size
+     *   so same-photo renditions routinely tie at 100. Ties break by
+     *   delivered-pixel area (`ctp=sWxH` first, `cstp=mxWxH` next, any
+     *   sWxH/mxWxH token after that; parameterless = unconstrained original
+     *   = infinite), then size-token
      *   rank (mx3090 > s2048x2048 > mx2048 > mx1638 > mx1199 > s1080x1080 >
      *   s960x960 > p720x720 > bare master class > unknown > p240x240 >
-     *   s320x320/fb50), then first-seen — a 320px thumb can never shadow a
-     *   2K master regardless of HTML order.
-     * - Sorts unique masters by score desc, size rank desc, first-seen, caps
-     *   at $max. URLs are selected whole — Meta's `oh=` HMAC signatures are
-     *   preserved byte-for-byte (never rewritten, `stp=` never touched).
+     *   s320x320/fb50), then first-seen — a 720px crop can never shadow the
+     *   1400px master regardless of HTML order.
+     * - Sorts unique masters by score desc, area desc, size rank desc,
+     *   first-seen; caps at $max. URLs are selected whole — Meta's `oh=`
+     *   HMAC signatures are preserved byte-for-byte (never rewritten,
+     *   `stp=` never touched).
      *
      * @param list<mixed> $urls
      * @return list<string>
@@ -800,7 +851,7 @@ final class DirectFacebookPhotosIngestCommand extends Command
     private function purifyImageUrls(array $urls, int $max = self::MAX_IMAGES): array
     {
         $seenUrls = [];
-        /** @var array<string, array{url: string, score: int, size: int, index: int}> $best */
+        /** @var array<string, array{url: string, score: int, area: int, size: int, index: int}> $best */
         $best = [];
         $order = 0;
         foreach ($urls as $u) {
@@ -865,16 +916,43 @@ final class DirectFacebookPhotosIngestCommand extends Command
                 $size = -5;
             }
 
+            // Delivered-pixel area: the true rendition size ships in ctp=
+            // (actual pixels served), then cstp= (container max), then any
+            // sWxH/mxWxH token (usually inside stp=). Parameterless URLs are
+            // unconstrained originals — ranked infinite so a bare master
+            // always beats its own crops.
+            $area = null;
+            if (preg_match('/ctp=s(\d+)x(\d+)/i', $u, $dm)) {
+                $area = (int) $dm[1] * (int) $dm[2];
+            } elseif (preg_match('/cstp=mx(\d+)x(\d+)/i', $u, $dm)) {
+                $area = (int) $dm[1] * (int) $dm[2];
+            } else {
+                $areas = [];
+                if (preg_match_all('/(?<![0-9a-z])s(\d+)x(\d+)/i', $lower, $sm, PREG_SET_ORDER)) {
+                    foreach ($sm as $d) {
+                        $areas[] = (int) $d[1] * (int) $d[2];
+                    }
+                }
+                if (preg_match_all('/(?<![0-9a-z])mx(\d+)x(\d+)/i', $lower, $sm, PREG_SET_ORDER)) {
+                    foreach ($sm as $d) {
+                        $areas[] = (int) $d[1] * (int) $d[2];
+                    }
+                }
+                $area = $areas !== [] ? max($areas) : PHP_INT_MAX;
+            }
+
             $key = \App\Support\FacebookMediaHelper::extractPhotoSignature($u);
             if (! isset($best[$key]) || $score > $best[$key]['score']
-                || ($score === $best[$key]['score'] && $size > $best[$key]['size'])) {
-                $best[$key] = ['url' => $u, 'score' => $score, 'size' => $size, 'index' => $order];
+                || ($score === $best[$key]['score'] && ($area > $best[$key]['area']
+                    || ($area === $best[$key]['area'] && $size > $best[$key]['size'])))) {
+                $best[$key] = ['url' => $u, 'score' => $score, 'area' => $area, 'size' => $size, 'index' => $order];
             }
             $order++;
         }
 
         $masters = array_values($best);
         usort($masters, static fn (array $a, array $b): int => $b['score'] <=> $a['score']
+            ?: $b['area'] <=> $a['area']
             ?: $b['size'] <=> $a['size']
             ?: $a['index'] <=> $b['index']);
 
