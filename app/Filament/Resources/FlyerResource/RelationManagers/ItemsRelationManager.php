@@ -96,6 +96,12 @@ class ItemsRelationManager extends RelationManager
                 Forms\Components\Toggle::make('is_featured')
                     ->label('Featured')
                     ->default(false),
+
+                Forms\Components\Placeholder::make('scraped_time')
+                    ->label('تاريخ رصد السعر')
+                    ->content(fn ($record): string => $record?->created_at
+                        ? $record->created_at->timezone('Africa/Cairo')->format('Y/m/d h:i A') . ' (' . $record->created_at->diffForHumans() . ')'
+                        : 'جديد'),
             ])
             ->columns(2);
     }

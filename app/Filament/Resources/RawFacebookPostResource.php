@@ -184,7 +184,7 @@ final class RawFacebookPostResource extends Resource
                     ->toggleable(),
 
                 Tables\Columns\TextColumn::make('published_at')
-                    ->label('تاريخ النشر')
+                    ->label('تاريخ النشر في فيسبوك')
                     ->formatStateUsing(function ($state, RawFacebookPost $record): string {
                         // Raw UTC digits (never the tz-mislabelled cast value).
                         $raw = $record->getRawOriginal('published_at') ?? $state;
@@ -209,10 +209,11 @@ final class RawFacebookPostResource extends Resource
                     ->toggleable(),
 
                 Tables\Columns\TextColumn::make('created_at')
-                    ->label('تاريخ الاستلام')
-                    ->dateTime('Y-m-d H:i')
-                    ->sortable()
-                    ->toggleable(isToggledHiddenByDefault: true),
+                    ->label('تاريخ وساعة السحب')
+                    ->dateTime('Y/m/d h:i A')
+                    ->timezone('Africa/Cairo')
+                    ->description(fn (RawFacebookPost $record): string => $record->created_at->diffForHumans())
+                    ->sortable(),
             ])
             ->filters([
                 Tables\Filters\SelectFilter::make('retailer_id')

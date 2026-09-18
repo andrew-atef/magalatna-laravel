@@ -393,7 +393,12 @@
     <!-- جدول الأسعار والسلع المكتشفة في المجلة (Structured Items Table) - Navy/Green -->
     <section class="rounded-2xl border border-[#e2e8f0] bg-white p-6 shadow-sm">
         <h2 class="mb-2 text-lg font-black text-[#023b55]">جدول السلع والأسعار المفصلة في هذا العرض</h2>
-        <p class="mb-6 text-xs text-slate-500">تم استخراج وقراءة هذه الأسعار تلقائياً وتدقيقها لضمان سهولة المقارنة والبحث.</p>
+        <p class="mb-4 text-xs text-slate-500 flex flex-wrap items-center gap-2">
+            <span>تم استخراج وتدقيق هذه الأسعار تلقائياً عبر الذكاء الاصطناعي.</span>
+            <span class="inline-flex items-center gap-1 rounded-md bg-[#039652]/10 px-2 py-0.5 font-bold text-[#039652]">
+                🕒 آخر رصد وتحديث للأسعار: {{ $flyer->updated_at?->timezone('Africa/Cairo')->format('Y/m/d h:i A') }} ({{ $flyer->updated_at?->timezone('Africa/Cairo')->diffForHumans() }})
+            </span>
+        </p>
 
         <div class="overflow-x-auto">
             <table class="w-full text-right text-xs">
