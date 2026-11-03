@@ -24,43 +24,54 @@ final class VerifyIngestWebhookSecret
 {
     public function handle(Request $request, Closure $next): Response
     {
-        $expected = (string) config('services.ingest_webhook.secret', '');
+        $expectedIngest = (string) (config('services.ingest_webhook.secret') ?: env('INGEST_WEBHOOK_SECRET', ''));
+        $expectedInternal = (string) config('services.internal_api.key', '');
 
-        if (trim($expected) === '') {
-            Log::warning('VerifyIngestWebhookSecret: INGEST_WEBHOOK_SECRET not configured; rejecting request.');
+        // Extract secret from header, query param, or bearer/internal key
+        $providedSecret = $request->header('X-Ingest-Secret') ?? $request->query('secret');
+        $providedBearer = $request->bearerToken() ?? $request->header('X-Internal-Key');
+
+        // Check against INGEST_WEBHOOK_SECRET
+        if ($expectedIngest !== '' && is_string($providedSecret) && trim($providedSecret) !== '') {
+            if (hash_equals($expectedIngest, trim($providedSecret))) {
+                return $next($request);
+            }
+        }
+
+        // Fallback: check if caller provided INGEST_WEBHOOK_SECRET via Bearer/X-Internal-Key
+        if ($expectedIngest !== '' && is_string($providedBearer) && trim($providedBearer) !== '') {
+            if (hash_equals($expectedIngest, trim($providedBearer))) {
+                return $next($request);
+            }
+        }
+
+        // Fallback: check if caller provided INTERNAL_API_KEY
+        if ($expectedInternal !== '') {
+            $candidate = is_string($providedSecret) && trim($providedSecret) !== '' ? $providedSecret : $providedBearer;
+            if (is_string($candidate) && trim($candidate) !== '' && hash_equals($expectedInternal, trim($candidate))) {
+                return $next($request);
+            }
+        }
+
+        if ($expectedIngest === '' && $expectedInternal === '') {
+            Log::warning('VerifyIngestWebhookSecret: Neither INGEST_WEBHOOK_SECRET nor INTERNAL_API_KEY configured.');
 
             return new JsonResponse(
-                ['message' => 'Service unavailable. Ingest webhook secret not configured.'],
+                ['message' => 'Service unavailable. Ingest secret not configured on server.'],
                 Response::HTTP_SERVICE_UNAVAILABLE,
             );
         }
 
-        // Prefer header; fall back to query param.
-        $provided = $request->header('X-Ingest-Secret');
+        Log::warning('VerifyIngestWebhookSecret: invalid or missing secret attempt.', [
+            'ip' => $request->ip(),
+            'ua' => $request->userAgent(),
+            'has_x_ingest_secret' => $request->hasHeader('X-Ingest-Secret'),
+            'has_secret_query' => $request->has('secret'),
+        ]);
 
-        if (! is_string($provided) || trim($provided) === '') {
-            $provided = $request->query('secret');
-        }
-
-        if (! is_string($provided) || trim($provided) === '') {
-            return new JsonResponse(
-                ['message' => 'Unauthorized. Missing X-Ingest-Secret header or ?secret= parameter.'],
-                Response::HTTP_UNAUTHORIZED,
-            );
-        }
-
-        if (! hash_equals($expected, trim($provided))) {
-            Log::warning('VerifyIngestWebhookSecret: invalid secret attempt.', [
-                'ip' => $request->ip(),
-                'ua' => $request->userAgent(),
-            ]);
-
-            return new JsonResponse(
-                ['message' => 'Unauthorized. Invalid ingest secret.'],
-                Response::HTTP_UNAUTHORIZED,
-            );
-        }
-
-        return $next($request);
+        return new JsonResponse(
+            ['message' => 'Unauthorized. Missing or invalid X-Ingest-Secret header or ?secret= parameter.'],
+            Response::HTTP_UNAUTHORIZED,
+        );
     }
 }
