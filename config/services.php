@@ -61,6 +61,12 @@ return [
     // flat key for spec compatibility: config('services.internal_api_key')
     'internal_api_key' => env('INTERNAL_API_KEY'),
 
+    // Radar webhook secret — shared between the Cloudflare Worker/GitHub Actions
+    // radar and this Laravel app. Used by VerifyIngestWebhookSecret middleware.
+    'ingest_webhook' => [
+        'secret' => env('INGEST_WEBHOOK_SECRET'),
+    ],
+
     'cloudflare' => [
         'api_token' => env('CLOUDFLARE_CACHE_API_TOKEN'),
         'zone_id' => env('CLOUDFLARE_ZONE_ID'),

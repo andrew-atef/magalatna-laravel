@@ -1,6 +1,7 @@
 <?php
 
 use App\Http\Middleware\InternalApiKeyMiddleware;
+use App\Http\Middleware\VerifyIngestWebhookSecret;
 use Illuminate\Foundation\Application;
 use Illuminate\Foundation\Configuration\Exceptions;
 use Illuminate\Foundation\Configuration\Middleware;
@@ -14,7 +15,8 @@ return Application::configure(basePath: dirname(__DIR__))
     )
     ->withMiddleware(function (Middleware $middleware): void {
         $middleware->alias([
-            'internal.api' => InternalApiKeyMiddleware::class,
+            'internal.api'   => InternalApiKeyMiddleware::class,
+            'ingest.secret'  => VerifyIngestWebhookSecret::class,
         ]);
         $middleware->web(append: [
             \App\Http\Middleware\NegotiateMarkdownResponse::class,

@@ -28,8 +28,8 @@ final class RawFacebookIngestController extends Controller
                 'retailer_slug' => ['required', 'string', 'max:255', 'exists:retailers,slug'],
                 'facebook_post_id' => ['required', 'string', 'max:255'],
                 'post_text' => ['required', 'string', 'max:10000'],
-                'image_urls' => ['required', 'array', 'min:1', 'max:20'],
-                'image_urls.*' => ['required', 'string', 'url', 'max:2048'],
+                'image_urls' => ['required', 'array', 'min:1', 'max:100'],
+                'image_urls.*' => ['required', 'string', 'url', 'max:4096'],
                 'published_at' => ['required', 'date'],
             ]);
 
