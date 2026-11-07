@@ -27,20 +27,20 @@ final class RawFacebookIngestController extends Controller
             $validated = $request->validate([
                 'retailer_slug' => ['required', 'string', 'max:255', 'exists:retailers,slug'],
                 'facebook_post_id' => ['required', 'string', 'max:255'],
-                'post_text' => ['required', 'string', 'max:10000'],
+                'post_text' => ['nullable', 'string', 'max:10000'],
                 'image_urls' => ['required', 'array', 'min:1', 'max:100'],
                 'image_urls.*' => ['required', 'string', 'url', 'max:4096'],
-                'published_at' => ['required', 'date'],
+                'published_at' => ['nullable', 'date'],
             ]);
 
             $retailerSlug = (string) $validated['retailer_slug'];
             $facebookPostId = (string) $validated['facebook_post_id'];
-            $postText = (string) $validated['post_text'];
+            $postText = (string) ($validated['post_text'] ?? '');
             /** @var list<string> $imageUrls */
             $imageUrls = array_values($validated['image_urls']);
             // Database temporal integrity: timestamps are ALWAYS stored in UTC.
             // Presentation layers (Filament, Blade) convert to Africa/Cairo on render.
-            $publishedAtUtc = Carbon::parse((string) $validated['published_at'])->utc();
+            $publishedAtUtc = !empty($validated['published_at']) ? Carbon::parse((string) $validated['published_at'])->utc() : now()->utc();
 
             // Zero data loss: persist every incoming payload
             $retailer = Retailer::where('slug', $retailerSlug)->firstOrFail();

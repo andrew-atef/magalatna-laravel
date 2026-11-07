@@ -445,10 +445,13 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
     /**
      * Build ProcessSinglePageJobs and dispatch them as one batch.
      *
-     * The then() callback recounts pages straight from the DB (O(1) aggregate —
-     * pages may have merged further while jobs ran), refreshes BLUF/editorial,
-     * and on auto-publish fires async IndexNow ping + Cloudflare purge dispatches
-     * (no synchronous network inside the worker).
+     * The then() callback enforces the ZERO-ITEMS KILL-SWITCH: if OCR extracted
+     * no products at all, the flyer (and its pages) are deleted and the raw post
+     * is marked rejected — it is NEVER published, never purged, never pinged.
+     * Otherwise it recounts pages straight from the DB (O(1) aggregate — pages
+     * may have merged further while jobs ran), refreshes BLUF/editorial, and on
+     * auto-publish fires async Cloudflare purge dispatches (no synchronous
+     * network inside the worker).
      *
      * @param  list<string>  $imageUrls
      */
@@ -463,15 +466,46 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
             );
         }
 
+        $rawPostId = $this->rawFacebookPostId;
+
         Bus::batch($jobs)
             ->name($batchName)
             ->allowFailures()
-            ->then(static function (Batch $batch) use ($flyerId): void {
+            ->then(static function (Batch $batch) use ($flyerId, $rawPostId): void {
                 try {
                     $flyer = Flyer::find($flyerId);
 
                     if ($flyer === null) {
                         Log::error('Flyer not found in batch then callback.', ['flyer_id' => $flyerId]);
+
+                        return;
+                    }
+
+                    // === ZERO-ITEMS KILL-SWITCH: never publish an empty flyer ===
+                    $itemsCount = $flyer->items()->count();
+
+                    if ($itemsCount === 0) {
+                        Log::warning('[ABORT_ZERO_ITEMS] Discarding flyer: OCR extracted 0 products.', [
+                            'flyer_id' => $flyer->id,
+                            'title' => $flyer->title,
+                            'retailer' => $flyer->retailer?->slug,
+                            'batch_id' => $batch->id,
+                        ]);
+
+                        // 1. Mark the raw post rejected with the reason, and clear
+                        //    the dangling flyer_id pointer to the deleted flyer.
+                        if ($rawPostId !== null) {
+                            RawFacebookPost::where('id', $rawPostId)->update([
+                                'status' => 'rejected',
+                                'rejection_reason' => 'تم إلغاء المجلة وحذفها تلقائياً: لم يتم العثور على أي سلع أو أسعار داخل الصور بعد الفحص.',
+                                'flyer_id' => null,
+                            ]);
+                        }
+
+                        // 2. Delete pages + flyer record — nothing hits the sitemap,
+                        //    IndexNow, or the cache. Immediate return, no publish.
+                        $flyer->pages()->delete();
+                        $flyer->delete();
 
                         return;
                     }
@@ -490,8 +524,9 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
                     // purge below remains the SINGLE purge authority (no observer cascade).
                     $flyer->saveQuietly();
 
-                    Log::info($autoPublish ? 'Flyer auto-published with BLUF.' : 'Flyer merged and pending_review with BLUF.', [
+                    Log::info($autoPublish ? 'Flyer auto-published with verified items.' : 'Flyer merged and pending_review with verified items.', [
                         'flyer_id' => $flyer->id,
+                        'items_count' => $itemsCount,
                         'batch_id' => $batch->id,
                         'status' => $flyer->status->value,
                     ]);
