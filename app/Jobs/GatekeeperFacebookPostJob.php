@@ -481,33 +481,31 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
                         return;
                     }
 
-                    // === ZERO-ITEMS KILL-SWITCH: never publish an empty flyer ===
-                    $itemsCount = $flyer->items()->count();
+                    // === ZERO-ITEMS / ZERO-PRICE KILL-SWITCH: never publish an empty or 0.00 EGP flyer ===
+                    $validItemsCount = $flyer->items()->where('sale_price', '>', 0)->count();
 
-                    if ($itemsCount === 0) {
-                        Log::warning('[ABORT_ZERO_ITEMS] Discarding flyer: OCR extracted 0 products.', [
+                    if ($validItemsCount === 0) {
+                        Log::warning('[ABORT_ZERO_PRICE_FLYER] Discarding flyer: 0 products with price > 0.', [
                             'flyer_id' => $flyer->id,
                             'title' => $flyer->title,
                             'retailer' => $flyer->retailer?->slug,
                             'batch_id' => $batch->id,
                         ]);
 
-                        // 1. Mark the raw post rejected with the reason, and clear
-                        //    the dangling flyer_id pointer to the deleted flyer.
                         if ($rawPostId !== null) {
                             RawFacebookPost::where('id', $rawPostId)->update([
                                 'status' => 'rejected',
-                                'rejection_reason' => 'تم إلغاء المجلة وحذفها تلقائياً: لم يتم العثور على أي سلع أو أسعار داخل الصور بعد الفحص.',
+                                'rejection_reason' => 'تم إلغاء المجلة وحذفها تلقائياً: الصور لا تحتوي على أي أسعار حقيقية للسلع (جميع الأسعار المستخرجة 0.00 ج.م أو منعدمة).',
                                 'flyer_id' => null,
                             ]);
                         }
 
-                        // 2. Delete pages + flyer record — nothing hits the sitemap,
-                        //    IndexNow, or the cache. Immediate return, no publish.
+                        // تنظيف وحذف المجلة وكل صفحاتها وسلعها الصفرية
                         $flyer->pages()->delete();
+                        $flyer->items()->delete();
                         $flyer->delete();
 
-                        return;
+                        return; // خروج فوري - لن تُنشر ولن تلوث الموقع
                     }
 
                     // O(1) recount from the DB — never trust a stale in-memory counter.

@@ -219,6 +219,14 @@ final class ProcessSinglePageJob implements ShouldQueue
                             }
 
                             $salePrice = (float) ($raw['sale_price'] ?? 0);
+                            if ($salePrice <= 0) {
+                                Log::warning('Skipping item with zero or negative price in ProcessSinglePageJob.', [
+                                    'product_name' => $productName,
+                                    'sale_price' => $salePrice,
+                                ]);
+
+                                continue;
+                            }
                             $oldPrice = isset($raw['old_price']) && $raw['old_price'] !== null ? (float) $raw['old_price'] : null;
                             $unit = $raw['unit'] ?? null;
                             $brandName = $raw['brand_name'] ?? null;

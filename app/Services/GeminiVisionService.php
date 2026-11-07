@@ -712,6 +712,7 @@ STRICT DISQUALIFICATION RULES — YOU MUST RETURN is_flyer = false FOR ANY OF TH
 3. SINGLE-PRODUCT ADS & BRAND SPONSORSHIPS: Any post advertising only one specific brand or product (e.g., "اشتري منتجات فلفيتا", "مسحوق إريال بأوفر سعر", "شوكولاتة كيت كات") without a multi-item price catalog. EXCEPTION: a multi-image Flash album as defined below is NOT a single-product ad.
 4. CONTESTS & GIVEAWAYS: Posts announcing raffles, winners, gold coins, or shopping vouchers (e.g., "سحب على ذهب وفلوس", "قسيمة شراء بـ 2000 جنيه", "مسابقة").
 5. TEASERS & BLANK BANNERS: "قريباً", "انتظرونا", "أقوى العروض جاية", "قبل ما العروض تخلص", or generic announcement posters/reminders without product prices or a full catalog.
+6. PROMO CODES & APP COUPONS (أكواد الخصم / كوبونات / افتح الأبلكيشن وانسخ الكود / بروموكود): Any post announcing app discount codes or online coupon vouchers (e.g. "انسخ اكواد الخصم", "عروض 11.11 أونلاين", "خصم 11% لحد 300 جنيه") without a multi-item price catalog with individual printed prices.
 
 FLASH 1-DAY ALBUM EXCEPTION (STILL VALID):
 An album with TOTAL_IMAGES_IN_POST >= 2 where each image features a discounted staple commodity for a single specific day (e.g., "ساري يوم الأربعاء 9 سبتمبر فقط") IS A VALID FLYER (is_flyer = true). The album as a whole is the catalog — set both valid_from and valid_until to that exact same date.
@@ -865,6 +866,11 @@ You are an expert OCR for Egyptian supermarket flyers/catalogs (High-Density Pag
 
 Extract EVERY product offer visible in the flyer page image. Flyers are in Arabic and sometimes English, high density, small fine print.
 
+STRICT ZERO-PRICE RULE:
+DO NOT output any item that does not have an explicit, printed numeric price > 0.
+If an image shows products with generic promo text (e.g. "خصم 11%", "وفر معنا") but NO printed item-by-item prices, return an empty items array: {"items": []}.
+NEVER return 0, 0.0, or null for sale_price.
+
 CRITICAL PRICE RULE — READ CAREFULLY:
 Supermarkets print prices with SUPERSCRIPTS for piasters/qirsh.
 Example: A large "19" and a small superscript "95" means 19.95 EGP, NOT 1995.
@@ -975,8 +981,13 @@ PROMPT;
             }
 
             $salePrice = $this->toFloatOrNull($raw['sale_price'] ?? null);
-            if ($salePrice === null) {
-                Log::warning('Skipping OCR item without valid sale_price.', ['index' => $idx, 'product' => $productName]);
+            // حظر تام لأي سعر صفري أو سالب (Supermarket items cannot be 0.00 EGP)
+            if ($salePrice === null || $salePrice <= 0) {
+                Log::warning('Skipping OCR item with zero or invalid sale_price.', [
+                    'index' => $idx,
+                    'product' => $productName,
+                    'price' => $salePrice,
+                ]);
 
                 continue;
             }
