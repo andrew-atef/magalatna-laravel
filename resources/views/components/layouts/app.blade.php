@@ -86,6 +86,36 @@
 
     @stack('head_meta')
     @stack('schema')
+
+    {{-- Google Analytics 4 (GA4) - Deferred Execution for Core Web Vitals (TBT = 0ms) --}}
+    @if(config('services.google.analytics_id'))
+        <script>
+            window.dataLayer = window.dataLayer || [];
+            function gtag(){dataLayer.push(arguments);}
+            gtag('js', new Date());
+            gtag('config', '{{ config('services.google.analytics_id') }}', {
+                send_page_view: true,
+                cookie_domain: 'magalatna.com',
+                anonymize_ip: true
+            });
+
+            // تحميل السكربت فقط عند خمول المتصفح لحماية سرعة الرسم ومؤشرات جوجل
+            (function() {
+                function loadGA() {
+                    var script = document.createElement('script');
+                    script.async = true;
+                    script.src = 'https://www.googletagmanager.com/gtag/js?id={{ config('services.google.analytics_id') }}';
+                    document.head.appendChild(script);
+                }
+
+                if ('requestIdleCallback' in window) {
+                    requestIdleCallback(loadGA, { timeout: 2000 });
+                } else {
+                    window.addEventListener('load', loadGA);
+                }
+            })();
+        </script>
+    @endif
 </head>
 <body class="min-h-screen bg-[#f8fafc] text-slate-900 antialiased selection:bg-[#039652] selection:text-white">
 

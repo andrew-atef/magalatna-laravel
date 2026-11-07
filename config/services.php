@@ -79,6 +79,10 @@ return [
 
     'indexnow_key' => env('INDEXNOW_KEY'),
 
+    'google' => [
+        'analytics_id' => env('GOOGLE_ANALYTICS_ID'),
+    ],
+
     'google_indexing' => [
         'enabled' => env('GOOGLE_INDEXING_ENABLED', false),
         'credentials_path' => storage_path((string) env('GOOGLE_INDEXING_CREDENTIALS_FILE', 'app/google-service-account.json')),
