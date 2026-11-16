@@ -29,68 +29,144 @@ final class PingIndexNowJob implements ShouldQueue
     public int $timeout = 30;
 
     /**
-     * @param  string|int  $pageUrl  Full URL to ping, e.g. https://example.com/flyer/my-slug or flyer ID for BC
+     * Accepts one of:
+     *  - string      : a single full URL
+     *  - int|string  : legacy BC — a flyer ID (numeric), resolved to its canonical URL
+     *  - list<string>: a batch of full URLs (IndexNow urlList, up to 10,000 per call)
+     *
+     * @param  string|int|list<string>  $pageUrl
      */
     public function __construct(public readonly mixed $pageUrl) {}
 
     public function handle(): void
     {
         try {
-            // Resolve URL: support both string URL and legacy int flyerId
-            $url = (string) $this->pageUrl;
-            if (is_int($this->pageUrl) || (is_string($this->pageUrl) && ctype_digit((string) $this->pageUrl))) {
-                $flyer = Flyer::find((int) $this->pageUrl);
-                if ($flyer === null) {
-                    Log::warning('PingIndexNowJob: Flyer not found for ID.', ['pageUrl' => $this->pageUrl]);
+            $urls = $this->resolveUrls();
 
-                    return;
-                }
-                $url = route('flyers.show', $flyer->slug);
+            if ($urls === []) {
+                return;
             }
 
             // Config-only key (never env() — unavailable after config:cache).
-            $apiKey = (string) config('services.indexnow.key', '');
-            $host = (string) parse_url((string) config('app.url'), PHP_URL_HOST);
+            $apiKey = trim((string) config('services.indexnow.key', ''));
+            $base = rtrim((string) config('app.url'), '/');
+            $host = (string) parse_url($base, PHP_URL_HOST);
 
-            if (trim($apiKey) === '') {
-                Log::warning('PingIndexNowJob: INDEXNOW_KEY not configured, skipping.', ['pageUrl' => $url]);
+            if ($apiKey === '') {
+                Log::warning('PingIndexNowJob: INDEXNOW_KEY not configured, skipping.', [
+                    'url_count' => count($urls),
+                ]);
 
                 return;
             }
 
-            if (trim($host) === '') {
-                $host = (string) parse_url($url, PHP_URL_HOST) ?: 'amanprice.example';
+            // Canonical host from config('app.url') ONLY. Never fall back to a
+            // placeholder host (offers.example) or a request-derived one:
+            // pinging IndexNow for a host we do not own is a protocol violation
+            // and CLI workers on the VPS would resolve 127.0.0.1.
+            if ($host === '') {
+                Log::warning('PingIndexNowJob: APP_URL host is empty, skipping IndexNow ping.', [
+                    'url_count' => count($urls),
+                ]);
+
+                return;
             }
 
             $payload = [
                 'host' => $host,
                 'key' => $apiKey,
-                'keyLocation' => rtrim((string) config('app.url'), '/')."/{$apiKey}.txt",
-                'urlList' => [$url],
+                'keyLocation' => $base."/{$apiKey}.txt",
+                'urlList' => $urls,
             ];
 
             $response = Http::timeout(10)->post('https://api.indexnow.org/indexnow', $payload);
 
             if ($response->successful()) {
-                Log::info("IndexNow Pinged successfully for URL: {$url}");
+                Log::info('IndexNow pinged successfully.', [
+                    'host' => $host,
+                    'url_count' => count($urls),
+                ]);
 
                 return;
             }
 
-            Log::warning("IndexNow Ping failed for {$url} with status: ".$response->status());
+            Log::warning('IndexNow ping failed.', [
+                'status' => $response->status(),
+                'url_count' => count($urls),
+            ]);
 
             if ($response->status() >= 500) {
                 throw new \RuntimeException('IndexNow server error: HTTP '.$response->status());
             }
         } catch (Throwable $e) {
-            Log::error('PingIndexNowJob failed.', ['pageUrl' => $this->pageUrl, 'error' => $e->getMessage()]);
+            Log::error('PingIndexNowJob failed.', ['error' => $e->getMessage()]);
 
             throw $e;
         }
     }
 
+    /**
+     * Normalize the constructor input into a de-duplicated list of absolute URLs.
+     *
+     * @return list<string>
+     */
+    private function resolveUrls(): array
+    {
+        $input = $this->pageUrl;
+
+        // Legacy BC: flyer ID => resolve its canonical /offers/{slug} URL from
+        // the config base (route() without arguments stays request-independent).
+        if (is_int($input) || (is_string($input) && ctype_digit($input))) {
+            $flyer = Flyer::query()->find((int) $input);
+
+            if ($flyer === null || (string) $flyer->slug === '') {
+                Log::warning('PingIndexNowJob: Flyer not found for ID.', ['pageUrl' => $input]);
+
+                return [];
+            }
+
+            return [self::baseUrl().route('flyers.show', ['slug' => (string) $flyer->slug], false)];
+        }
+
+        if (is_string($input)) {
+            $input = [$input];
+        }
+
+        if (! is_array($input)) {
+            return [];
+        }
+
+        $base = self::baseUrl();
+        $out = [];
+
+        foreach ($input as $u) {
+            $t = trim((string) $u);
+
+            if ($t === '') {
+                continue;
+            }
+
+            // Relative paths get the canonical config base prepended.
+            if (! preg_match('#^https?://#i', $t)) {
+                $t = $base.'/'.ltrim($t, '/');
+            }
+
+            $out[] = $t;
+        }
+
+        return array_values(array_unique($out));
+    }
+
+    /**
+     * Canonical host from config only — never request-bound.
+     */
+    private static function baseUrl(): string
+    {
+        return rtrim((string) config('app.url'), '/');
+    }
+
     public function failed(Throwable $exception): void
     {
-        Log::error('PingIndexNowJob permanently failed.', ['pageUrl' => $this->pageUrl, 'error' => $exception->getMessage()]);
+        Log::error('PingIndexNowJob permanently failed.', ['error' => $exception->getMessage()]);
     }
 }

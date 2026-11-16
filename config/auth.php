@@ -114,4 +114,21 @@ return [
 
     'password_timeout' => env('AUTH_PASSWORD_TIMEOUT', 10800),
 
+    /*
+    |--------------------------------------------------------------------------
+    | Filament Admin Panel Access
+    |--------------------------------------------------------------------------
+    |
+    | Comma-separated email allowlist for the /admin Filament panel. Read by
+    | App\Models\User::canAccessPanel(). NEVER read env() directly from the
+    | model — env() is unavailable after `php artisan config:cache`.
+    |
+    | Example: FILAMENT_ADMIN_EMAILS="owner@magalatna.com, dev@magalatna.com"
+    |
+    */
+
+    'panel' => [
+        'admin_emails' => env('FILAMENT_ADMIN_EMAILS', ''),
+    ],
+
 ];

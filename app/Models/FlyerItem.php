@@ -4,7 +4,6 @@ declare(strict_types=1);
 
 namespace App\Models;
 
-use App\Support\ArabicNormalizer;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
@@ -48,14 +47,9 @@ class FlyerItem extends Model
         ];
     }
 
-    protected static function booted(): void
-    {
-        static::saving(function (self $model): void {
-            if ($model->isDirty('product_name') || empty($model->normalized_name)) {
-                $model->normalized_name = ArabicNormalizer::normalize((string) $model->product_name);
-            }
-        });
-    }
+    // NOTE: normalized_name population lives ONLY in FlyerItemObserver
+    // (single source of truth). No booted() saving hook here — a duplicate
+    // normalization path caused double work and event-order ambiguity.
 
     /**
      * @return BelongsTo<Flyer, $this>

@@ -10,6 +10,8 @@ use App\Http\Controllers\PageController;
 use App\Http\Controllers\RetailerController;
 use App\Models\Flyer;
 use App\Models\Retailer;
+use App\Support\CairoTime;
+use Carbon\Carbon;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Response;
 use Illuminate\Support\Facades\Route;
@@ -35,10 +37,24 @@ Route::get('/llms.txt', [LlmsTxtController::class, 'index'])->name('llms.txt');
 
 // خريطة الموقع لمحركات البحث — cached 6h, invalidated via observers (FlyerObserver::saved/deleted)
 // Memory-guarded: max 300 flyers, column-selected, cover page only (no full pages hydration).
+// Expired flyers are NEVER listed: their pages render noindex,follow and a
+// sitemap entry would trigger "Submitted URL marked noindex" in Search Console.
 Route::get('/sitemap.xml', function () {
     $xml = Cache::remember('sitemap_xml_content', 21600, function () {
-        $retailers = Retailer::where('is_active', true)->get();
+        // Canonical host from config — CLI/queue/admin hosts must never poison
+        // the cached <loc> values.
+        $baseUrl = rtrim((string) config('app.url'), '/');
+
+        $retailers = Retailer::where('is_active', true)
+            ->get(['id', 'name', 'slug', 'logo_path', 'updated_at']);
+
         $activeFlyers = Flyer::where('status', FlyerStatus::Published)
+            // Published but past valid_until renders noindex — exclude as well.
+            // Direct >= comparison keeps the valid_until B-Tree index usable.
+            ->where('valid_until', '>=', Carbon::today('Africa/Cairo')->toDateString())
+            // Inactive retailers must never leak into the sitemap: their hub
+            // pages 404 and a listed flyer would point through a dead hub.
+            ->whereHas('retailer', static fn ($q) => $q->where('is_active', true))
             ->select(['id', 'slug', 'retailer_id', 'title', 'updated_at'])
             ->with([
                 'retailer' => static fn ($q) => $q->select(['id', 'name', 'slug', 'logo_path']),
@@ -50,17 +66,18 @@ Route::get('/sitemap.xml', function () {
             ->latest('updated_at')
             ->limit(300)
             ->get();
-        $expiredFlyers = Flyer::where('status', FlyerStatus::Expired)
-            ->select(['id', 'slug', 'retailer_id', 'updated_at'])
-            ->with(['retailer'])
-            ->latest('updated_at')
-            ->limit(200)
-            ->get();
+
+        // Homepage <lastmod> = latest published flyer's updated_at — NEVER now():
+        // a now() lastmod on an unchanged homepage forces pointless recrawls.
+        $homepageLastmod = CairoTime::toIso8601(
+            (string) ($activeFlyers->first()?->getRawOriginal('updated_at') ?? now('Africa/Cairo')->format('Y-m-d H:i:s')),
+        );
 
         return view('sitemap', [
+            'baseUrl' => $baseUrl,
+            'homepageLastmod' => $homepageLastmod,
             'retailers' => $retailers,
             'activeFlyers' => $activeFlyers,
-            'expiredFlyers' => $expiredFlyers,
             // Back-compat for older view variable name
             'flyers' => $activeFlyers,
         ])->render();

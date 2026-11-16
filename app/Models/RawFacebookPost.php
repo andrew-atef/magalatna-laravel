@@ -14,9 +14,23 @@ class RawFacebookPost extends Model
     use HasFactory;
 
     /**
+     * Explicit mass-assignment allowlist (matches the raw_facebook_posts
+     * schema exactly). status/flyer_id remain assignable because the
+     * Gatekeeper pipeline writes them through model updates.
+     *
      * @var list<string>
      */
-    protected $guarded = ['id'];
+    protected $fillable = [
+        'retailer_id',
+        'facebook_post_id',
+        'post_text',
+        'image_urls',
+        'published_at',
+        'status',
+        'ai_classification',
+        'rejection_reason',
+        'flyer_id',
+    ];
 
     /**
      * @return array<string, string>

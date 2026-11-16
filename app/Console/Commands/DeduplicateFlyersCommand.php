@@ -4,16 +4,20 @@ declare(strict_types=1);
 
 namespace App\Console\Commands;
 
+use App\Enums\FlyerStatus;
 use App\Jobs\PurgeCloudflareCacheJob;
 use App\Models\Flyer;
 use App\Models\FlyerItem;
 use App\Models\FlyerPage;
+use App\Models\RawFacebookPost;
 use App\Models\Retailer;
 use App\Support\ArabicNormalizer;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Storage;
+use Throwable;
 
 final class DeduplicateFlyersCommand extends Command
 {
@@ -58,7 +62,7 @@ final class DeduplicateFlyersCommand extends Command
 
             foreach ($duplicates as $dup) {
                 $flyerCount = Flyer::where('retailer_id', $dup->id)->count();
-                $rawCount = \App\Models\RawFacebookPost::where('retailer_id', $dup->id)->count();
+                $rawCount = RawFacebookPost::where('retailer_id', $dup->id)->count();
                 $childCount = Retailer::where('parent_id', $dup->id)->count();
 
                 $this->line(" - دمج المتجر المكرر [{$dup->id}] {$dup->name} ({$dup->slug}) -> الأساسي [{$primary->id}] {$primary->name} ({$primary->slug}) — {$flyerCount} مجلة, {$rawCount} منشور خام, {$childCount} فرع");
@@ -66,7 +70,7 @@ final class DeduplicateFlyersCommand extends Command
                 if (! $dryRun) {
                     DB::transaction(function () use ($dup, $primary): void {
                         Flyer::where('retailer_id', $dup->id)->update(['retailer_id' => $primary->id]);
-                        \App\Models\RawFacebookPost::where('retailer_id', $dup->id)->update(['retailer_id' => $primary->id]);
+                        RawFacebookPost::where('retailer_id', $dup->id)->update(['retailer_id' => $primary->id]);
                         Retailer::where('parent_id', $dup->id)->update(['parent_id' => $primary->id]);
                         // Atomic: deletion inside the transaction — re-parenting, re-linking
                         // and delete succeed or roll back together. Observer side-effects
@@ -101,12 +105,12 @@ final class DeduplicateFlyersCommand extends Command
                     continue;
                 }
                 $flyerCount = Flyer::where('retailer_id', $dup->id)->count();
-                $rawCount = \App\Models\RawFacebookPost::where('retailer_id', $dup->id)->count();
+                $rawCount = RawFacebookPost::where('retailer_id', $dup->id)->count();
                 $this->line(" - دمج بالاسم المطابق [{$dup->id}] {$dup->name} ({$dup->slug}) -> الأساسي [{$primary->id}] {$primary->name} ({$primary->slug}) — {$flyerCount} مجلة, {$rawCount} منشور خام");
                 if (! $dryRun) {
                     DB::transaction(function () use ($dup, $primary): void {
                         Flyer::where('retailer_id', $dup->id)->update(['retailer_id' => $primary->id]);
-                        \App\Models\RawFacebookPost::where('retailer_id', $dup->id)->update(['retailer_id' => $primary->id]);
+                        RawFacebookPost::where('retailer_id', $dup->id)->update(['retailer_id' => $primary->id]);
                         Retailer::where('parent_id', $dup->id)->update(['parent_id' => $primary->id]);
                         // Atomic: deletion inside the transaction (see primary pass).
                         $dup->delete();
@@ -139,13 +143,13 @@ final class DeduplicateFlyersCommand extends Command
             $primary = $flyers->first();
             $dups = $flyers->slice(1);
 
-            $this->line(" - مجموعة مكررة: retailer {$g->retailer_id} {$g->valid_from} → {$g->valid_until} — الأساسي #{$primary->id} ({$primary->slug}), مكررات: " . $dups->pluck('id')->implode(','));
+            $this->line(" - مجموعة مكررة: retailer {$g->retailer_id} {$g->valid_from} → {$g->valid_until} — الأساسي #{$primary->id} ({$primary->slug}), مكررات: ".$dups->pluck('id')->implode(','));
 
             if ($dryRun) {
                 // Dry-run: estimate only (unique image_path + unique items)
                 $existingPaths = $primary->pages()->pluck('image_path')->filter()->map(fn ($p) => trim((string) $p))->all();
                 $existingPaths = array_unique($existingPaths);
-                $existingKeys = $primary->items()->get()->map(fn ($i) => mb_strtolower(trim((string) $i->product_name)) . '|' . number_format((float) $i->sale_price, 2, '.', ''))->flip()->all();
+                $existingKeys = $primary->items()->get()->map(fn ($i) => mb_strtolower(trim((string) $i->product_name)).'|'.number_format((float) $i->sale_price, 2, '.', ''))->flip()->all();
                 foreach ($dups as $dup) {
                     foreach ($dup->pages()->get() as $page) {
                         $path = trim((string) $page->image_path);
@@ -156,7 +160,7 @@ final class DeduplicateFlyersCommand extends Command
                         $pagesMoved++;
                     }
                     foreach ($dup->items()->get() as $item) {
-                        $key = mb_strtolower(trim((string) $item->product_name)) . '|' . number_format((float) $item->sale_price, 2, '.', '');
+                        $key = mb_strtolower(trim((string) $item->product_name)).'|'.number_format((float) $item->sale_price, 2, '.', '');
                         if (isset($existingKeys[$key])) {
                             continue;
                         }
@@ -170,14 +174,14 @@ final class DeduplicateFlyersCommand extends Command
                 continue;
             }
 
-            DB::transaction(function () use ($primary, $dups, &$pagesMoved, &$itemsMoved, &$flyersDeleted, &$flyersMerged): void {
+            DB::transaction(function () use ($primary, $dups, &$pagesMoved, &$itemsMoved, &$flyersDeleted, &$flyersMerged, &$touchedFlyerIds): void {
                 $primaryFresh = Flyer::findOrFail($primary->id);
 
                 $existingPaths = $primaryFresh->pages()->pluck('image_path')->filter()->map(fn ($p) => trim((string) $p))->all();
                 $existingPaths = array_values(array_unique($existingPaths));
 
                 $existingKeys = $primaryFresh->items()->get()
-                    ->map(fn ($i) => mb_strtolower(trim((string) $i->product_name)) . '|' . number_format((float) $i->sale_price, 2, '.', ''))
+                    ->map(fn ($i) => mb_strtolower(trim((string) $i->product_name)).'|'.number_format((float) $i->sale_price, 2, '.', ''))
                     ->flip()->all();
 
                 // Next free page_number avoids UNIQUE(flyer_id, page_number) collision
@@ -216,7 +220,7 @@ final class DeduplicateFlyersCommand extends Command
                     // 2) Move unique items BEFORE deleting dup (else cascade deletes them)
                     $items = $dupFresh->items()->orderBy('id')->get();
                     foreach ($items as $item) {
-                        $key = mb_strtolower(trim((string) $item->product_name)) . '|' . number_format((float) $item->sale_price, 2, '.', '');
+                        $key = mb_strtolower(trim((string) $item->product_name)).'|'.number_format((float) $item->sale_price, 2, '.', '');
                         if (isset($existingKeys[$key])) {
                             // Duplicate of primary — leave for cascade delete
                             continue;
@@ -236,6 +240,13 @@ final class DeduplicateFlyersCommand extends Command
                         $itemsMoved++;
                     }
 
+                    // 2) Re-link raw posts BEFORE the dup shell disappears —
+                    // the ingest audit trail (RawFacebookPost.flyer_id) must
+                    // survive the dedup or the Gatekeeper merge history is lost.
+                    DB::table('raw_facebook_posts')
+                        ->where('flyer_id', $dupFresh->id)
+                        ->update(['flyer_id' => $primaryFresh->id, 'updated_at' => now()]);
+
                     // 3) Delete dup shell WITHOUT firing Eloquent observers.
                     // Skipped pages share image_path with the PRIMARY flyer — an
                     // Eloquent delete would fire FlyerObserver::deleted → bulk R2
@@ -247,6 +258,10 @@ final class DeduplicateFlyersCommand extends Command
                     DB::table('flyer_pages')->where('flyer_id', $dupFresh->id)->delete();
                     DB::table('flyers')->where('id', $dupFresh->id)->delete();
                     $flyersDeleted++;
+
+                    // Primary content changed (pages/items moved in) — mark it
+                    // so Steps 5+6 refresh its BLUF/editorial and purge CDN.
+                    $touchedFlyerIds[(int) $primaryFresh->id] = true;
                 }
 
                 // 4) Resequence pages 1..N (UNIQUE-safe, see resequencePages())
@@ -286,18 +301,58 @@ final class DeduplicateFlyersCommand extends Command
                     continue;
                 }
 
-                $this->line(" - مجلة متضخمة #{$flyer->id} ({$flyer->slug}): {$pages->count()} صفحة → " . ($pages->count() - count($dupMap)) . ' فريدة');
+                $this->line(" - مجلة متضخمة #{$flyer->id} ({$flyer->slug}): {$pages->count()} صفحة → ".($pages->count() - count($dupMap)).' فريدة');
 
                 if (! $dryRun) {
-                    DB::transaction(function () use ($flyer, $dupMap): void {
+                    /** @var array<string, true> $orphanCandidates image paths of deleted dup pages (may still be referenced elsewhere) */
+                    $orphanCandidates = [];
+
+                    DB::transaction(function () use ($flyer, $dupMap, &$orphanCandidates): void {
                         foreach ($dupMap as $dupId => $keptId) {
                             // Relink items to the surviving copy before deleting the page
                             FlyerItem::where('flyer_page_id', $dupId)->update(['flyer_page_id' => $keptId]);
+
+                            $dupPath = trim((string) (DB::table('flyer_pages')->where('id', $dupId)->value('image_path') ?? ''));
                             FlyerPage::where('id', $dupId)->delete();
+
+                            if ($dupPath !== '') {
+                                $orphanCandidates[$dupPath] = true;
+                            }
                         }
 
                         $this->resequencePages((int) $flyer->id);
                     });
+
+                    // After commit: reap R2 objects NO surviving page references
+                    // anymore. Candidates sharing their path with the kept page
+                    // (or any other page) fail the exists check and stay. Async
+                    // queued closure — never sync network I/O in this process.
+                    if ($orphanCandidates !== []) {
+                        $candidatePaths = array_keys($orphanCandidates);
+
+                        dispatch(static function () use ($candidatePaths): void {
+                            try {
+                                $surviving = FlyerPage::query()
+                                    ->whereIn('image_path', $candidatePaths)
+                                    ->pluck('image_path')
+                                    ->map(fn ($p) => trim((string) $p))
+                                    ->all();
+
+                                $orphans = array_values(array_diff($candidatePaths, $surviving));
+
+                                if ($orphans !== []) {
+                                    Storage::disk('r2')->delete($orphans);
+                                    Log::info('Deduplicate: reaped orphaned R2 page images.', [
+                                        'count' => count($orphans),
+                                    ]);
+                                }
+                            } catch (Throwable $e) {
+                                Log::warning('Deduplicate: orphaned R2 image delete failed.', [
+                                    'error' => $e->getMessage(),
+                                ]);
+                            }
+                        })->afterCommit();
+                    }
                 }
 
                 $pagesCompressed += count($dupMap);
@@ -321,7 +376,7 @@ final class DeduplicateFlyersCommand extends Command
                             $item->update(['normalized_name' => $norm]);
                         }
                     }
-                    $key = mb_strtolower($norm) . '|' . number_format((float) $item->sale_price, 2, '.', '');
+                    $key = mb_strtolower($norm).'|'.number_format((float) $item->sale_price, 2, '.', '');
                     if (isset($seen[$key])) {
                         if (! $dryRun) {
                             $item->delete();
@@ -349,7 +404,12 @@ final class DeduplicateFlyersCommand extends Command
                 if ($f === null) {
                     continue;
                 }
-                $f->update(['bluf_summary' => null, 'editorial_overview' => null]);
+                $f->bluf_summary = null;
+                $f->editorial_overview = null;
+                // saveQuietly: Step 6 is the single batched Cloudflare purge
+                // authority — a normal save() would fire FlyerObserver::saved
+                // and dispatch a second per-flyer purge (double purge).
+                $f->saveQuietly();
                 $blufRegenerated++;
             }
             $this->info(" → تم تجديد {$blufRegenerated} ملخص");
@@ -357,15 +417,58 @@ final class DeduplicateFlyersCommand extends Command
             $this->info($dryRun ? '5) [Dry Run] سيتم تجديد ملخصات BLUF للمجلات المنظفة.' : '5) لا توجد مجلات تحتاج تجديد ملخصات.');
         }
 
-        // 6. Flush & Invalidate Caches
+        // 6. Targeted cache invalidation + canonical CDN purge.
         if (! $dryRun) {
-            Cache::flush();
+            // NEVER Cache::flush() on a live box: it would wipe Cache::lock
+            // ingest mutexes (Gatekeeper) and rate-limiter counters mid-flight.
             Cache::forget('sitemap_xml_content');
             Cache::forget('llms_txt_content');
-            PurgeCloudflareCacheJob::dispatch([url('/'), url('/sitemap.xml'), url('/llms.txt')]);
-            $this->info(' → تم تفريغ Cache وإرسال PurgeCloudflareCacheJob للصفحة الرئيسية و sitemap و llms.txt');
+            Cache::forget('layout:header_retailers');
+
+            // Purge canonical URLs (config('app.url') — never request-bound
+            // url('/')): affected flyers, their retailer hubs, and the shared
+            // artifacts. Chunked at 30 per Cloudflare free-plan purge call.
+            $base = rtrim((string) config('app.url'), '/');
+            $purgeUrls = [
+                $base.'/',
+                $base.'/sitemap.xml',
+                $base.'/llms.txt',
+            ];
+
+            $affectedFlyerIds = array_map(intval(...), array_keys($touchedFlyerIds));
+
+            foreach (array_chunk($affectedFlyerIds, 500) as $idChunk) {
+                Flyer::query()
+                    ->with('retailer:id,slug')
+                    ->whereIn('id', $idChunk)
+                    ->get(['id', 'slug', 'status', 'retailer_id'])
+                    ->each(function (Flyer $f) use ($base, &$purgeUrls): void {
+                        if ($f->status === FlyerStatus::Published && (string) $f->slug !== '') {
+                            $purgeUrls[] = $base.route('flyers.show', ['slug' => (string) $f->slug], false);
+                        }
+
+                        $retailerSlug = $f->retailer?->slug;
+
+                        if (is_string($retailerSlug) && $retailerSlug !== '') {
+                            $purgeUrls[] = $base.route('retailers.show', ['retailer' => $retailerSlug], false);
+                        }
+                    });
+            }
+
+            foreach (array_chunk(array_values(array_unique(array_filter(array_map('trim', $purgeUrls)))), 30) as $chunkIndex => $chunk) {
+                try {
+                    PurgeCloudflareCacheJob::dispatch($chunk);
+                } catch (Throwable $e) {
+                    Log::warning('Deduplicate: failed to dispatch purge chunk.', [
+                        'chunk' => $chunkIndex,
+                        'error' => $e->getMessage(),
+                    ]);
+                }
+            }
+
+            $this->info(' → تم إبطال كاش sitemap/llms/header فقط (بدون Cache::flush) وإرسال purge للصفحات المتأثرة');
         } else {
-            $this->info(' → [Dry Run] سيتم تفريغ Cache وإرسال Purge لـ /, /sitemap.xml, /llms.txt');
+            $this->info(' → [Dry Run] سيتم إبطال كاش sitemap/llms/header وإرسال purge للصفحات المتأثرة');
         }
 
         $this->info('--- ملخص ---');
@@ -425,7 +528,7 @@ final class DeduplicateFlyersCommand extends Command
             $bindings[] = $flyerId;
 
             DB::update(
-                'UPDATE flyer_pages SET page_number = CASE ' . implode(' ', $cases) . ' ELSE page_number END, updated_at = ? WHERE flyer_id = ?',
+                'UPDATE flyer_pages SET page_number = CASE '.implode(' ', $cases).' ELSE page_number END, updated_at = ? WHERE flyer_id = ?',
                 $bindings
             );
         }
@@ -453,11 +556,11 @@ final class DeduplicateFlyersCommand extends Command
             $identities = FlyerItem::where('flyer_page_id', $pageId)
                 ->orderBy('id')
                 ->get(['normalized_name', 'sale_price'])
-                ->map(fn ($i): string => mb_strtolower(trim((string) $i->normalized_name)) . '|' . number_format((float) $i->sale_price, 2, '.', ''))
+                ->map(fn ($i): string => mb_strtolower(trim((string) $i->normalized_name)).'|'.number_format((float) $i->sale_price, 2, '.', ''))
                 ->all();
 
             if ($identities !== []) {
-                return 'items:' . md5(implode(';', $identities));
+                return 'items:'.md5(implode(';', $identities));
             }
         } catch (\Throwable $e) {
             Log::debug('Deduplicate: item identity lookup failed, falling back to path.', [
@@ -468,17 +571,18 @@ final class DeduplicateFlyersCommand extends Command
 
         $path = trim($imagePath);
         if ($path !== '') {
-            return 'path:' . $path;
+            return 'path:'.$path;
         }
 
-        return 'keep-' . $pageId;
+        return 'keep-'.$pageId;
     }
 
     /**
      * Canonical grouping key: bim/bimmisr/bim-egypt → bim,
      * kazyon/kazyonegypt → kazyon, carrefour/carrefouregypt → carrefour,
      * «بيم مصر» → «بيم».
-     */    private static function canonicalRetailerKey(Retailer $retailer): string
+     */
+    private static function canonicalRetailerKey(Retailer $retailer): string
     {
         $slug = mb_strtolower(trim((string) $retailer->slug));
         $key = $slug !== '' ? $slug : mb_strtolower(trim((string) $retailer->name));

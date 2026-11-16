@@ -5,7 +5,8 @@
     'ogDescription' => null,
     'ogImage' => null,
     'ogType' => 'website',
-    'robots' => 'index, follow, max-image-size:large, max-snippet:-1, max-video-preview:-1',
+    'robots' => 'index, follow, max-image-preview:large, max-snippet:-1, max-video-preview:-1',
+    'canonical' => null,
 ])
 
 <!DOCTYPE html>
@@ -20,20 +21,36 @@
 
     @php
         $siteName = config('app.name', 'مجلاتنا');
-        $canonicalUrl = url()->current();
+        // Canonical STRICTLY from config('app.url') + the request PATH — never
+        // url()->current()/fullUrl(), which leak the request host (admin host,
+        // CLI, www, proxies) into the canonical and poison SEO.
+        $baseUrl = rtrim((string) config('app.url'), '/');
+        $canonicalUrl = $canonical ?? ($baseUrl.request()->getPathInfo());
         $r2Url = (string) config('filesystems.disks.r2.url');
         $r2Host = parse_url($r2Url, PHP_URL_HOST);
     @endphp
 
     <title>{{ $metaTitle ? $metaTitle . ' | ' . $siteName : $siteName . ' | مجلات وعروض السوبرماركت في مصر اليوم' }}</title>
     <meta name="description" content="{{ $metaDescription ?? 'تصفح أحدث مجلات وعروض كارفور، كازيون، بيم، هايبر وان، وفتح الله اليوم في مصر. قارن أسعار السلع قبل الشراء ووفر ميزانيتك.' }}">
-    @if(request()->has('q') || request()->has('page'))
+    @php
+        // noindex when the page itself opted out OR any filter/pagination
+        // parameter is present — filtered duplicates must never be indexed.
+        $isNoindex = $robots === 'noindex, follow'
+            || request()->filled('q')
+            || request()->filled('retailer')
+            || request()->filled('type')
+            || (int) request('page', 1) > 1;
+    @endphp
+    @if ($isNoindex)
+        {{-- Filtered/paginated views are crawled (so Googlebot can SEE the
+        noindex) but never indexed. --}}
         <meta name="robots" content="noindex, follow">
-        <link rel="canonical" href="{{ request()->fullUrl() }}">
     @else
-        <meta name="robots" content="{{ $robots ?? 'index, follow, max-image-size:large, max-snippet:-1, max-video-preview:-1' }}">
-        <link rel="canonical" href="{{ $canonicalUrl ?? url()->current() }}">
+        <meta name="robots" content="{{ $robots }}">
     @endif
+    {{-- Canonical ALWAYS the clean controller-provided URL (defaults to
+    config host + request PATH) — filter query strings must never leak in. --}}
+    <link rel="canonical" href="{{ $canonicalUrl }}">
 
     <link rel="preload" href="/fonts/readex-pro.woff2" as="font" type="font/woff2" crossorigin>
 
@@ -63,9 +80,10 @@
             '@context' => 'https://schema.org',
             '@type' => 'Organization',
             'name' => $siteName,
-            'url' => url('/'),
-            'logo' => url('/favicon.svg'),
+            'url' => $baseUrl.'/',
+            'logo' => $baseUrl.'/favicon.svg',
             'areaServed' => 'EG',
+            'sameAs' => array_values(array_filter((array) config('app.social_links', []))),
             'knowsAbout' => [
                 'عروض كارفور مصر',
                 'تخفيضات كازيون',
@@ -75,7 +93,7 @@
         ];
     @endphp
     @if (! request()->routeIs('flyers.show') && ! request()->routeIs('home') && ! request()->routeIs('retailers.show'))
-        <script type="application/ld+json">{!! json_encode($organizationSchema, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) !!}</script>
+        <script type="application/ld+json">{!! json_encode($organizationSchema, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE) !!}</script>
     @endif
 
     @vite(['resources/css/app.css', 'resources/js/app.js'])
@@ -205,7 +223,7 @@
                     @foreach ($headerRetailers as $navRet)
                         <a href="{{ route('retailers.show', $navRet->slug) }}" class="flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-bold text-[#023b55] hover:bg-slate-50 hover:text-[#039652] transition">
                             @if ($navRet->logo_path)
-                                <img src="{{ \App\Support\R2Url::asset($navRet->logo_path) }}" alt="{{ $navRet->name }}" class="h-6 w-6 rounded-full object-contain border border-slate-200 bg-white">
+                                <img src="{{ \App\Support\R2Url::asset($navRet->logo_path) }}" alt="{{ $navRet->name }}" width="24" height="24" class="h-6 w-6 rounded-full object-contain border border-slate-200 bg-white">
                             @else
                                 <span class="flex h-6 w-6 items-center justify-center rounded-full bg-[#023b55] text-[10px] font-black text-white">{{ mb_substr($navRet->name,0,1) }}</span>
                             @endif

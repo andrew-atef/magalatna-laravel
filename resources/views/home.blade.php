@@ -1,10 +1,17 @@
 @php
     use App\Support\R2Url;
-    $siteName = config('app.name', 'عروض نت');
+    $siteName = config('app.name', 'مجلاتنا');
     $searchQuery = $searchQuery ?? request('q', '');
     $selectedRetailerSlug = request('retailer');
     $r2DiskUrl = R2Url::base();
-    $robotsMeta = request()->filled('q') || request()->has('page') ? 'noindex, follow' : 'index, follow, max-image-size:large, max-snippet:-1, max-video-preview:-1';
+    // max-image-preview:large (NOT "max-image-size" — that directive is invalid).
+    // Filtered/paginated combos are noindex,follow so Googlebot can crawl and
+    // see the directive while the clean hub stays indexable.
+    $robotsMeta = request()->filled('q') || request()->filled('retailer') || request()->filled('type') || (int) request('page', 1) > 1
+        ? 'noindex, follow'
+        : 'index, follow, max-image-preview:large, max-snippet:-1, max-video-preview:-1';
+    $baseUrl = rtrim((string) config('app.url'), '/');
+    $homeUrl = $baseUrl.'/';
 @endphp
 
 <x-layouts.app
@@ -14,14 +21,14 @@
 >
     @push('schema')
         @php
-            $homeOrganizationId = url('/') . '#organization';
-            $homeWebsiteId = url('/') . '#website';
+            $homeOrganizationId = $homeUrl . '#organization';
+            $homeWebsiteId = $homeUrl . '#website';
             $homeGraph = [
                 [
                     '@type' => 'Organization',
                     '@id' => $homeOrganizationId,
                     'name' => $siteName,
-                    'url' => url('/'),
+                    'url' => $homeUrl,
                     'logo' => [
                         '@type' => 'ImageObject',
                         'url' => url('/favicon.svg'),
@@ -40,13 +47,15 @@
                     '@type' => 'WebSite',
                     '@id' => $homeWebsiteId,
                     'name' => $siteName,
-                    'url' => url('/'),
+                    'url' => $homeUrl,
                     'publisher' => ['@id' => $homeOrganizationId],
+                    'sameAs' => array_values(array_filter((array) config('app.social_links', []))),
                     'potentialAction' => [
                         '@type' => 'SearchAction',
                         'target' => [
                             '@type' => 'EntryPoint',
-                            'urlTemplate' => url('/') . '/?q={search_term_string}',
+                            // rtrim() kills the double-slash bug ("...com/?q=..." not "...com//?q=...")
+                            'urlTemplate' => $homeUrl . '?q={search_term_string}',
                         ],
                         'query-input' => 'required name=search_term_string',
                     ],
@@ -57,7 +66,7 @@
                 '@graph' => $homeGraph,
             ];
         @endphp
-        <script type="application/ld+json">{!! json_encode($homeUnified, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) !!}</script>
+        <script type="application/ld+json">{!! json_encode($homeUnified, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE) !!}</script>
     @endpush
 
     <!-- Header Hero & Stores Filter Carousel - Navy structure -->
@@ -83,7 +92,7 @@
                     class="inline-flex shrink-0 items-center gap-2 rounded-full border px-3.5 py-1.5 text-xs font-bold transition border-slate-200 bg-white text-[#023b55] hover:border-[#039652]/30 hover:bg-slate-50"
                 >
                     @if ($ret->logo_path)
-                        <img src="{{ R2Url::asset($ret->logo_path) }}" alt="{{ $ret->name }}" class="h-4 w-4 rounded-full object-contain">
+                        <img src="{{ R2Url::asset($ret->logo_path) }}" alt="{{ $ret->name }}" width="16" height="16" class="h-4 w-4 rounded-full object-contain">
                     @endif
                     <span>{{ $ret->name }}</span>
                 </a>
@@ -166,7 +175,7 @@
         <div class="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4">
             @forelse ($flyers as $flyer)
                 @php
-                    $coverPage = $flyer->pages->first();
+                    $coverPage = $flyer->coverPage;
                     $coverUrl = $coverPage ? R2Url::asset($coverPage->image_path) : '/img/placeholder-flyer.png';
                 @endphp
                 <article class="group flex flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm transition hover:shadow-md">
@@ -176,11 +185,12 @@
                             alt="{{ $flyer->title }}"
                             width="600"
                             height="800"
-                            loading="lazy"
+                            {{-- LCP: ONLY the first above-the-fold cover is eager+high priority; the rest lazy-load. --}}
+                            @if ($loop->first) loading="eager" fetchpriority="high" decoding="async" @else loading="lazy" decoding="async" @endif
                             class="h-full w-full object-cover transition duration-300 group-hover:scale-105"
                         >
                         <span class="absolute right-2 top-2 rounded-lg bg-slate-900/80 px-2 py-1 text-[11px] font-bold text-white backdrop-blur">
-                            {{ $flyer->total_pages }} صفحة
+                            {{ $flyer->pages_count ?? $flyer->total_pages }} صفحة
                         </span>
                     </a>
 

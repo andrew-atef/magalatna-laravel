@@ -7,8 +7,10 @@ namespace App\Console\Commands;
 use App\Jobs\GatekeeperFacebookPostJob;
 use App\Models\RawFacebookPost;
 use App\Models\Retailer;
+use App\Support\FacebookMediaHelper;
 use Carbon\Carbon;
 use Illuminate\Console\Command;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
 use Symfony\Component\Process\Process;
 use Throwable;
@@ -39,8 +41,41 @@ final class DirectFacebookPhotosIngestCommand extends Command
         return 'curl_chrome116';
     }
 
+    /**
+     * Fail fast: a missing curl-impersonate binary means every store in the
+     * loop would burn fetch cycles producing identical no-content results.
+     * Verify ONCE at command start, never per retailer.
+     */
+    private function curlBinaryAvailable(): bool
+    {
+        $resolved = $this->curlImpersonateBinary();
+
+        if ($resolved !== 'curl_chrome116') {
+            return true;
+        }
+
+        // Bare name — confirm it actually exists on PATH.
+        try {
+            $check = new Process(['bash', '-lc', 'command -v curl_chrome116 >/dev/null 2>&1']);
+            $check->setTimeout(5);
+            $check->run();
+
+            return $check->isSuccessful();
+        } catch (Throwable) {
+            return false;
+        }
+    }
+
     public function handle(): int
     {
+        if (! $this->curlBinaryAvailable()) {
+            $this->error('curl-impersonate binary (curl_chrome116) not found or not executable. Install it at /usr/local/bin/curl_chrome116 or expose it on PATH.');
+
+            $this->safeLog('error', '[DIRECT_INGEST] curl-impersonate binary missing — aborting ingest run.');
+
+            return self::FAILURE;
+        }
+
         $dryRun = (bool) $this->option('dry-run');
         $store = trim((string) ($this->option('store') ?? ''));
         $force = (bool) $this->option('force');
@@ -71,8 +106,18 @@ final class DirectFacebookPhotosIngestCommand extends Command
                     'error' => $e->getMessage(),
                 ]);
                 $this->error("Ingest failed [{$retailer->slug}]: {$e->getMessage()}");
+            } finally {
+                // Telemetry MUST run while $status/$images are still alive —
+                // this runs before the unset below, on both success and
+                // failure paths.
+                $this->logTelemetry($retailer->slug, $status, $images);
+
+                // Raw Facebook HTML routinely runs multiple MB per fetch —
+                // force a collection cycle between stores so the CLI process
+                // never accumulates three store payloads at once.
+                unset($status, $images);
+                gc_collect_cycles();
             }
-            $this->logTelemetry($retailer->slug, $status, $images);
         }
 
         return self::SUCCESS;
@@ -134,13 +179,14 @@ final class DirectFacebookPhotosIngestCommand extends Command
             return ['status' => 'no-content', 'images' => 0];
         }
 
-        // KV / Database gate (Tier 1 radar dedup): LIKE match catches stored
-        // id variants (bare fbid vs pfbid-wrapped rows). Seen id + no --force
-        // means up-to-date — zero extra fetches. --force
-        // bypasses the gate for manual re-harvests.
-        $like = '%' . addcslashes($postId, '\\%_') . '%';
+        // KV / Database gate (Tier 1 radar dedup): exact facebook_post_id match
+        // first, then a containment check with SQLite ESCAPE '\' semantics.
+        // Seen id + no --force means up-to-date — zero extra fetches.
+        // --force bypasses the gate for manual re-harvests.
+        $escaped = addcslashes($postId, '\\%_');
         $alreadyExists = RawFacebookPost::where('retailer_id', $retailer->id)
-            ->where('facebook_post_id', 'like', $like)
+            ->where(fn ($q) => $q->where('facebook_post_id', $postId)
+                ->orWhereRaw("facebook_post_id LIKE ? ESCAPE '\\'", ['%'.$escaped.'%']))
             ->exists();
 
         if ($alreadyExists && ! $force) {
@@ -160,7 +206,7 @@ final class DirectFacebookPhotosIngestCommand extends Command
                 [[
                     $retailer->slug,
                     $postId,
-                    $preview !== null ? count($preview['images']) . ' imgs (direct parse)' : '0 imgs',
+                    $preview !== null ? count($preview['images']).' imgs (direct parse)' : '0 imgs',
                     mb_substr($preview !== null && $preview['caption'] !== '' ? $preview['caption'] : "عروض {$retailer->name} الجديدة", 0, 60),
                     ($preview !== null ? $preview['published_at'] : Carbon::now('UTC'))->format('Y-m-d H:i'),
                 ]]
@@ -179,7 +225,18 @@ final class DirectFacebookPhotosIngestCommand extends Command
             return ['status' => 'no-content', 'images' => 0];
         }
 
-        $rawPost = $this->persistPost($retailer, $postId, $payload['caption'], $payload['images'], $payload['published_at'], null);
+        // --force fix: re-harvest must UPDATE the existing row, not insert a
+        // duplicate that crashes on UNIQUE(retailer_id, facebook_post_id).
+        // Variant post ids (same story nested inside a longer id) must match
+        // too — the exact+LIKE(ESCAPE '\') criteria mirrors $alreadyExists;
+        // exact matches win when both rows exist.
+        $existing = RawFacebookPost::where('retailer_id', $retailer->id)
+            ->where(fn ($q) => $q->where('facebook_post_id', $postId)
+                ->orWhereRaw("facebook_post_id LIKE ? ESCAPE '\\'", ['%'.$escaped.'%']))
+            ->orderByRaw('facebook_post_id = ? DESC', [$postId])
+            ->first();
+
+        $rawPost = $this->persistPost($retailer, $postId, $payload['caption'], $payload['images'], $payload['published_at'], $existing);
         $this->dispatchGatekeeper($retailer, $rawPost, $postId, $payload['caption'], $payload['images'], $payload['published_at']);
 
         return ['status' => 'harvested', 'images' => count($payload['images'])];
@@ -191,14 +248,28 @@ final class DirectFacebookPhotosIngestCommand extends Command
     private function logTelemetry(string $retailerSlug, string $status, int $images): void
     {
         $line = sprintf(
-            '[INGEST_SUMMARY] Retailer: %s | Status: %s | Images: %d | Memory: %.2f MB' . PHP_EOL,
+            '[INGEST_SUMMARY] Retailer: %s | Status: %s | Images: %d | Memory: %.2f MB'.PHP_EOL,
             $retailerSlug,
             $status,
             $images,
             round(memory_get_usage(true) / 1024 / 1024, 2)
         );
 
-        file_put_contents(storage_path('logs/facebook_direct_ingest.log'), $line, FILE_APPEND | LOCK_EX);
+        try {
+            $path = storage_path('logs/facebook_direct_ingest.log');
+
+            // Bounded disk: rotate >1MB to a single .old generation (overwrite)
+            // instead of letting the append-only log grow unbounded on the VPS.
+            if (is_file($path) && (int) filesize($path) > 1_000_000) {
+                @rename($path, $path.'.old');
+            }
+
+            file_put_contents($path, $line, FILE_APPEND | LOCK_EX);
+        } catch (Throwable $e) {
+            $this->safeLog('warning', '[INGEST_SUMMARY] Failed to write telemetry.', [
+                'error' => $e->getMessage(),
+            ]);
+        }
     }
 
     /**
@@ -223,8 +294,8 @@ final class DirectFacebookPhotosIngestCommand extends Command
         }
         $this->line('  ├── [TRACE] Pattern 2 (Story URL pfbid): NO_MATCH');
         $fallback = $this->extractPostId($html);
-        $this->line('  ├── [TRACE] Pattern 3 (fbid in query/script): ' . ($fallback !== null ? "Match: {$fallback}" : 'NO_MATCH'));
-        $this->line('  └── [TRACE] RESOLVED_AS: ' . ($fallback ?? 'NULL'));
+        $this->line('  ├── [TRACE] Pattern 3 (fbid in query/script): '.($fallback !== null ? "Match: {$fallback}" : 'NO_MATCH'));
+        $this->line('  └── [TRACE] RESOLVED_AS: '.($fallback ?? 'NULL'));
         $this->safeLog('debug', '[TRACE] Post ID resolution finished.', ['post_id' => $fallback]);
 
         return $fallback;
@@ -251,136 +322,95 @@ final class DirectFacebookPhotosIngestCommand extends Command
         $excludedIds = $this->systemPhotoIds($html);
         $excludedSignatures = $this->systemPhotoSignatures($html);
 
-        // Story path.
+        // Story path. Split the timeline into full story chunks ONCE — large
+        // multi-image catalogs exceed 150KB, so chunks must NEVER be truncated:
+        // each chunk runs to the next story node (or end of HTML for the last).
+        $chunks = [];
+
         if (preg_match_all('/\{"node":\{"__typename":"Story"/', $html, $m, PREG_OFFSET_CAPTURE)) {
             $offsets = array_column($m[0], 1);
             $offsets[] = strlen($html);
-            foreach ($offsets as $i => $offset) {
-                if ($i >= count($m[0])) {
-                    break;
-                }
-                // Full story boundary: large multi-image catalogs exceed 150KB,
-                // so the chunk must NEVER be truncated — scan to the next
-                // story node (or end of HTML for the last story).
-                $chunk = substr($html, $offset, max(0, $offsets[$i + 1] - $offset));
-                if (! str_contains($chunk, '"' . $postId . '"')) {
-                    continue;
-                }
-                // Primary: Relay JSON message body (unclipped full caption).
-                $caption = '';
-                if (preg_match('/"message":\s*\{\s*"text":\s*"((?:[^"\\\\]|\\\\.)*)"/u', $chunk, $cm)) {
-                    $decoded = json_decode('"' . $cm[1] . '"', true);
-                    if (is_string($decoded) && trim($decoded) !== '') {
-                        $caption = trim($decoded);
-                    }
-                }
-                // Secondary: aggregated accessibility captions (image
-                // descriptions), skipping reaction counters and placeholders.
-                if ($caption === '' && preg_match_all('/"accessibility_caption":\s*"((?:[^"\\\\]|\\\\.)*)"/u', $chunk, $am)) {
-                    $parts = [];
-                    foreach (array_unique($am[1]) as $raw) {
-                        $decoded = json_decode('"' . $raw . '"', true);
-                        $text = trim((string) ($decoded !== null ? $decoded : $raw));
-                        if ($text !== '' && ! str_contains($text, 'likes') && ! str_contains($text, 'May be an image')) {
-                            $parts[] = $text;
-                        }
-                    }
-                    $caption = trim(implode("\n", $parts));
-                }
-                // Tertiary: neutral fallback (never raw \uXXXX escapes).
-                if ($caption === '') {
-                    $caption = "عروض {$retailer->name} الجديدة";
-                }
-                // Primary media: EVERY scontent uri in the story unit —
-                // viewer_image covers plus all subattachment originals.
-                $rawImages = [];
-                if (preg_match_all('/"uri":\s*"((?:[^"\\\\]|\\\\.)*scontent(?:[^"\\\\]|\\\\.)*)"/i', $chunk, $im)) {
-                    foreach ($im[1] as $raw) {
-                        $rawImages[] = str_replace('\\/', '/', trim($raw));
-                    }
-                }
-                // Broad master-asset sweep (UNCONDITIONAL): story viewer_image
-                // often exposes only the preview collage while the remaining
-                // catalog pages ship as high-res t39 master assets further
-                // down the same story block. Never settle for a solitary page
-                // when masters exist — no count gate.
-                foreach ($this->extractStoryMasterImages($chunk) as $master) {
-                    $rawImages[] = $master;
-                }
-                // Deep album set fetcher: Meta throttles the timeline SSR to
-                // a ~5-photo preview collage; the remaining catalog pages hide
-                // behind the album/media set id (set=a.XXX / set=pcb.XXX).
-                // When the story yields fewer than 25 UNIQUE photos (by
-                // immutable signature), fetch the dedicated album page via
-                // WARP (plus its type=3 grid variant, which SSR-renders a
-                // different slice) and merge master assets.
-                if ($this->countUniqueSignatures($rawImages) < 25
-                    && preg_match('#[?&]set=(a\.\d+|pcb\.\d+)#i', $chunk, $setMatch)) {
-                    $albumUrls = [
-                        'https://www.facebook.com/media/set/?set=' . $setMatch[1],
-                        'https://www.facebook.com/media/set/?set=' . $setMatch[1] . '&type=3',
-                    ];
-                    foreach ($albumUrls as $albumUrl) {
-                        $albumHtml = $this->fetchViaCurlImpersonate($albumUrl);
-                        if ($albumHtml !== null && trim($albumHtml) !== '') {
-                            foreach ($this->extractStoryMasterImages($albumHtml) as $master) {
-                                $rawImages[] = $master;
-                            }
-                        }
-                        if ($this->countUniqueSignatures($rawImages) >= 25) {
-                            break;
-                        }
-                    }
-                }
-                // Cover shield: discard immediately any rendition carrying a
-                // system photo id (page cover / profile photo). Strict
-                // substring match on the immutable numeric id.
-                if ($excludedIds !== []) {
-                    $filtered = [];
-                    foreach ($rawImages as $candidate) {
-                        $blocked = false;
-                        foreach ($excludedIds as $excludedId => $_) {
-                            if ($excludedId !== '' && str_contains($candidate, (string) $excludedId)) {
-                                $blocked = true;
+            $storyCount = count($m[0]);
 
-                                break;
-                            }
-                        }
-                        if (! $blocked) {
-                            $filtered[] = $candidate;
-                        }
-                    }
-                    $rawImages = $filtered;
-                }
-                // Cover-signature shield: the cover fbid never appears in its
-                // CDN URL, so drop any rendition whose immutable photo
-                // signature matches the page cover / profile display image.
-                if ($excludedSignatures !== []) {
-                    $rawImages = array_values(array_filter(
-                        $rawImages,
-                        static fn ($candidate): bool => ! isset($excludedSignatures[\App\Support\FacebookMediaHelper::extractPhotoSignature((string) $candidate)])
-                    ));
-                }
-                $images = $this->purifyImageUrls($rawImages, self::MAX_IMAGES);
-                if ($images === []) {
-                    continue;
-                }
-                $publishedAt = Carbon::now('UTC');
-                if (preg_match('/"creation_time":(\d{10})/', $chunk, $tm)) {
-                    try {
-                        $publishedAt = Carbon::createFromTimestampUTC((int) $tm[1]);
-                    } catch (Throwable $e) {
-                        $publishedAt = Carbon::now('UTC');
-                    }
-                }
-
-                return [
-                    'caption' => mb_substr($caption !== '' ? $caption : "عروض {$retailer->name} الجديدة", 0, 10000),
-                    'images' => $images,
-                    'published_at' => $publishedAt,
-                ];
+            for ($i = 0; $i < $storyCount; $i++) {
+                $chunks[] = substr($html, (int) $offsets[$i], max(0, (int) $offsets[$i + 1] - (int) $offsets[$i]));
             }
         }
+
+        // Pass 1: only story chunks carrying the detected post id, in order.
+        $triedIndexes = [];
+
+        foreach ($chunks as $index => $chunk) {
+            if (! str_contains($chunk, '"'.$postId.'"')) {
+                continue;
+            }
+            $triedIndexes[$index] = true;
+
+            $payload = $this->parseStoryChunk($retailer, $chunk, $excludedIds, $excludedSignatures);
+
+            if ($payload !== null) {
+                unset($chunks);
+
+                return $payload;
+            }
+        }
+
+        // Pass 2 — STORY FALLBACK: the newest Story may be video/text-only
+        // (zero usable flyer images). Walk the remaining story nodes in order
+        // and harvest the first one with usable images instead of aborting
+        // the whole store as "no-content".
+        foreach ($chunks as $index => $chunk) {
+            if (isset($triedIndexes[$index])) {
+                continue;
+            }
+
+            $payload = $this->parseStoryChunk($retailer, $chunk, $excludedIds, $excludedSignatures);
+
+            if ($payload === null) {
+                continue;
+            }
+
+            // The fallback chunk carries its OWN post id — persisting its
+            // content under the detected $postId while that story was already
+            // ingested would double-store it and key future radar runs on a
+            // stale id. Verify the chunk's own post id was never ingested
+            // (exact match first, then containment with SQLite ESCAPE '\').
+            $chunkPostId = null;
+            if (preg_match('/"post_id":"(\d+|pfbid[\w]+)"/', $chunk, $pm)) {
+                $chunkPostId = trim($pm[1]);
+            }
+
+            if ($chunkPostId !== null) {
+                $chunkEscaped = addcslashes($chunkPostId, '\\%_');
+                $alreadyIngested = RawFacebookPost::where('retailer_id', $retailer->id)
+                    ->where(fn ($q) => $q->where('facebook_post_id', $chunkPostId)
+                        ->orWhereRaw("facebook_post_id LIKE ? ESCAPE '\\'", ['%'.$chunkEscaped.'%']))
+                    ->exists();
+
+                if ($alreadyIngested) {
+                    Log::info('[STORY_FALLBACK] Candidate story already ingested — skipping chunk.', [
+                        'retailer_slug' => $retailer->slug,
+                        'detected_post_id' => $postId,
+                        'story_post_id' => $chunkPostId,
+                        'story_index' => $index,
+                    ]);
+
+                    continue;
+                }
+            }
+
+            Log::info('[STORY_FALLBACK] Newest story yielded no images; harvested an earlier story node.', [
+                'retailer_slug' => $retailer->slug,
+                'detected_post_id' => $postId,
+                'story_post_id' => $chunkPostId,
+                'story_index' => $index,
+            ]);
+            unset($chunks);
+
+            return $payload;
+        }
+
+        unset($chunks);
 
         // Photo-unit path: the single edge carrying this fbid.
         foreach ($this->extractPhotoUnits($html) as $unit) {
@@ -402,6 +432,133 @@ final class DirectFacebookPhotosIngestCommand extends Command
         }
 
         return null;
+    }
+
+    /**
+     * Parse ONE story chunk into a payload. Returns null when the chunk
+     * carries no usable flyer images (video/text-only story).
+     *
+     * @param  array<string, true>  $excludedIds
+     * @param  array<string, true>  $excludedSignatures
+     * @return array{caption: string, images: list<string>, published_at: Carbon}|null
+     */
+    private function parseStoryChunk(Retailer $retailer, string $chunk, array $excludedIds, array $excludedSignatures): ?array
+    {
+        // Primary: Relay JSON message body (unclipped full caption).
+        $caption = '';
+        if (preg_match('/"message":\s*\{\s*"text":\s*"((?:[^"\\\\]|\\\\.)*)"/u', $chunk, $cm)) {
+            $decoded = json_decode('"'.$cm[1].'"', true);
+            if (is_string($decoded) && trim($decoded) !== '') {
+                $caption = trim($decoded);
+            }
+        }
+        // Secondary: aggregated accessibility captions (image
+        // descriptions), skipping reaction counters and placeholders.
+        if ($caption === '' && preg_match_all('/"accessibility_caption":\s*"((?:[^"\\\\]|\\\\.)*)"/u', $chunk, $am)) {
+            $parts = [];
+            foreach (array_unique($am[1]) as $raw) {
+                $decoded = json_decode('"'.$raw.'"', true);
+                $text = trim((string) ($decoded !== null ? $decoded : $raw));
+                if ($text !== '' && ! str_contains($text, 'likes') && ! str_contains($text, 'May be an image')) {
+                    $parts[] = $text;
+                }
+            }
+            $caption = trim(implode("\n", $parts));
+        }
+        // Tertiary: neutral fallback (never raw \uXXXX escapes).
+        if ($caption === '') {
+            $caption = "عروض {$retailer->name} الجديدة";
+        }
+        // Primary media: EVERY scontent uri in the story unit —
+        // viewer_image covers plus all subattachment originals.
+        $rawImages = [];
+        if (preg_match_all('/"uri":\s*"((?:[^"\\\\]|\\\\.)*scontent(?:[^"\\\\]|\\\\.)*)"/i', $chunk, $im)) {
+            foreach ($im[1] as $raw) {
+                $rawImages[] = str_replace('\\/', '/', trim($raw));
+            }
+        }
+        // Broad master-asset sweep (UNCONDITIONAL): story viewer_image
+        // often exposes only the preview collage while the remaining
+        // catalog pages ship as high-res t39 master assets further
+        // down the same story block. Never settle for a solitary page
+        // when masters exist — no count gate.
+        foreach ($this->extractStoryMasterImages($chunk) as $master) {
+            $rawImages[] = $master;
+        }
+        // Deep album set fetcher: Meta throttles the timeline SSR to
+        // a ~5-photo preview collage; the remaining catalog pages hide
+        // behind the album/media set id (set=a.XXX / set=pcb.XXX).
+        // When the story yields fewer than 25 UNIQUE photos (by
+        // immutable signature), fetch the dedicated album page via
+        // WARP (plus its type=3 grid variant, which SSR-renders a
+        // different slice) and merge master assets.
+        if ($this->countUniqueSignatures($rawImages) < 25
+            && preg_match('#[?&]set=(a\.\d+|pcb\.\d+)#i', $chunk, $setMatch)) {
+            $albumUrls = [
+                'https://www.facebook.com/media/set/?set='.$setMatch[1],
+                'https://www.facebook.com/media/set/?set='.$setMatch[1].'&type=3',
+            ];
+            foreach ($albumUrls as $albumUrl) {
+                $albumHtml = $this->fetchViaCurlImpersonate($albumUrl);
+                if ($albumHtml !== null && trim($albumHtml) !== '') {
+                    foreach ($this->extractStoryMasterImages($albumHtml) as $master) {
+                        $rawImages[] = $master;
+                    }
+                }
+                unset($albumHtml);
+                if ($this->countUniqueSignatures($rawImages) >= 25) {
+                    break;
+                }
+            }
+        }
+        // Cover shield: discard immediately any rendition carrying a
+        // system photo id (page cover / profile photo). Strict
+        // substring match on the immutable numeric id.
+        if ($excludedIds !== []) {
+            $filtered = [];
+            foreach ($rawImages as $candidate) {
+                $blocked = false;
+                foreach ($excludedIds as $excludedId => $_) {
+                    if ($excludedId !== '' && str_contains($candidate, (string) $excludedId)) {
+                        $blocked = true;
+
+                        break;
+                    }
+                }
+                if (! $blocked) {
+                    $filtered[] = $candidate;
+                }
+            }
+            $rawImages = $filtered;
+        }
+        // Cover-signature shield: the cover fbid never appears in its
+        // CDN URL, so drop any rendition whose immutable photo
+        // signature matches the page cover / profile display image.
+        if ($excludedSignatures !== []) {
+            $rawImages = array_values(array_filter(
+                $rawImages,
+                static fn ($candidate): bool => ! isset($excludedSignatures[FacebookMediaHelper::extractPhotoSignature((string) $candidate)])
+            ));
+        }
+        $images = $this->purifyImageUrls($rawImages, self::MAX_IMAGES);
+        unset($rawImages);
+        if ($images === []) {
+            return null;
+        }
+        $publishedAt = Carbon::now('UTC');
+        if (preg_match('/"creation_time":(\d{10})/', $chunk, $tm)) {
+            try {
+                $publishedAt = Carbon::createFromTimestampUTC((int) $tm[1]);
+            } catch (Throwable $e) {
+                $publishedAt = Carbon::now('UTC');
+            }
+        }
+
+        return [
+            'caption' => mb_substr($caption !== '' ? $caption : "عروض {$retailer->name} الجديدة", 0, 10000),
+            'images' => $images,
+            'published_at' => $publishedAt,
+        ];
     }
 
     /**
@@ -464,7 +621,7 @@ final class DirectFacebookPhotosIngestCommand extends Command
 
             $caption = null;
             if (preg_match('/"accessibility_caption":\s*"((?:[^"\\\\]|\\\\.)*)"/u', $window, $cm)) {
-                $decoded = json_decode('"' . $cm[1] . '"');
+                $decoded = json_decode('"'.$cm[1].'"');
                 $caption = trim((string) ($decoded !== null ? $decoded : $cm[1]));
             }
 
@@ -566,13 +723,13 @@ final class DirectFacebookPhotosIngestCommand extends Command
     /**
      * Count distinct photos by immutable signature (dedupes renditions).
      *
-     * @param list<mixed> $urls
+     * @param  list<mixed>  $urls
      */
     private function countUniqueSignatures(array $urls): int
     {
         $seen = [];
         foreach ($urls as $u) {
-            $seen[\App\Support\FacebookMediaHelper::extractPhotoSignature((string) $u)] = true;
+            $seen[FacebookMediaHelper::extractPhotoSignature((string) $u)] = true;
         }
 
         return count($seen);
@@ -603,7 +760,7 @@ final class DirectFacebookPhotosIngestCommand extends Command
                 foreach ($xm[1] as $raw) {
                     $url = trim(html_entity_decode((string) $raw, ENT_QUOTES | ENT_HTML5, 'UTF-8'));
                     if ($url !== '') {
-                        $excluded[\App\Support\FacebookMediaHelper::extractPhotoSignature($url)] = true;
+                        $excluded[FacebookMediaHelper::extractPhotoSignature($url)] = true;
                     }
                 }
             }
@@ -658,7 +815,7 @@ final class DirectFacebookPhotosIngestCommand extends Command
             rawFacebookPostId: $rawPost->id,
         );
 
-        $this->safeLog('info', "[INGEST_DISPATCHED] Dispatched Gatekeeper for {$retailer->slug}:{$postId} with " . count($images) . ' high-res pages.');
+        $this->safeLog('info', "[INGEST_DISPATCHED] Dispatched Gatekeeper for {$retailer->slug}:{$postId} with ".count($images).' high-res pages.');
         $this->info("Dispatched Gatekeeper for [{$retailer->slug}:{$postId}].");
     }
 
@@ -701,14 +858,14 @@ final class DirectFacebookPhotosIngestCommand extends Command
 
             if ($process->isSuccessful()) {
                 $html = $process->getOutput();
-                $line = '[DEBUG_RESPONSE] Route: CURL_CHROME116+WARP | Size: ' . strlen($html) . " bytes | Time: {$elapsedMs}ms";
+                $line = '[DEBUG_RESPONSE] Route: CURL_CHROME116+WARP | Size: '.strlen($html)." bytes | Time: {$elapsedMs}ms";
                 $this->line($line);
                 $this->safeLog('debug', $line);
 
                 return $html;
             }
 
-            $this->safeLog('warning', "[CURL_IMPERSONATE_ERROR] Failed to fetch {$targetUrl}: " . trim($process->getErrorOutput()));
+            $this->safeLog('warning', "[CURL_IMPERSONATE_ERROR] Failed to fetch {$targetUrl}: ".trim($process->getErrorOutput()));
 
             return null;
         } catch (Throwable $e) {
@@ -735,8 +892,8 @@ final class DirectFacebookPhotosIngestCommand extends Command
 
         $lines = [
             "  ├── [ANATOMY] {$candidate} Title: \"{$pageTitle}\"",
-            '  ├── [ANATOMY] Login Form: ' . ($hasLoginForm ? 'YES (WALLED)' : 'NO') . ' | Login Keyword: ' . ($hasLoginKeyword ? 'YES' : 'NO'),
-            "  ├── [ANATOMY] JSON Scripts: {$jsonScriptBlocks} | scontent Images: {$scontentImagesCount} | Story Nodes: " . ($hasStoryNode ? 'YES' : 'NO'),
+            '  ├── [ANATOMY] Login Form: '.($hasLoginForm ? 'YES (WALLED)' : 'NO').' | Login Keyword: '.($hasLoginKeyword ? 'YES' : 'NO'),
+            "  ├── [ANATOMY] JSON Scripts: {$jsonScriptBlocks} | scontent Images: {$scontentImagesCount} | Story Nodes: ".($hasStoryNode ? 'YES' : 'NO'),
             "  └── [ANATOMY] Body Preview: {$preview}",
         ];
         foreach ($lines as $line) {
@@ -770,8 +927,9 @@ final class DirectFacebookPhotosIngestCommand extends Command
 
     /**
      * Persist the raw upstream HTML snapshot for unresolved retailers.
-     * Keeps the newest 10 snapshots per store: bounds scheduler disk growth
-     * (~5MB/store) while preserving forensic evidence. Never throws.
+     * Disk-protection: at most ONE snapshot per store per 24h (Cache throttle)
+     * and only the newest 2 kept per store — forensic evidence without the
+     * ~5MB/store/day growth. Never throws.
      */
     private function dumpRawHtml(string $retailerSlug, ?string $html): void
     {
@@ -779,23 +937,33 @@ final class DirectFacebookPhotosIngestCommand extends Command
             return;
         }
         try {
-            $snapshotPath = storage_path("logs/fb_raw_{$retailerSlug}_" . date('Ymd_His') . '.html');
+            // 24h throttle per store: repeated scheduler failures must not
+            // write an identical snapshot every run.
+            if (! Cache::add("fb_html_dump_throttle:{$retailerSlug}", true, now()->addDay())) {
+                $this->safeLog('debug', '[FORENSIC_DUMP] Skipped — snapshot for this store already written within 24h.', [
+                    'retailer_slug' => $retailerSlug,
+                ]);
+
+                return;
+            }
+
+            $snapshotPath = storage_path("logs/fb_raw_{$retailerSlug}_".date('Ymd_His').'.html');
             file_put_contents($snapshotPath, $html, LOCK_EX);
             $this->error("  ⚠️ DUMP SAVED: Full raw HTML saved to: {$snapshotPath}");
-            $this->safeLog('warning',  '[FORENSIC_DUMP] Raw upstream HTML snapshot saved.', [
+            $this->safeLog('warning', '[FORENSIC_DUMP] Raw upstream HTML snapshot saved.', [
                 'retailer_slug' => $retailerSlug,
                 'path' => $snapshotPath,
                 'bytes' => strlen($html),
             ]);
             $snapshots = glob(storage_path("logs/fb_raw_{$retailerSlug}_*.html")) ?: [];
-            if (count($snapshots) > 10) {
+            if (count($snapshots) > 2) {
                 rsort($snapshots);
-                foreach (array_slice($snapshots, 10) as $stale) {
+                foreach (array_slice($snapshots, 2) as $stale) {
                     @unlink($stale);
                 }
             }
         } catch (Throwable $e) {
-            $this->safeLog('warning',  '[FORENSIC_DUMP] Failed to save raw HTML snapshot.', [
+            $this->safeLog('warning', '[FORENSIC_DUMP] Failed to save raw HTML snapshot.', [
                 'retailer_slug' => $retailerSlug,
                 'error' => $e->getMessage(),
             ]);
@@ -896,7 +1064,7 @@ final class DirectFacebookPhotosIngestCommand extends Command
      *   HMAC signatures are preserved byte-for-byte (never rewritten,
      *   `stp=` never touched).
      *
-     * @param list<mixed> $urls
+     * @param  list<mixed>  $urls
      * @return list<string>
      */
     private function purifyImageUrls(array $urls, int $max = self::MAX_IMAGES): array
@@ -1001,7 +1169,7 @@ final class DirectFacebookPhotosIngestCommand extends Command
                 $area = $areas !== [] ? max($areas) : PHP_INT_MAX;
             }
 
-            $key = \App\Support\FacebookMediaHelper::extractPhotoSignature($u);
+            $key = FacebookMediaHelper::extractPhotoSignature($u);
             if (! isset($best[$key]) || $score > $best[$key]['score']
                 || ($score === $best[$key]['score'] && ($area > $best[$key]['area']
                     || ($area === $best[$key]['area'] && $size > $best[$key]['size'])))) {
@@ -1038,5 +1206,4 @@ final class DirectFacebookPhotosIngestCommand extends Command
 
         return false;
     }
-
 }

@@ -25,7 +25,7 @@ final class R2Url
 
         // If no scheme at all (cdn.magalatna.com), prepend https://
         if (! Str::startsWith(strtolower($url), ['http://', 'https://'])) {
-            $url = 'https://' . ltrim($url, '/');
+            $url = 'https://'.ltrim($url, '/');
         }
 
         return rtrim($url, '/');
@@ -56,7 +56,7 @@ final class R2Url
 
         // Protocol-relative //cdn.magalatna.com/... -> https://...
         if (str_starts_with($path, '//')) {
-            return 'https:' . $path;
+            return 'https:'.$path;
         }
 
         $base = self::base();
@@ -65,12 +65,17 @@ final class R2Url
             return ltrim($path, '/');
         }
 
-        return $base . '/' . ltrim($path, '/');
+        return $base.'/'.ltrim($path, '/');
     }
 
     /**
      * Build a Cloudflare Image Resizing URL for a stored R2 path.
-     * Routes through self::base() so malformed protocols are normalized once.
+     *
+     * Cloudflare Free-Plan zones return 403/404 for /cdn-cgi/image/... unless
+     * Image Transformations is explicitly enabled, so resizing is OPT-IN via
+     * config('filesystems.disks.r2.image_resizing_enabled') — disabled by
+     * default, mobile browsers then receive the plain original asset and can
+     * NEVER hit a broken image.
      */
     public static function resizedAsset(?string $path, int $width = 600, string $format = 'webp'): ?string
     {
@@ -79,6 +84,10 @@ final class R2Url
             return null;
         }
 
-        return $base . '/cdn-cgi/image/width=' . $width . ',format=' . $format . '/' . ltrim((string) $path, '/');
+        if (config('filesystems.disks.r2.image_resizing_enabled', false) !== true) {
+            return self::asset($path);
+        }
+
+        return $base.'/cdn-cgi/image/width='.$width.',format='.$format.'/'.ltrim((string) $path, '/');
     }
 }

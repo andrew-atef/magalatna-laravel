@@ -27,6 +27,14 @@ final class FlyerSlugService
             ->trim('-')
             ->toString();
 
+        // Guard: a retailer slug of exactly "egypt" (or "-") cleans down to ''
+        // and must never yield slugs like "-6-september-2026" with a dangling dash.
+        if ($cleanRetailer === '') {
+            $fallback = trim($retailerSlug);
+
+            $cleanRetailer = $fallback !== '' ? $fallback : 'flyer';
+        }
+
         $from = Carbon::parse($validFromDate, 'Africa/Cairo');
         $until = Carbon::parse($validUntilDate, 'Africa/Cairo');
 

@@ -24,8 +24,18 @@ final class VerifyIngestWebhookSecret
 {
     public function handle(Request $request, Closure $next): Response
     {
-        $expectedIngest = (string) (config('services.ingest_webhook.secret') ?: env('INGEST_WEBHOOK_SECRET', ''));
-        $expectedInternal = (string) config('services.internal_api.key', '');
+        // Config-only (never env() — env() returns null after config:cache).
+        // services.ingest_webhook.secret => env('INGEST_WEBHOOK_SECRET').
+        $expectedIngest = trim((string) config('services.ingest_webhook.secret', ''));
+        $expectedInternal = trim((string) config('services.internal_api.key', ''));
+
+        // Deprecation radar: ?secret= leaks into Cloudflare/proxy access logs.
+        // Clients MUST move to the X-Ingest-Secret header.
+        if ($request->has('secret')) {
+            Log::warning('VerifyIngestWebhookSecret: secret supplied via query string. ?secret= is deprecated and leaks into CDN/proxy logs — switch to the X-Ingest-Secret header.', [
+                'ip' => $request->ip(),
+            ]);
+        }
 
         // Extract secret from header, query param, or bearer/internal key
         $providedSecret = $request->header('X-Ingest-Secret') ?? $request->query('secret');

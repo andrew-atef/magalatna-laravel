@@ -34,6 +34,7 @@ final class ExpireOldFlyersCommand extends Command
         if ($flyers->isEmpty()) {
             $this->info('لا توجد مجلات منتهية للتحويل اليوم.');
             Cache::forget('sitemap_xml_content');
+            Cache::forget('llms_txt_content');
 
             return self::SUCCESS;
         }
@@ -57,7 +58,7 @@ final class ExpireOldFlyersCommand extends Command
                 'error' => $e->getMessage(),
                 'trace' => $e->getTraceAsString(),
             ]);
-            $this->error('فشلت الأرشفة وتم التراجع عن كل التغييرات: ' . $e->getMessage());
+            $this->error('فشلت الأرشفة وتم التراجع عن كل التغييرات: '.$e->getMessage());
 
             return self::FAILURE;
         }
@@ -65,38 +66,31 @@ final class ExpireOldFlyersCommand extends Command
         $affected = count($expiredIds);
 
         // Collect purge URLs for the expired flyers (re-read inside fresh state).
+        // ALL URLs are built from config('app.url') + RELATIVE routes —
+        // request-bound url('/') / absolute route() on the CLI resolves to
+        // 127.0.0.1 or the admin host and would purge the wrong cache entries.
+        $base = rtrim((string) config('app.url'), '/');
+
         $allUrls = [];
         $expired = Flyer::with('retailer')->whereIn('id', $expiredIds)->get();
         foreach ($expired as $flyer) {
-            try {
-                $allUrls[] = route('flyers.show', $flyer->slug);
-            } catch (Throwable $e) {
-                $allUrls[] = rtrim((string) config('app.url'), '/') . '/offers/' . $flyer->slug;
-            }
+            $allUrls[] = $base.route('flyers.show', ['slug' => (string) $flyer->slug], false);
 
-            if ($flyer->retailer) {
-                try {
-                    $allUrls[] = route('retailers.show', $flyer->retailer->slug);
-                } catch (Throwable $e) {
-                    Log::warning('ExpireOldFlyersCommand: retailer URL failed.', ['flyer_id' => $flyer->id]);
-                }
+            if ($flyer->retailer !== null && (string) $flyer->retailer->slug !== '') {
+                $allUrls[] = $base.route('retailers.show', ['retailer' => (string) $flyer->retailer->slug], false);
             }
         }
 
-        // Ensure homepage and sitemap are purged even if observers handled per-flyer
-        $allUrls[] = url('/');
-        $allUrls[] = rtrim((string) url('/'), '/') . '/';
-        $allUrls[] = url('/sitemap.xml');
-        $appUrl = rtrim((string) config('app.url'), '/');
-        if ($appUrl !== '' && $appUrl !== url('/')) {
-            $allUrls[] = $appUrl;
-            $allUrls[] = $appUrl . '/';
-            $allUrls[] = $appUrl . '/sitemap.xml';
-        }
+        // Shared artifacts: homepage, sitemap and llms.txt always change when
+        // flyers expire. NO IndexNow — expired URLs are NOT indexable pages.
+        $allUrls[] = $base.'/';
+        $allUrls[] = $base.'/sitemap.xml';
+        $allUrls[] = $base.'/llms.txt';
 
         $allUrls = array_values(array_unique(array_filter(array_map(static fn (mixed $u): string => trim((string) $u), $allUrls))));
 
         Cache::forget('sitemap_xml_content');
+        Cache::forget('llms_txt_content');
 
         // Respect Cloudflare Edge API batch limits: max 30 URLs per purge job.
         foreach (array_chunk($allUrls, 30) as $index => $chunk) {

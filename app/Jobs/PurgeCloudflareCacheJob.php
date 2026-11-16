@@ -28,7 +28,7 @@ final class PurgeCloudflareCacheJob implements ShouldQueue
     public int $timeout = 60;
 
     /**
-     * @param list<string> $urls
+     * @param  list<string>  $urls
      */
     public function __construct(public readonly array $urls) {}
 
@@ -46,24 +46,16 @@ final class PurgeCloudflareCacheJob implements ShouldQueue
             $purged = $cache->purgeUrls($urls);
 
             if (! $purged) {
-                Log::warning('PurgeCloudflareCacheJob: Cloudflare purge partially failed, still dispatching indexing.', [
+                Log::warning('PurgeCloudflareCacheJob: Cloudflare purge failed.', [
                     'urls' => $urls,
                 ]);
             }
 
-            // Decoupled: fan out one independent IndexNow worker per URL.
-            // No synchronous network calls here — each PingIndexNowJob runs
-            // on its own worker with its own retries.
-            foreach ($urls as $url) {
-                try {
-                    PingIndexNowJob::dispatch($url);
-                } catch (Throwable $e) {
-                    Log::warning('PurgeCloudflareCacheJob: Failed to dispatch IndexNow.', [
-                        'url' => $url,
-                        'error' => $e->getMessage(),
-                    ]);
-                }
-            }
+            // IndexNow is DECOUPLED from purging by design. This job purges the
+            // CDN edge for deleted flyers, expired flyers, /sitemap.xml and
+            // /llms.txt — none of which are indexable pages. PingIndexNowJob is
+            // dispatched ONLY by the authorities that know a live Published page
+            // changed (FlyerObserver, RetailerObserver). Never fan it out here.
 
             Log::info('PurgeCloudflareCacheJob: Completed.', [
                 'urls_count' => count($urls),
@@ -81,7 +73,7 @@ final class PurgeCloudflareCacheJob implements ShouldQueue
     }
 
     /**
-     * @param list<string> $urls
+     * @param  list<string>  $urls
      * @return list<string>
      */
     private function normalize(array $urls): array

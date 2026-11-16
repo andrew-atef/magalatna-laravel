@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services;
 
+use App\Support\PublicUrlGuard;
 use Illuminate\Http\Client\RequestException;
 use Illuminate\Http\UploadedFile;
 use Illuminate\Support\Facades\Http;
@@ -14,6 +15,7 @@ use Intervention\Image\Drivers\Gd\Driver as GdDriver;
 use Intervention\Image\Drivers\Imagick\Driver as ImagickDriver;
 use Intervention\Image\Encoders\WebpEncoder;
 use Intervention\Image\ImageManager;
+use Psr\Http\Message\ResponseInterface;
 use RuntimeException;
 use Spatie\PdfToImage\Pdf;
 use Symfony\Component\Process\Exception\ProcessFailedException;
@@ -27,6 +29,12 @@ final class ImageOptimizerService
     private const WEBP_QUALITY = 80;
 
     private const DOWNLOAD_TIMEOUT = 15;
+
+    /** Hard cap per download (images AND PDFs) — protects the 128MB worker. */
+    private const MAX_DOWNLOAD_BYTES = 25 * 1024 * 1024;
+
+    /** Sane PDF page cap: rendering 100+ pages would OOM/timeout the worker. */
+    private const MAX_PDF_PAGES = 40;
 
     /**
      * Resolve the best available image manager (Imagick preferred, GD fallback).
@@ -68,14 +76,36 @@ final class ImageOptimizerService
     private function downloadBinary(string $url): string
     {
         try {
+            // SSRF guard BEFORE any byte is fetched: remote sources arrive from
+            // webhooks — a crafted URL must never probe loopback/private hosts
+            // or the VPS's internal network.
+            PublicUrlGuard::assertPublicHttpUrl($url);
+
             $response = Http::timeout(self::DOWNLOAD_TIMEOUT)
                 ->withHeaders([
-                    'User-Agent' => 'AmanPrice-ImageOptimizer/1.0 (+https://amanprice.tech)',
+                    'User-Agent' => 'Magalatna-ImageOptimizer/1.0 (+https://magalatna.com)',
                     'Accept' => '*/*',
                 ])
                 ->withOptions([
-                    'allow_redirects' => true,
+                    // Redirect SSRF guard: every 30x hop is re-validated — a
+                    // redirect must never pivot into loopback/private/reserved
+                    // IP ranges or internal hostnames.
+                    'allow_redirects' => [
+                        'max' => 5,
+                        'on_redirect' => static function ($request, $response, $uri): void {
+                            PublicUrlGuard::assertPublicHttpUrl((string) $uri);
+                        },
+                    ],
                     'http_errors' => false,
+                    // Abort inside Guzzle's on_headers hook BEFORE the body
+                    // streams into worker memory.
+                    'on_headers' => static function (ResponseInterface $headers) use ($url): void {
+                        $contentLength = (int) ($headers->getHeaderLine('Content-Length') ?: 0);
+
+                        if ($contentLength > self::MAX_DOWNLOAD_BYTES) {
+                            throw new RuntimeException('Resource exceeds maximum allowed size (Content-Length): '.$url);
+                        }
+                    },
                 ])
                 ->get($url);
 
@@ -96,6 +126,11 @@ final class ImageOptimizerService
                 if ($body === '') {
                     throw new RuntimeException('Downloaded resource is empty for URL '.$url);
                 }
+            }
+
+            // Re-check after download: chunked responses lack Content-Length.
+            if (strlen($body) > self::MAX_DOWNLOAD_BYTES) {
+                throw new RuntimeException('Resource exceeds maximum allowed size: '.$url);
             }
 
             return $body;
@@ -230,6 +265,12 @@ final class ImageOptimizerService
 
             $webpBinary = (string) $encoded;
 
+            // Free Intervention's rasterized image + encoded object NOW — the
+            // 840MB VPS converts many images per batch; dropping the GD/Imagick
+            // buffers before the next read keeps peak RSS flat.
+            unset($image, $encoded, $manager);
+            gc_collect_cycles();
+
             if ($webpBinary === '') {
                 throw new RuntimeException('WebP encoding produced empty binary.');
             }
@@ -348,7 +389,7 @@ final class ImageOptimizerService
             }
 
             // Write PDF to temp file
-            $tmpPdf = tempnam(sys_get_temp_dir(), 'aman_pdf_');
+            $tmpPdf = tempnam(sys_get_temp_dir(), 'magalatna_pdf_');
             if ($tmpPdf === false) {
                 throw new RuntimeException('Failed to create temp file for PDF.');
             }
@@ -357,6 +398,11 @@ final class ImageOptimizerService
             if ($written === false) {
                 throw new RuntimeException('Failed to write PDF to temp file: '.$tmpPdf);
             }
+
+            // The PDF bytes now live on disk — free the in-memory copy before
+            // page rendering begins (128MB worker budget).
+            unset($binary);
+            gc_collect_cycles();
 
             // Strategy 1: spatie/pdf-to-image if available
             if (class_exists(Pdf::class)) {
@@ -427,6 +473,17 @@ final class ImageOptimizerService
             throw new RuntimeException('PDF has no pages: '.$pdfPath);
         }
 
+        // Memory guard: converting 100+ pages would OOM/timeout the worker —
+        // process only the first MAX_PDF_PAGES pages.
+        if ($numPages > self::MAX_PDF_PAGES) {
+            Log::warning('PDF exceeds page cap, truncating.', [
+                'path' => $pdfPath,
+                'pages' => $numPages,
+                'cap' => self::MAX_PDF_PAGES,
+            ]);
+            $numPages = self::MAX_PDF_PAGES;
+        }
+
         Log::info('Converting PDF via spatie/pdf-to-image.', [
             'path' => $pdfPath,
             'pages' => $numPages,
@@ -453,6 +510,11 @@ final class ImageOptimizerService
 
                 $webpBinary = $this->optimizeImageBinary($binary);
                 $keys[] = $this->uploadToR2($webpBinary, $directory);
+
+                // Free page buffers before the next render — long PDFs must
+                // never accumulate raw + webp per iteration on the worker.
+                unset($binary, $webpBinary);
+                gc_collect_cycles();
             } catch (Throwable $e) {
                 Log::error('Failed to process PDF page via Spatie.', [
                     'page' => $page,
@@ -557,6 +619,16 @@ final class ImageOptimizerService
         sort($generated, SORT_NATURAL);
         $tempImagesCollector = array_merge($tempImagesCollector, $generated);
 
+        // Memory guard: cap the number of rendered pages converted/uploaded.
+        if (count($generated) > self::MAX_PDF_PAGES) {
+            Log::warning('PDF exceeds page cap, truncating.', [
+                'path' => $pdfPath,
+                'pages' => count($generated),
+                'cap' => self::MAX_PDF_PAGES,
+            ]);
+            $generated = array_slice($generated, 0, self::MAX_PDF_PAGES);
+        }
+
         $keys = [];
 
         foreach ($generated as $pngPath) {
@@ -570,6 +642,10 @@ final class ImageOptimizerService
 
                 $webpBinary = $this->optimizeImageBinary($binary);
                 $keys[] = $this->uploadToR2($webpBinary, $directory);
+
+                // Free page buffers before the next conversion.
+                unset($binary, $webpBinary);
+                gc_collect_cycles();
             } catch (Throwable $e) {
                 Log::error('Failed to process pdftoppm page.', [
                     'path' => $pngPath,

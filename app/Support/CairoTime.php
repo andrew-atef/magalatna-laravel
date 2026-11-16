@@ -24,9 +24,29 @@ final class CairoTime
 
         $str = trim((string) $date);
 
-        // If stored as raw UTC string from MySQL (Y-m-d H:i:s), parse explicitly as UTC then convert
+        // Date-only strings are calendar dates with NO time/offset: parse them
+        // explicitly in Cairo so they never depend on the app timezone config.
+        if (preg_match('/^\d{4}-\d{2}-\d{2}$/', $str) === 1) {
+            return Carbon::createFromFormat('Y-m-d', $str, 'Africa/Cairo')
+                ->startOfDay()
+                ->setTimezone('Africa/Cairo')
+                ->toIso8601String();
+        }
+
+        // Raw DB datetime strings (Y-m-d H:i:s) carry NO offset: they were
+        // written in the application timezone — config('app.timezone') — which
+        // for this app is Africa/Cairo, NOT always UTC. Parsing them as
+        // hardcoded UTC double-shifts Cairo timestamps +2/+3h into the future.
         if (preg_match('/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/', $str) === 1) {
-            return Carbon::createFromFormat('Y-m-d H:i:s', $str, 'UTC')
+            $appTz = trim((string) config('app.timezone', 'UTC'));
+
+            if ($appTz === '' || strcasecmp($appTz, 'UTC') === 0) {
+                return Carbon::createFromFormat('Y-m-d H:i:s', $str, 'UTC')
+                    ->setTimezone('Africa/Cairo')
+                    ->toIso8601String();
+            }
+
+            return Carbon::createFromFormat('Y-m-d H:i:s', $str, $appTz)
                 ->setTimezone('Africa/Cairo')
                 ->toIso8601String();
         }

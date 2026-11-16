@@ -9,7 +9,6 @@ use App\Models\Flyer;
 use App\Models\Retailer;
 use DOMDocument;
 use DOMElement;
-use DOMNode;
 use DOMXPath;
 use Illuminate\Support\Facades\Cache;
 use Throwable;
@@ -17,6 +16,7 @@ use Throwable;
 final class AutoInternalLinkerService
 {
     private const CACHE_TTL = 86400; // 24 hours
+
     private const MAX_LINKS = 5;
 
     public function linkify(string $content, ?Flyer $currentFlyer = null): string
@@ -39,14 +39,14 @@ final class AutoInternalLinkerService
 
         $dom = new DOMDocument('1.0', 'UTF-8');
         libxml_use_internal_errors(true);
-        $wrapped = '<?xml encoding="utf-8" ?><div>' . $htmlFragment . '</div>';
+        $wrapped = '<?xml encoding="utf-8" ?><div>'.$htmlFragment.'</div>';
         $dom->loadHTML($wrapped, LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD);
         libxml_clear_errors();
 
         $xpath = new DOMXPath($dom);
         $excluded = ['a', 'button', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'script', 'style'];
-        $notAncestors = implode(' and ', array_map(static fn (string $tag): string => 'not(ancestor::' . $tag . ')', $excluded));
-        $nodes = $xpath->query('//text()[' . $notAncestors . ']');
+        $notAncestors = implode(' and ', array_map(static fn (string $tag): string => 'not(ancestor::'.$tag.')', $excluded));
+        $nodes = $xpath->query('//text()['.$notAncestors.']');
 
         if ($nodes === false || $nodes->length === 0) {
             return $htmlFragment;
@@ -94,7 +94,7 @@ final class AutoInternalLinkerService
                         continue;
                     }
 
-                    $pattern = '/(?<![\p{L}\p{N}_])' . preg_quote($keywordTrim, '/') . '(?![\p{L}\p{N}_])/u';
+                    $pattern = '/(?<![\p{L}\p{N}_])'.preg_quote($keywordTrim, '/').'(?![\p{L}\p{N}_])/u';
                     if (preg_match($pattern, $remaining, $matches, PREG_OFFSET_CAPTURE)) {
                         $bytePos = $matches[0][1];
                         $pos = mb_strlen(substr($remaining, 0, $bytePos));
@@ -191,7 +191,10 @@ final class AutoInternalLinkerService
                 continue;
             }
 
-            $routeUrl = route('retailers.show', ['retailer' => $slug]);
+            // Canonical absolute URL: config('app.url') + relative route —
+            // route() alone would embed the request host (e.g. the CLI or an
+            // admin host) and poison the cached keyword map.
+            $routeUrl = rtrim((string) config('app.url'), '/').route('retailers.show', ['retailer' => $slug], false);
             $map[$name] ??= $routeUrl;
 
             $slugKey = strtolower($slug);
@@ -209,7 +212,7 @@ final class AutoInternalLinkerService
         foreach ($brands as $brandName) {
             $brandName = trim((string) $brandName);
             if (mb_strlen($brandName) >= 2) {
-                $map[$brandName] ??= route('home', ['q' => $brandName]);
+                $map[$brandName] ??= rtrim((string) config('app.url'), '/').route('home', ['q' => $brandName], false);
             }
         }
 
@@ -222,7 +225,7 @@ final class AutoInternalLinkerService
                 foreach ($items as $item) {
                     $pName = trim((string) $item->product_name);
                     if (mb_strlen($pName) >= 3) {
-                        $map[$pName] ??= route('flyers.show', ['slug' => $currentFlyer->slug]);
+                        $map[$pName] ??= rtrim((string) config('app.url'), '/').route('flyers.show', ['slug' => $currentFlyer->slug], false);
                     }
                 }
             } catch (Throwable) {

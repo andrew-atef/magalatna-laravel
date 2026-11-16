@@ -31,7 +31,12 @@ final class ViewServiceProvider extends ServiceProvider
             $headerRetailers = Cache::remember(
                 'layout:header_retailers',
                 86400,
+                // Main retailers only (parent_id IS NULL) — child branches are
+                // not first-class navigation entries; matches HomeController's
+                // active main-retailers query so header links never 404 after
+                // a retailer merge sets a parent_id.
                 static fn () => Retailer::where('is_active', true)
+                    ->whereNull('parent_id')
                     ->orderBy('name')
                     ->limit(12)
                     ->get(['id', 'name', 'slug', 'logo_path'])

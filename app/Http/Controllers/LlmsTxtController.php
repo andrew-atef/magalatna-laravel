@@ -14,24 +14,29 @@ final class LlmsTxtController extends Controller
 {
     public function index(): Response
     {
-        $todayCairo = now('Africa/Cairo')->toDateString();
+        // Both Eloquent queries live INSIDE the closure: cache hits execute
+        // ZERO database queries (6h TTL, invalidated by observers).
+        $content = Cache::remember('llms_txt_content', 21600, function (): string {
+            $todayCairo = now('Africa/Cairo')->toDateString();
 
-        $retailers = Retailer::where('is_active', true)
-            ->withCount(['flyers' => function ($q) use ($todayCairo): void {
-                $q->where('status', FlyerStatus::Published)
-                    ->whereDate('valid_until', '>=', $todayCairo);
-            }])
-            ->orderBy('name')
-            ->get();
+            $retailers = Retailer::query()
+                ->where('is_active', true)
+                ->withCount(['flyers' => function ($q) use ($todayCairo): void {
+                    $q->where('status', FlyerStatus::Published)
+                        ->where('valid_until', '>=', $todayCairo);
+                }])
+                ->orderBy('name')
+                ->get();
 
-        $activeFlyers = Flyer::where('status', FlyerStatus::Published)
-            ->whereDate('valid_until', '>=', $todayCairo)
-            ->with('retailer')
-            ->latest('valid_from')
-            ->take(15)
-            ->get();
+            $activeFlyers = Flyer::query()
+                ->where('status', FlyerStatus::Published)
+                ->where('valid_until', '>=', $todayCairo)
+                ->whereHas('retailer', fn ($q) => $q->where('is_active', true))
+                ->with('retailer')
+                ->latest('valid_from')
+                ->take(15)
+                ->get();
 
-        $content = Cache::remember('llms_txt_content', 21600, function () use ($retailers, $activeFlyers): string {
             return view('llms', compact('retailers', 'activeFlyers'))->render();
         });
 

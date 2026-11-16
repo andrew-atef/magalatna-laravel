@@ -11,10 +11,11 @@ use Throwable;
 final class CloudflareCacheService
 {
     private const ENDPOINT_TEMPLATE = 'https://api.cloudflare.com/client/v4/zones/%s/purge_cache';
+
     private const CHUNK_SIZE = 30; // Strictly capped to 30 URLs per batch for edge reliability
 
     /**
-     * @param list<string> $urls
+     * @param  list<string>  $urls
      */
     public function purgeUrls(array $urls): bool
     {
@@ -62,11 +63,16 @@ final class CloudflareCacheService
     /**
      * Normalize, strip URL fragments, and append markdown representations.
      *
-     * @param list<string> $urls
+     * @param  list<string>  $urls
      * @return list<string>
      */
     private function normalizeAndDeduplicate(array $urls): array
     {
+        // Only purge URLs on the configured canonical host: Cloudflare rejects
+        // an ENTIRE 30-URL batch if a single URL points at a foreign host, so
+        // a bad host must never leak into the API payload.
+        $allowedHost = strtolower((string) parse_url(rtrim((string) config('app.url'), '/'), PHP_URL_HOST));
+
         $result = [];
 
         foreach ($urls as $url) {
@@ -80,11 +86,32 @@ final class CloudflareCacheService
                 $u = explode('#', $u, 2)[0];
             }
 
+            if ($allowedHost !== '') {
+                $host = strtolower((string) parse_url($u, PHP_URL_HOST));
+
+                if ($host === '' || $host !== $allowedHost) {
+                    Log::warning('CloudflareCacheService: skipped URL on non-canonical host.', [
+                        'url' => $u,
+                        'expected_host' => $allowedHost,
+                    ]);
+
+                    continue;
+                }
+            }
+
             $result[] = $u;
 
-            // Generate Markdown variant for CDN cache invalidation
-            $separator = str_contains($u, '?') ? '&' : '?';
-            $result[] = $u . $separator . '_fmt=md';
+            // Markdown variant for CDN cache invalidation — HTML pages ONLY.
+            // .xml/.txt endpoints (sitemap.xml, llms.txt, robots.txt) have no
+            // ?_fmt=md representation; appending one wastes purge budget.
+            $path = strtolower((string) parse_url($u, PHP_URL_PATH));
+
+            if (! str_ends_with($path, '.xml')
+                && ! str_ends_with($path, '.txt')
+                && ! str_contains($u, '_fmt=md')) {
+                $separator = str_contains($u, '?') ? '&' : '?';
+                $result[] = $u.$separator.'_fmt=md';
+            }
         }
 
         return array_values(array_unique(array_filter($result)));

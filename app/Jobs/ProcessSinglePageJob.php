@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Jobs;
 
+use App\Exceptions\GeminiRateLimitedException;
 use App\Models\Brand;
 use App\Models\Flyer;
 use App\Models\FlyerItem;
@@ -11,6 +12,7 @@ use App\Models\FlyerPage;
 use App\Services\GeminiVisionService;
 use App\Services\ImageOptimizerService;
 use App\Support\ArabicNormalizer;
+use App\Support\PublicUrlGuard;
 use Illuminate\Bus\Batchable;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -20,8 +22,10 @@ use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
-use Illuminate\Support\Facades\Redis;
+use Illuminate\Support\Facades\RateLimiter;
+use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
+use Psr\Http\Message\ResponseInterface;
 use Throwable;
 
 final class ProcessSinglePageJob implements ShouldQueue
@@ -38,6 +42,17 @@ final class ProcessSinglePageJob implements ShouldQueue
     public array $backoff = [10, 30, 60];
 
     public int $timeout = 180;
+
+    /**
+     * Gemini free-tier budget: 15 requests per 60s. Backed by the default
+     * cache store (SQLite-safe, no Redis dependency).
+     */
+    private const GEMINI_RPM_LIMIT = 15;
+
+    private const GEMINI_RPM_WINDOW = 60;
+
+    /** Hard cap per image download — protects the 128MB queue worker. */
+    private const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
 
     public function __construct(
         public readonly int $flyerId,
@@ -63,34 +78,50 @@ final class ProcessSinglePageJob implements ShouldQueue
         }
 
         try {
-            // Redis throttle: 15 RPM for Gemini — fallback to direct execution if Redis unavailable
-            try {
-                $throttle = Redis::throttle('gemini-api-limit')->allow(15)->every(60);
+            // Cache-backed rate limiter (RateLimiter facade): unlike
+            // Redis::throttle — which silently disables itself when Redis is
+            // absent and lets the whole batch slam Gemini at once — this works
+            // on any cache store. Release back to the queue when the window
+            // is exhausted instead of burning a synchronous wait.
+            if (RateLimiter::tooManyAttempts('gemini-api-limit', self::GEMINI_RPM_LIMIT)) {
+                $retryAfter = max(10, RateLimiter::availableIn('gemini-api-limit'));
 
-                $throttle->then(
-                    function () use ($gemini, $optimizer): void {
-                        $this->processPage($gemini, $optimizer);
-                    },
-                    function (): void {
-                        Log::warning('Gemini rate limit hit, releasing job.', [
-                            'flyer_id' => $this->flyerId,
-                            'page_number' => $this->pageNumber,
-                        ]);
+                Log::warning('Gemini rate limit hit, releasing job.', [
+                    'flyer_id' => $this->flyerId,
+                    'page_number' => $this->pageNumber,
+                    'retry_after_seconds' => $retryAfter,
+                ]);
 
-                        $this->release(10);
-                    }
-                );
+                $this->release($retryAfter);
 
                 return;
-            } catch (Throwable $e) {
-                Log::debug('Redis throttle unavailable, processing without throttle.', [
-                    'flyer_id' => $this->flyerId,
-                    'error' => $e->getMessage(),
-                ]);
             }
 
-            // Fallback: direct processing
-            $this->processPage($gemini, $optimizer);
+            $processed = RateLimiter::attempt(
+                'gemini-api-limit',
+                self::GEMINI_RPM_LIMIT,
+                function () use ($gemini, $optimizer): void {
+                    $this->processPage($gemini, $optimizer);
+                },
+                self::GEMINI_RPM_WINDOW,
+            );
+
+            if ($processed === false) {
+                // Window filled between the check and the attempt.
+                $this->release(10);
+            }
+        } catch (GeminiRateLimitedException $e) {
+            // Gemini answered 429 — free the worker immediately and retry the
+            // job after the rate-limit window instead of sleeping in-process.
+            Log::warning('ProcessSinglePageJob hit Gemini rate limit, releasing job.', [
+                'flyer_id' => $this->flyerId,
+                'page_number' => $this->pageNumber,
+                'retry_after_seconds' => $e->retryAfterSeconds,
+            ]);
+
+            $this->release($e->retryAfterSeconds > 0 ? $e->retryAfterSeconds : 30);
+
+            return;
         } catch (Throwable $e) {
             Log::error('ProcessSinglePageJob failed outside throttle.', [
                 'flyer_id' => $this->flyerId,
@@ -130,26 +161,38 @@ final class ProcessSinglePageJob implements ShouldQueue
                 return;
             }
 
-            // 1. Download raw image binary ONCE (defensive timeout).
+            // 1. SSRF guard BEFORE any byte is fetched: only public http(s)
+            // origins. Facebook CDN URLs arrive from an external webhook —
+            // a crafted URL must never probe 127.0.0.1/169.254.169.254 or the
+            // VPS's private network.
+            PublicUrlGuard::assertPublicHttpUrl($this->imageUrl);
+
+            $rawPath = (string) parse_url($this->imageUrl, PHP_URL_PATH);
+            $isPdf = str_ends_with(strtolower($rawPath), '.pdf');
+
+            // 2. Download raw image binary ONCE (defensive timeout).
             // Every downstream step (R2 upload + Gemini OCR) reuses these bytes —
             // never download the same asset twice within one job cycle.
-            $rawBinary = $this->downloadRawImage($this->imageUrl);
+            // PDFs are the one exception: the optimizer re-downloads internally
+            // for multi-page rendering, so skip the wasted fetch here.
+            $rawBinary = $isPdf ? null : $this->downloadRawImage($this->imageUrl);
 
-            // 2. Optimize in-memory and store the WebP on R2.
-            // Use directory flyers/{flyerId}
+            // 3. Optimize in-memory and store the WebP on R2.
             $directory = 'flyers/'.$this->flyerId;
+            $webpBinary = null;
 
             try {
-                $path = (string) parse_url($this->imageUrl, PHP_URL_PATH);
-                if (str_ends_with(strtolower($path), '.pdf')) {
-                    // PDFs need multi-page rendering (optimizer entry point handles
-                    // download internally) — the only path allowed a second fetch.
+                if ($isPdf) {
                     $r2Key = $optimizer->processAndUpload($this->imageUrl, $directory);
                 } else {
+                    /** @var string $rawBinary */
                     $webpBinary = $optimizer->convertToWebp($rawBinary);
                     $r2Key = $optimizer->storeWebp($webpBinary, $directory, 'r2');
                 }
             } catch (Throwable $e) {
+                unset($rawBinary, $webpBinary);
+                gc_collect_cycles();
+
                 Log::error('ImageOptimizerService failed, will attempt direct R2 upload fallback.', [
                     'flyer_id' => $this->flyerId,
                     'error' => $e->getMessage(),
@@ -158,14 +201,45 @@ final class ProcessSinglePageJob implements ShouldQueue
                 throw $e;
             }
 
+            // Real pixel dimensions from the converted WebP (never hardcoded),
+            // read BEFORE the buffer is freed below. PDF path: $rawBinary is
+            // null here (the optimizer re-downloads PDFs internally for
+            // multi-page rendering) and $webpBinary is also null — so load
+            // the converted single WebP back from R2 BEFORE pageDimensions()
+            // and extractProductsFromPage(); passing null to either is a
+            // fatal TypeError.
+            if ($isPdf) {
+                $pdfWebp = Storage::disk('r2')->get($r2Key);
+
+                if (! is_string($pdfWebp) || $pdfWebp === '') {
+                    throw new \RuntimeException('Converted PDF page missing on R2 after upload: '.$r2Key);
+                }
+
+                // One R2 read feeds BOTH the dimension scan and the OCR call;
+                // copy-on-write keeps this a single shared buffer.
+                $rawBinary = $pdfWebp;
+                $webpBinary = $pdfWebp;
+                unset($pdfWebp);
+            }
+
+            [$width, $height] = $this->pageDimensions($webpBinary);
+
+            // WebP bytes are on R2 — free the buffer before the OCR call so the
+            // 128MB worker never holds raw + webp + response simultaneously.
+            unset($webpBinary);
+            gc_collect_cycles();
+
             Log::info('Image uploaded to R2.', [
                 'flyer_id' => $this->flyerId,
                 'r2_key' => $r2Key,
             ]);
 
-            // 3. Call Gemini Vision OCR (high-density)
-            // Use raw binary for OCR to preserve original quality; Gemini handles WebP as well
+            // 4. Call Gemini Vision OCR (high-density)
+            /** @var string $rawBinary */
             $items = $gemini->extractProductsFromPage($rawBinary);
+
+            unset($rawBinary);
+            gc_collect_cycles();
 
             if ($items === []) {
                 Log::warning('Gemini OCR returned no items for page.', [
@@ -180,8 +254,25 @@ final class ProcessSinglePageJob implements ShouldQueue
                 'count' => count($items),
             ]);
 
-            // 4. Insert FlyerPage and FlyerItems within transaction — WITHOUT cascade cache purge
-            DB::transaction(function () use ($flyer, $r2Key, $items): void {
+            // 5. Insert FlyerPage and FlyerItems within transaction — WITHOUT cascade cache purge
+            $replacedOldPath = null;
+
+            DB::transaction(function () use ($flyer, $r2Key, $items, $width, $height, &$replacedOldPath): void {
+                // Capture the pre-existing image path BEFORE the upsert: on a
+                // retry the page row may already point at a different R2 object
+                // which must be reaped after this commit (never leaked).
+                $previous = FlyerPage::query()
+                    ->where('flyer_id', $flyer->id)
+                    ->where('page_number', $this->pageNumber)
+                    ->first(['id', 'image_path']);
+
+                if ($previous !== null) {
+                    $oldPath = trim((string) $previous->image_path);
+                    if ($oldPath !== '' && $oldPath !== $r2Key) {
+                        $replacedOldPath = $oldPath;
+                    }
+                }
+
                 // Upsert FlyerPage (unique flyer_id + page_number) — no observer, safe
                 $flyerPage = FlyerPage::updateOrCreate(
                     [
@@ -190,8 +281,8 @@ final class ProcessSinglePageJob implements ShouldQueue
                     ],
                     [
                         'image_path' => $r2Key,
-                        'width' => 1200,
-                        'height' => 1600,
+                        'width' => $width,
+                        'height' => $height,
                     ]
                 );
 
@@ -280,10 +371,24 @@ final class ProcessSinglePageJob implements ShouldQueue
                                     );
                                     $brandId = $brand->id;
                                 } catch (Throwable $e) {
-                                    Log::warning('Failed to resolve brand, proceeding without brand.', [
-                                        'brand_name' => $brandNameTrim,
-                                        'error' => $e->getMessage(),
-                                    ]);
+                                    // Unique-constraint race with a concurrent worker:
+                                    // re-query instead of dropping the brand entirely.
+                                    try {
+                                        $brand = Brand::query()->where('name', $brandNameTrim)->first();
+                                        $brandId = $brand?->id;
+
+                                        if ($brandId === null) {
+                                            Log::warning('Failed to resolve brand, proceeding without brand.', [
+                                                'brand_name' => $brandNameTrim,
+                                                'error' => $e->getMessage(),
+                                            ]);
+                                        }
+                                    } catch (Throwable $re) {
+                                        Log::warning('Brand re-query failed after create race.', [
+                                            'brand_name' => $brandNameTrim,
+                                            'error' => $re->getMessage(),
+                                        ]);
+                                    }
                                 }
                             }
 
@@ -304,7 +409,9 @@ final class ProcessSinglePageJob implements ShouldQueue
                                 $extraJson = null;
                             }
 
-                            $normalizedName = ArabicNormalizer::normalize($productName);
+                            // Empty normalization falls back to the raw product name
+                            // so the item never joins the dedup '' bucket.
+                            $normalizedName = ArabicNormalizer::normalize($productName) ?: $productName;
 
                             // Check if identical item (same normalized name and exact sale price) already exists in THIS flyer
                             $existingItem = FlyerItem::where('flyer_id', $flyer->id)
@@ -349,6 +456,24 @@ final class ProcessSinglePageJob implements ShouldQueue
                 });
             });
 
+            // Replaced image (retry with a different R2 key): reap the OLD
+            // object only AFTER the new path is durably committed, async, so
+            // no network I/O ever sits inside a SQLite transaction.
+            if (is_string($replacedOldPath) && $replacedOldPath !== '') {
+                $oldPath = $replacedOldPath;
+
+                dispatch(static function () use ($oldPath): void {
+                    try {
+                        Storage::disk('r2')->delete($oldPath);
+                    } catch (Throwable $e) {
+                        Log::warning('ProcessSinglePageJob: replaced image R2 delete failed.', [
+                            'path' => $oldPath,
+                            'error' => $e->getMessage(),
+                        ]);
+                    }
+                })->afterCommit();
+            }
+
             Log::info('ProcessSinglePageJob completed successfully.', [
                 'flyer_id' => $this->flyerId,
                 'page_number' => $this->pageNumber,
@@ -368,7 +493,29 @@ final class ProcessSinglePageJob implements ShouldQueue
     }
 
     /**
-     * Download raw image binary with defensive timeout.
+     * Read the actual pixel dimensions from the converted binary — never
+     * hardcoded. Falls back to the column defaults when unreadable (PDF path).
+     *
+     * @return array{0: int, 1: int}
+     */
+    private function pageDimensions(?string $binary): array
+    {
+        if (is_string($binary) && $binary !== '') {
+            $info = @getimagesizefromstring($binary);
+
+            if (is_array($info) && ($info[0] ?? 0) > 0 && ($info[1] ?? 0) > 0) {
+                return [(int) $info[0], (int) $info[1]];
+            }
+        }
+
+        return [1200, 1600];
+    }
+
+    /**
+     * Download raw image binary with defensive timeout and a hard 20MB cap.
+     * The cap aborts the transfer inside Guzzle's on_headers hook (before the
+     * body streams into worker memory) and is re-checked after download for
+     * chunked responses lacking Content-Length.
      *
      * @throws \RuntimeException
      */
@@ -381,8 +528,23 @@ final class ProcessSinglePageJob implements ShouldQueue
                     'Accept' => 'image/*',
                 ])
                 ->withOptions([
-                    'allow_redirects' => true,
+                    // Redirect SSRF guard: every 30x hop is re-validated — a
+                    // redirect must never pivot into loopback/private/reserved
+                    // IP ranges or internal hostnames.
+                    'allow_redirects' => [
+                        'max' => 5,
+                        'on_redirect' => static function ($request, $response, $uri): void {
+                            PublicUrlGuard::assertPublicHttpUrl((string) $uri);
+                        },
+                    ],
                     'http_errors' => false,
+                    'on_headers' => static function (ResponseInterface $headers) use ($url): void {
+                        $contentLength = (int) ($headers->getHeaderLine('Content-Length') ?: 0);
+
+                        if ($contentLength > self::MAX_IMAGE_BYTES) {
+                            throw new \RuntimeException('Image exceeds maximum allowed size (Content-Length): '.$url);
+                        }
+                    },
                 ])
                 ->get($url);
 
@@ -399,6 +561,10 @@ final class ProcessSinglePageJob implements ShouldQueue
 
             if ($body === '') {
                 throw new \RuntimeException('Downloaded image is empty: '.$url);
+            }
+
+            if (strlen($body) > self::MAX_IMAGE_BYTES) {
+                throw new \RuntimeException('Image exceeds maximum allowed size: '.$url);
             }
 
             return $body;

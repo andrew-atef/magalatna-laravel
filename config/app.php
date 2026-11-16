@@ -17,6 +17,22 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Social Profiles (Schema.org sameAs)
+    |--------------------------------------------------------------------------
+    |
+    | Absolute profile URLs rendered into the Organization "sameAs" property
+    | so search engines & LLMs can disambiguate the brand identity.
+    |
+    */
+
+    'social_links' => [
+        // 'facebook' => 'https://www.facebook.com/magalatna',
+        // 'x' => 'https://x.com/magalatna',
+        // 'youtube' => 'https://www.youtube.com/@magalatna',
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
     | Application Environment
     |--------------------------------------------------------------------------
     |

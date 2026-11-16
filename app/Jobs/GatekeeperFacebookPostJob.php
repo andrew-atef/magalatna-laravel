@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace App\Jobs;
 
 use App\Enums\FlyerStatus;
-use App\Jobs\PurgeCloudflareCacheJob;
 use App\Models\Flyer;
 use App\Models\RawFacebookPost;
 use App\Models\Retailer;
@@ -24,7 +23,6 @@ use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Bus;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
-use Illuminate\Support\Str;
 use Throwable;
 
 final class GatekeeperFacebookPostJob implements ShouldQueue
@@ -158,7 +156,7 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
                     if ($this->rawFacebookPostId !== null) {
                         RawFacebookPost::where('id', $this->rawFacebookPostId)->update([
                             'status' => 'rejected',
-                            'rejection_reason' => 'العرض منتهي الصلاحية بتوقيت القاهرة (' . $validUntilCarbon->toDateString() . ')',
+                            'rejection_reason' => 'العرض منتهي الصلاحية بتوقيت القاهرة ('.$validUntilCarbon->toDateString().')',
                         ]);
                     }
 
@@ -190,7 +188,7 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
             $untilStr = $validUntilCarbon->toDateString();
 
             try {
-                Cache::lock($lockKey, 60)->block(30, function () use ($gemini, $slugService, $retailer, $validFromCarbon, $validUntilCarbon, $governorates, $flyerTitle, $count, $fromStr, $untilStr): void {
+                Cache::lock($lockKey, 60)->block(30, function () use ($slugService, $retailer, $validFromCarbon, $validUntilCarbon, $governorates, $flyerTitle, $fromStr, $untilStr): void {
                     // 1. EXACT range match only: same retailer + identical period.
                     // Partially-overlapping but distinct flyers are NEVER swallowed
                     // into one another here; the slug-base check below is the only
@@ -205,10 +203,18 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
                     // 2. Also check if the generated slug base already exists (catches renamed duplicates)
                     $baseSlug = $slugService->generate($retailer->slug, $fromStr, $untilStr);
                     if ($existingFlyer === null) {
-                        // Strip any -part-N suffix the service may have appended, then fuzzy-match
+                        // Strip any -part-N suffix the service may have appended, then
+                        // match the canonical base EXACTLY or its own -part-N variants.
+                        // A bare prefix LIKE "base%" would merge slug "1" into "10";
+                        // escaping % _ \ with SQLite's ESCAPE '\' keeps slugs
+                        // containing wildcards literal, and the status filter never
+                        // merges new posts into EXPIRED flyers.
                         $canonicalBase = (string) preg_replace('/-part-\d+$/', '', $baseSlug);
+                        $partPattern = addcslashes($canonicalBase.'-part-', '\\%_');
                         $existingFlyer = Flyer::where('retailer_id', $retailer->id)
-                            ->where('slug', 'like', $canonicalBase.'%')
+                            ->whereIn('status', [FlyerStatus::Draft, FlyerStatus::PendingReview, FlyerStatus::Published])
+                            ->where(fn ($q) => $q->where('slug', $canonicalBase)
+                                ->orWhereRaw("slug LIKE ? ESCAPE '\\'", [$partPattern.'%']))
                             ->orderBy('id')
                             ->first();
                         if ($existingFlyer !== null) {
@@ -257,89 +263,89 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
                                 RawFacebookPost::where('id', $this->rawFacebookPostId)->update([
                                     'flyer_id' => $existingFlyer->id,
                                     'status' => 'rejected',
-                                    'rejection_reason' => 'تم التخطي: جميع صور المنشور مدمجة بالفعل في المجلة #' . $existingFlyer->id,
+                                    'rejection_reason' => 'تم التخطي: جميع صور المنشور مدمجة بالفعل في المجلة #'.$existingFlyer->id,
                                 ]);
                             }
 
                             return;
                         }
 
-                $maxDbPage = (int) ($existingFlyer->pages()->max('page_number') ?? 0);
-                $startPageNumber = max((int) $existingFlyer->total_pages, $maxDbPage);
-                $newPagesCount = count($filteredImageUrls);
+                        $maxDbPage = (int) ($existingFlyer->pages()->max('page_number') ?? 0);
+                        $startPageNumber = max((int) $existingFlyer->total_pages, $maxDbPage);
+                        $newPagesCount = count($filteredImageUrls);
 
-                Log::info('[CONSOLIDATION] Merging ' . $newPagesCount . ' new pages into existing flyer #' . $existingFlyer->id . '.', [
-                    'existing_flyer_id' => $existingFlyer->id,
-                    'existing_slug' => $existingFlyer->slug,
-                    'new_pages' => $newPagesCount,
-                    'start_page' => $startPageNumber + 1,
-                    'retailer_id' => $retailer->id,
-                    'valid_from' => $validFromCarbon->toDateString(),
-                    'valid_until' => $validUntilCarbon->toDateString(),
-                ]);
+                        Log::info('[CONSOLIDATION] Merging '.$newPagesCount.' new pages into existing flyer #'.$existingFlyer->id.'.', [
+                            'existing_flyer_id' => $existingFlyer->id,
+                            'existing_slug' => $existingFlyer->slug,
+                            'new_pages' => $newPagesCount,
+                            'start_page' => $startPageNumber + 1,
+                            'retailer_id' => $retailer->id,
+                            'valid_from' => $validFromCarbon->toDateString(),
+                            'valid_until' => $validUntilCarbon->toDateString(),
+                        ]);
 
-                $existingFlyer->total_pages = (int) $existingFlyer->total_pages + $newPagesCount;
-                $existingFlyer->saveQuietly();
+                        $existingFlyer->total_pages = (int) $existingFlyer->total_pages + $newPagesCount;
+                        $existingFlyer->saveQuietly();
 
-                $this->updateRawPostFlyer($existingFlyer->id);
+                        $this->updateRawPostFlyer($existingFlyer->id);
 
-                $this->dispatchPageProcessingBatch(
-                    flyerId: $existingFlyer->id,
-                    imageUrls: $filteredImageUrls,
-                    startPageNumber: $startPageNumber,
-                    batchName: 'flyer-'.$existingFlyer->id.'-'.$this->facebookPostId.'-consolidated',
-                );
+                        $this->dispatchPageProcessingBatch(
+                            flyerId: $existingFlyer->id,
+                            imageUrls: $filteredImageUrls,
+                            startPageNumber: $startPageNumber,
+                            batchName: 'flyer-'.$existingFlyer->id.'-'.$this->facebookPostId.'-consolidated',
+                        );
 
-                Log::info('Gatekeeper fan-out dispatched (consolidated).', [
-                    'flyer_id' => $existingFlyer->id,
-                    'jobs_count' => $newPagesCount,
-                ]);
+                        Log::info('Gatekeeper fan-out dispatched (consolidated).', [
+                            'flyer_id' => $existingFlyer->id,
+                            'jobs_count' => $newPagesCount,
+                        ]);
 
-                return;
-            }
+                        return;
+                    }
 
-            // 4. Create new flyer ONLY if zero existing flyers matched.
-            // $baseSlug was already generated (and uniqueness-checked) inside the lock.
-            $slug = $baseSlug;
+                    // 4. Create new flyer ONLY if zero existing flyers matched.
+                    // $baseSlug was already generated (and uniqueness-checked) inside the lock.
+                    $slug = $baseSlug;
 
-            $title = $this->formatTitle(
-                retailerName: $retailer->name,
-                validFrom: $validFromCarbon,
-                validUntil: $validUntilCarbon,
-                rawTitle: is_string($flyerTitle) ? trim($flyerTitle) : null
-            );
+                    $title = $this->formatTitle(
+                        retailerName: $retailer->name,
+                        validFrom: $validFromCarbon,
+                        validUntil: $validUntilCarbon,
+                        rawTitle: is_string($flyerTitle) ? trim($flyerTitle) : null
+                    );
 
-            $flyer = Flyer::create([
-                'retailer_id' => $retailer->id,
-                'title' => $title,
-                'slug' => $slug,
-                'valid_from' => $validFromCarbon->toDateString(),
-                'valid_until' => $validUntilCarbon->toDateString(),
-                'applicable_governorates' => $governorates === [] ? null : $governorates,
-                'status' => FlyerStatus::Draft,
-                'total_pages' => count($this->imageUrls),
-                'bluf_summary' => null,
-            ]);
+                    $flyer = Flyer::create([
+                        'retailer_id' => $retailer->id,
+                        'title' => $title,
+                        'slug' => $slug,
+                        'valid_from' => $validFromCarbon->toDateString(),
+                        'valid_until' => $validUntilCarbon->toDateString(),
+                        'applicable_governorates' => $governorates === [] ? null : $governorates,
+                        'status' => FlyerStatus::Draft,
+                        'total_pages' => count($this->imageUrls),
+                        'bluf_summary' => null,
+                    ]);
 
-            Log::info('Flyer created in draft.', [
-                'flyer_id' => $flyer->id,
-                'slug' => $flyer->slug,
-                'title' => $flyer->title,
-            ]);
+                    Log::info('Flyer created in draft.', [
+                        'flyer_id' => $flyer->id,
+                        'slug' => $flyer->slug,
+                        'title' => $flyer->title,
+                    ]);
 
-            $this->updateRawPostFlyer($flyer->id);
+                    $this->updateRawPostFlyer($flyer->id);
 
-            $this->dispatchPageProcessingBatch(
-                flyerId: $flyer->id,
-                imageUrls: $this->imageUrls,
-                startPageNumber: 0,
-                batchName: 'flyer-'.$flyer->id.'-'.$this->facebookPostId,
-            );
+                    $this->dispatchPageProcessingBatch(
+                        flyerId: $flyer->id,
+                        imageUrls: $this->imageUrls,
+                        startPageNumber: 0,
+                        batchName: 'flyer-'.$flyer->id.'-'.$this->facebookPostId,
+                    );
 
-            Log::info('Gatekeeper fan-out dispatched.', [
-                'flyer_id' => $flyer->id,
-                'jobs_count' => count($this->imageUrls),
-            ]);
+                    Log::info('Gatekeeper fan-out dispatched.', [
+                        'flyer_id' => $flyer->id,
+                        'jobs_count' => count($this->imageUrls),
+                    ]);
                 }); // end Cache::lock()->block()
             } catch (LockTimeoutException $e) {
                 Log::warning('Could not acquire flyer ingest lock, releasing job for retry.', [
@@ -437,21 +443,18 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
         }
     }
 
-    private function fallbackTitle(string $retailerName): string
-    {
-        return trim($retailerName).' Offers '.Carbon::today('Africa/Cairo')->format('Y-m-d');
-    }
-
     /**
      * Build ProcessSinglePageJobs and dispatch them as one batch.
      *
      * The then() callback enforces the ZERO-ITEMS KILL-SWITCH: if OCR extracted
-     * no products at all, the flyer (and its pages) are deleted and the raw post
-     * is marked rejected — it is NEVER published, never purged, never pinged.
+     * no products at all, the flyer (and its pages) are deleted — FlyerObserver
+     * reaps the R2 objects and purges the CDN — and the raw post is marked
+     * rejected. It is NEVER published, never purged as live content, never
+     * pinged.
      * Otherwise it recounts pages straight from the DB (O(1) aggregate — pages
-     * may have merged further while jobs ran), refreshes BLUF/editorial, and on
-     * auto-publish fires async Cloudflare purge dispatches (no synchronous
-     * network inside the worker).
+     * may have merged further while jobs ran), refreshes BLUF/editorial, and
+     * lets FlyerObserver (single authority, via save()) fire the afterCommit
+     * purge + IndexNow dispatches.
      *
      * @param  list<string>  $imageUrls
      */
@@ -500,9 +503,13 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
                             ]);
                         }
 
-                        // تنظيف وحذف المجلة وكل صفحاتها وسلعها الصفرية
-                        $flyer->pages()->delete();
-                        $flyer->items()->delete();
+                        // تنظيف وحذف المجلة: Eloquent delete fires
+                        // FlyerObserver::deleting, which captures every page's
+                        // R2 image paths BEFORE SQLite's ON DELETE CASCADE
+                        // wipes flyer_pages — the queued afterCommit closure
+                        // then reaps the R2 objects. Deleting pages()/items()
+                        // via bulk queries first would fire zero model events
+                        // and orphan every WebP file on R2.
                         $flyer->delete();
 
                         return; // خروج فوري - لن تُنشر ولن تلوث الموقع
@@ -518,31 +525,18 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
 
                     $flyer->bluf_summary = self::buildBlufSummary($flyer);
                     $flyer->editorial_overview = self::buildEditorialOverview($flyer);
-                    // Quiet save: FlyerObserver stays silent so this callback's explicit
-                    // purge below remains the SINGLE purge authority (no observer cascade).
-                    $flyer->saveQuietly();
+                    // Auditable save (NOT saveQuietly): FlyerObserver is the SINGLE
+                    // authority for the Cloudflare purge + sitemap/llms cache forget
+                    // + IndexNow ping on publish. It fires once, afterCommit, with
+                    // the full canonical URL set — no double purge, no double ping.
+                    $flyer->save();
 
                     Log::info($autoPublish ? 'Flyer auto-published with verified items.' : 'Flyer merged and pending_review with verified items.', [
                         'flyer_id' => $flyer->id,
-                        'items_count' => $itemsCount,
+                        'items_count' => $validItemsCount,
                         'batch_id' => $batch->id,
                         'status' => $flyer->status->value,
                     ]);
-
-                    if ($autoPublish) {
-                        try {
-                            // Single authority: PurgeCloudflareCacheJob purges the Edge
-                            // AND fans out PingIndexNowJob internally — never dispatch
-                            // PingIndexNowJob alongside it (would double-ping).
-                            $flyerUrl = route('flyers.show', $flyer->slug);
-                            PurgeCloudflareCacheJob::dispatch([$flyerUrl]);
-                        } catch (Throwable $e) {
-                            Log::warning('Failed to dispatch post-publish purge.', [
-                                'flyer_id' => $flyer->id,
-                                'error' => $e->getMessage(),
-                            ]);
-                        }
-                    }
                 } catch (Throwable $e) {
                     Log::error('Failed in batch then() for flyer.', [
                         'flyer_id' => $flyerId,
@@ -632,33 +626,23 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
         return $title;
     }
 
-    private function generateUniqueSlug(string $title, string $retailerSlug, string $facebookPostId): string
+    /**
+     * Format a decimal for Arabic copy: "12.00" → "12", "15.50" → "15.5".
+     */
+    private static function trimDecimal(float $value): string
     {
-        $base = Str::slug($title);
+        $trimmed = rtrim(rtrim(number_format($value, 2, '.', ''), '0'), '.');
 
-        if ($base === '') {
-            $base = Str::slug($retailerSlug.'-'.$facebookPostId);
-        }
-
-        $suffix = Str::lower(Str::ulid()->toString());
-        $suffix = substr($suffix, -6);
-
-        $candidate = $base.'-'.$suffix;
-
-        $counter = 0;
-        $slug = $candidate;
-
-        while (Flyer::where('slug', $slug)->exists()) {
-            $counter++;
-            $slug = $candidate.'-'.$counter;
-        }
-
-        return $slug;
+        return $trimmed === '' ? '0' : $trimmed;
     }
 
-    private function generateBlufSummary(Flyer $flyer): string
+    /**
+     * Format an EGP price: trim decimals FIRST, then append the currency —
+     * rtrim()ing the finished string would eat the Arabic "ج.م" suffix.
+     */
+    private static function formatEgp(float $amount): string
     {
-        return self::buildBlufSummary($flyer);
+        return self::trimDecimal($amount).' ج.م';
     }
 
     public static function buildBlufSummary(Flyer $flyer): string
@@ -683,7 +667,10 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
                     maxDiscount: $maxDiscount
                 );
 
-                if (trim($geminiText) !== '' && ! preg_match('/[a-zA-Z]/', $geminiText)) {
+                // Quality gate: the summary must carry actual Arabic content.
+                // Brand names (LG, iPhone, HP, 4K) are legitimate — rejecting on
+                // any Latin character threw away good Arabic copy wholesale.
+                if (trim($geminiText) !== '' && preg_match('/[\x{0600}-\x{06FF}]/u', $geminiText)) {
                     return $geminiText;
                 }
             } catch (Throwable $e) {
@@ -691,18 +678,40 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
             }
 
             $titleForBluf = $flyer->title ?? 'العرض';
-            $untilCarbon = $flyer->valid_until instanceof Carbon ? $flyer->valid_until : Carbon::parse($flyer->valid_until);
-            $untilText = $untilCarbon->locale('ar')->isoFormat('dddd D MMMM YYYY');
-            if (! str_contains($untilText, 'سبتمبر') && ! str_contains($untilText, 'يناير')) {
-                $untilText = ArabicDateHelper::formatArabicDate($untilCarbon);
+            // NEVER Carbon::parse('') — an empty/garbage valid_until would resolve
+            // to "today" and misstate the offer window. Fall back to a neutral
+            // Arabic-formatted current date only when a parseable date exists.
+            $untilText = ArabicDateHelper::formatArabicDate(Carbon::now('Africa/Cairo'));
+            $untilRaw = $flyer->valid_until;
+
+            if ($untilRaw instanceof Carbon || (is_string($untilRaw) && trim($untilRaw) !== '')) {
+                try {
+                    $untilCarbon = $untilRaw instanceof Carbon
+                        ? $untilRaw->copy()->setTimezone('Africa/Cairo')
+                        : Carbon::parse(trim((string) $untilRaw), 'Africa/Cairo');
+
+                    $untilText = $untilCarbon->locale('ar')->isoFormat('dddd D MMMM YYYY');
+                    if (! preg_match('/[\x{0600}-\x{06FF}]/u', $untilText)) {
+                        $untilText = ArabicDateHelper::formatArabicDate($untilCarbon);
+                    }
+                } catch (Throwable $e) {
+                    Log::debug('BLUF valid_until parse failed, using neutral date.', [
+                        'flyer_id' => $flyer->id,
+                        'error' => $e->getMessage(),
+                    ]);
+                }
             }
-            $maxDiscount = $flyer->items()->max('discount_percent');
-            $discount = number_format((float) ($maxDiscount ?? 0), 2, '.', '');
-            $discount = rtrim(rtrim($discount, '0'), '.');
+
+            $maxDiscount = (float) ($flyer->items()->max('discount_percent') ?? 0);
+            // 0% protection: never publish "بخصومات تصل إلى 0%." — when no real
+            // discount was detected, advertise competitive pricing instead.
+            $discountPhrase = $maxDiscount > 0
+                ? 'بخصومات تصل إلى '.self::trimDecimal($maxDiscount).'%'
+                : 'بأسعار تنافسية مخفضة';
             $topProducts = $flyer->items()->limit(5)->pluck('product_name')->filter()->implode('، ');
             $topProducts = $topProducts !== '' ? $topProducts : 'سلع متنوعة';
 
-            return "تصفح {$titleForBluf} الساري في مصر حتى {$untilText}، بخصومات تصل إلى {$discount}%. يشمل العرض تخفيضات قوية على {$topProducts} بجميع الفروع وحتى نفاذ الكمية.";
+            return "تصفح {$titleForBluf} الساري في مصر حتى {$untilText}، {$discountPhrase}. يشمل العرض تخفيضات قوية على {$topProducts} بجميع الفروع وحتى نفاذ الكمية.";
         } catch (Throwable $e) {
             Log::warning('Failed to generate BLUF summary, using ultimate fallback.', [
                 'flyer_id' => $flyer->id,
@@ -723,7 +732,9 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
                 /** @var GeminiVisionService $gemini */
                 $gemini = app(GeminiVisionService::class);
                 $text = $gemini->generateEditorialOverview($flyer);
-                if (trim($text) !== '' && ! preg_match('/[a-zA-Z]/', $text)) {
+                // Arabic-presence gate (NOT a Latin-rejection gate): brand names
+                // like LG / iPhone / 4K are valid inside Arabic copy.
+                if (trim($text) !== '' && preg_match('/[\x{0600}-\x{06FF}]/u', $text)) {
                     $text = (string) preg_replace('/(\d+)\.\s+(\d+%)/u', '$1.$2', $text);
                     $text = (string) preg_replace('/(\d+)\s+%/u', '$1%', $text);
 
@@ -738,31 +749,39 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
             $from = $flyer->valid_from instanceof Carbon ? $flyer->valid_from->format('Y-m-d') : (string) $flyer->valid_from;
             $until = $flyer->valid_until instanceof Carbon ? $flyer->valid_until->format('Y-m-d') : (string) $flyer->valid_until;
             try {
-                $fromCarbon = Carbon::parse($flyer->valid_from);
-                $untilCarbon = Carbon::parse($flyer->valid_until);
-                $from = $fromCarbon->locale('ar')->isoFormat('D MMMM YYYY');
-                $until = $untilCarbon->locale('ar')->isoFormat('D MMMM YYYY');
-                if (! preg_match('/[\x{0600}-\x{06FF}]/u', $from)) {
-                    $from = ArabicDateHelper::formatArabicDate($fromCarbon);
-                    $until = ArabicDateHelper::formatArabicDate($untilCarbon);
+                // Explicit Cairo tz + null guard: Carbon::parse('') would silently
+                // resolve to today and fabricate a wrong offer window.
+                $fromRaw = $flyer->valid_from;
+                $untilRaw = $flyer->valid_until;
+
+                if ($fromRaw !== null && $untilRaw !== null) {
+                    $fromCarbon = $fromRaw instanceof Carbon
+                        ? $fromRaw->copy()->setTimezone('Africa/Cairo')
+                        : Carbon::parse(trim((string) $fromRaw), 'Africa/Cairo');
+                    $untilCarbon = $untilRaw instanceof Carbon
+                        ? $untilRaw->copy()->setTimezone('Africa/Cairo')
+                        : Carbon::parse(trim((string) $untilRaw), 'Africa/Cairo');
+
+                    $from = $fromCarbon->locale('ar')->isoFormat('D MMMM YYYY');
+                    $until = $untilCarbon->locale('ar')->isoFormat('D MMMM YYYY');
+                    if (! preg_match('/[\x{0600}-\x{06FF}]/u', $from)) {
+                        $from = ArabicDateHelper::formatArabicDate($fromCarbon);
+                        $until = ArabicDateHelper::formatArabicDate($untilCarbon);
+                    }
                 }
             } catch (Throwable $e) {
             }
 
-            $maxDiscount = $flyer->items()->max('discount_percent');
-            $discountRange = $maxDiscount ? number_format((float) $maxDiscount, 2, '.', '').'%' : 'متنوعة';
-            $discountRange = rtrim(rtrim($discountRange, '0'), '.');
-            $discountRange = str_replace('. ', '.', $discountRange);
+            $maxDiscount = (float) ($flyer->items()->max('discount_percent') ?? 0);
+            // Trim ".00" BEFORE appending the unit — rtrim() on the finished
+            // string hits the Arabic "ج.م" suffix and is a no-op.
+            $discountRange = $maxDiscount > 0 ? self::trimDecimal($maxDiscount).'%' : 'متنوعة';
             $discountRange = (string) preg_replace('/(\d+)\.\s+(\d)/u', '$1.$2', $discountRange);
 
             $heroDeals = $flyer->items()->orderByDesc('discount_percent')->limit(4)->get();
             $heroText = $heroDeals->map(function ($item): string {
-                $sale = number_format((float) $item->sale_price, 2, '.', '').' ج.م';
-                $sale = rtrim(rtrim($sale, '0'), '.');
-                $sale = str_replace('. ', '.', $sale);
-                $old = $item->old_price ? number_format((float) $item->old_price, 2, '.', '').' ج.م' : null;
-                $old = $old ? rtrim(rtrim($old, '0'), '.') : null;
-                $old = $old ? str_replace('. ', '.', $old) : null;
+                $sale = self::formatEgp((float) $item->sale_price);
+                $old = $item->old_price ? self::formatEgp((float) $item->old_price) : null;
                 $discount = $item->discount_percent ? round((float) $item->discount_percent).'%' : '';
                 if ($old) {
                     return "{$item->product_name} بسعر {$sale} بدلاً من {$old} بخصم {$discount}";
@@ -778,10 +797,9 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
             $para1 = "تقدم مجلة {$title} من {$retailerName} عروضاً حصرية سارية في مصر من {$from} حتى {$until}، بخصومات {$discountRange} على تشكيلة واسعة من السلع الغذائية والمستلزمات المنزلية.";
             if ($heroDeals->isNotEmpty()) {
                 $bullets = $heroDeals->map(function ($item): string {
-                    $sale = number_format((float) $item->sale_price, 2, '.', '').' ج.م';
-                    $sale = rtrim(rtrim($sale, '0'), '.');
+                    $sale = self::formatEgp((float) $item->sale_price);
                     $discount = $item->discount_percent ? ' (خصم '.round((float) $item->discount_percent).'%)' : '';
-                    $old = $item->old_price ? ' بدلاً من '.rtrim(rtrim(number_format((float) $item->old_price, 2, '.', '').' ج.م', '0'), '.') : '';
+                    $old = $item->old_price ? ' بدلاً من '.self::formatEgp((float) $item->old_price) : '';
 
                     return "- {$item->product_name} بسعر {$sale}{$old}{$discount}";
                 })->implode("\n");

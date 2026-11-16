@@ -7,8 +7,8 @@ namespace App\Filament\Resources;
 use App\Enums\FlyerStatus;
 use App\Filament\Resources\FlyerResource\Pages;
 use App\Filament\Resources\FlyerResource\RelationManagers\ItemsRelationManager;
-use App\Jobs\PingIndexNowJob;
 use App\Models\Flyer;
+use App\Observers\FlyerObserver;
 use App\Services\ImageOptimizerService;
 use Filament\Forms;
 use Filament\Forms\Components\Actions\Action;
@@ -132,7 +132,7 @@ final class FlyerResource extends Resource
                 Forms\Components\Section::make('Pages')
                     ->description('Facebook image order — use ↑ ↓ buttons to reorder safely. Thumbnails from R2.')
                     ->schema([
-                        Forms\Components\Repeater::make('pages')
+                        Repeater::make('pages')
                             ->label('Flyer Pages')
                             ->relationship('pages')
                             // orderColumn stays INTENTIONALLY: it is the single numbering
@@ -345,20 +345,21 @@ final class FlyerResource extends Resource
                     ->color('success')
                     ->icon('heroicon-o-check-circle')
                     ->requiresConfirmation()
-                    ->modalHeading('Publish flyer & ping IndexNow?')
-                    ->modalDescription('This will set status to published and queue an IndexNow ping in background.')
+                    ->modalHeading('Publish flyer?')
+                    ->modalDescription('Status will be set to published; FlyerObserver queues the IndexNow ping (single authority — no double ping).')
                     ->visible(fn (Flyer $record): bool => $record->status !== FlyerStatus::Published)
                     ->action(function (Flyer $record): void {
                         $record->status = FlyerStatus::Published;
+                        // $record->save() fires FlyerObserver's batched IndexNow
+                        // ping — a manual PingIndexNowJob dispatch here would
+                        // double-ping every URL and waste the IndexNow quota.
                         $record->save();
 
                         Notification::make()
                             ->title('Flyer published')
-                            ->body('"'.$record->title.'" is now published and queued for IndexNow.')
+                            ->body('"'.$record->title.'" is now published — IndexNow ping queued by the observer.')
                             ->success()
                             ->send();
-
-                        PingIndexNowJob::dispatch(route('flyers.show', $record->slug));
                     }),
             ])
             ->bulkActions([
@@ -371,15 +372,18 @@ final class FlyerResource extends Resource
                         ->icon('heroicon-o-check-circle')
                         ->requiresConfirmation()
                         ->action(function (Collection $records): void {
-                            foreach ($records as $record) {
-                                $record->status = FlyerStatus::Published;
-                                $record->save();
-                                PingIndexNowJob::dispatch(route('flyers.show', $record->slug));
-                            }
+                            // Single authority: FlyerObserver::bulkPublish()
+                            // persists every flyer with saveQuietly() (no
+                            // per-model events) and dispatches ONE combined
+                            // PurgeCloudflareCacheJob + ONE PingIndexNowJob —
+                            // never 2N per-flyer external API jobs.
+                            $published = FlyerObserver::bulkPublish($records);
 
                             Notification::make()
                                 ->title('Bulk publish queued')
-                                ->body(count($records).' flyers published and IndexNow pings queued.')
+                                ->body($published > 0
+                                    ? $published.' flyers published — one combined CDN purge and one IndexNow ping queued.'
+                                    : 'No flyers changed status — nothing was queued.')
                                 ->success()
                                 ->send();
                         })

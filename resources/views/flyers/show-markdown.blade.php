@@ -1,9 +1,13 @@
 # {{ $flyer->title }}
 
-**المتجر:** {{ $flyer->retailer->name }}
-**تاريخ السريان:** من {{ $flyer->valid_from->format('Y-m-d') }} حتى {{ $flyer->valid_until->format('Y-m-d') }} (بتوقيت القاهرة)
-**الحالة:** {{ \Carbon\Carbon::parse($flyer->valid_until)->lt(\Carbon\Carbon::today('Africa/Cairo')) ? 'منتهي الصلاحية' : 'سارٍ الآن' }}
-**عدد الصفحات:** {{ $flyer->total_pages }}
+**المتجر:** {{ $flyer->retailer?->name ?? '—' }}
+**تاريخ السريان:** من {{ $flyer->valid_from?->format('Y-m-d') ?? '—' }} حتى {{ $flyer->valid_until?->format('Y-m-d') ?? '—' }} (بتوقيت القاهرة)
+**الحالة:** {{ $flyer->isExpired() ? 'منتهي الصلاحية' : 'سارٍ الآن' }}
+**عدد الصفحات:** {{ $flyer->pages_count ?? $flyer->total_pages }}
+@if ($flyer->isExpired() && ! empty($latestActiveFlyer))
+
+**مجلة سارية جديدة لنفس المتجر:** [{{ $latestActiveFlyer->title }}]({{ rtrim((string) config('app.url'), '/').route('flyers.show', ['slug' => $latestActiveFlyer->slug], false) }})
+@endif
 
 ## خلاصة العرض (BLUF)
 {{ $flyer->bluf_summary }}

@@ -3,8 +3,14 @@
     $r2DiskUrl = R2Url::base();
     $firstPage = $flyer->pages->first();
     $coverImage = $firstPage ? R2Url::asset($firstPage->image_path) : url('/img/og-cover.png');
-    $pageUrl = route('flyers.show', $flyer->slug);
+    // Canonical strictly from config('app.url') + relative route — request
+    // hosts (admin, CLI, proxies, www) must never poison canonical/@ids.
+    $baseUrl = rtrim((string) config('app.url'), '/');
+    $pageUrl = $baseUrl.route('flyers.show', ['slug' => $flyer->slug], false);
+    $homeUrl = $baseUrl.'/';
+    $retailerUrl = $baseUrl.route('retailers.show', ['retailer' => $flyer->retailer->slug], false);
     $cleanTitle = $flyer->title;
+    $isExpired = $flyer->isExpired();
 
     // BLUF — Bulletproof Arabic via Flyer accessor
     $bluf = $flyer->bluf_summary;
@@ -17,29 +23,40 @@
     :og-description="$bluf"
     :og-image="$coverImage"
     og-type="article"
+    :robots="$isExpired ? 'noindex, follow' : 'index, follow, max-image-preview:large, max-snippet:-1, max-video-preview:-1'"
 >
     @push('schema')
         @php
             $siteName = config('app.name', 'مجلاتنا');
-            $organizationId = url('/') . '#organization';
-            $websiteId = url('/') . '#website';
-            $breadcrumbId = $pageUrl . '#breadcrumb';
-            $eventId = $pageUrl . '#event';
-            $itemListId = $pageUrl . '#itemlist';
+            $organizationId = $homeUrl.'#organization';
+            $websiteId = $homeUrl.'#website';
+            $breadcrumbId = $pageUrl.'#breadcrumb';
+            $eventId = $pageUrl.'#event';
+            $announcementId = $pageUrl.'#announcement';
+            $itemListId = $pageUrl.'#itemlist';
+
+            // Cairo-accurate Event dates: date-only strings parsed EXPLICITLY
+            // in Africa/Cairo (start/end of day, no TZ drift) → full ISO-8601.
+            $eventStart = \Carbon\Carbon::createFromFormat('Y-m-d', $flyer->valid_from->toDateString(), 'Africa/Cairo')->startOfDay()->toIso8601String();
+            $eventEnd = \Carbon\Carbon::createFromFormat('Y-m-d', $flyer->valid_until->toDateString(), 'Africa/Cairo')->endOfDay()->toIso8601String();
 
             // Page-id => absolute image URL map (from already-loaded pages: zero extra queries).
             // Lets each Product carry its own page image instead of the shared cover.
             $pageImages = $flyer->pages->mapWithKeys(fn ($p) => [$p->id => R2Url::asset($p->image_path)]);
+
+            // ALL discounted items — itemListElement MUST match numberOfItems
+            // (a take(50) truncation makes the count a lie for rich results).
+            $discountedItems = $flyer->items->where('sale_price', '>', 0)->values();
 
             $graph = [
                 [
                     '@type' => 'Organization',
                     '@id' => $organizationId,
                     'name' => $siteName,
-                    'url' => url('/'),
+                    'url' => $homeUrl,
                     'logo' => [
                         '@type' => 'ImageObject',
-                        'url' => url('/favicon.svg'),
+                        'url' => $homeUrl.'favicon.svg',
                         'width' => 140,
                         'height' => 36,
                     ],
@@ -47,11 +64,12 @@
                         '@type' => 'Country',
                         'name' => 'EG',
                     ],
+                    'sameAs' => array_values(array_filter((array) config('app.social_links', []))),
                 ],
                 [
                     '@type' => 'WebSite',
                     '@id' => $websiteId,
-                    'url' => url('/'),
+                    'url' => $homeUrl,
                     'name' => $siteName,
                     'publisher' => ['@id' => $organizationId],
                 ],
@@ -59,8 +77,8 @@
                     '@type' => 'BreadcrumbList',
                     '@id' => $breadcrumbId,
                     'itemListElement' => [
-                        ['@type' => 'ListItem', 'position' => 1, 'name' => 'الرئيسية', 'item' => url('/')],
-                        ['@type' => 'ListItem', 'position' => 2, 'name' => $flyer->retailer->name, 'item' => route('retailers.show', $flyer->retailer->slug)],
+                        ['@type' => 'ListItem', 'position' => 1, 'name' => 'الرئيسية', 'item' => $homeUrl],
+                        ['@type' => 'ListItem', 'position' => 2, 'name' => $flyer->retailer->name, 'item' => $retailerUrl],
                         ['@type' => 'ListItem', 'position' => 3, 'name' => $cleanTitle, 'item' => $pageUrl],
                     ],
                 ],
@@ -69,9 +87,11 @@
                     '@id' => $eventId,
                     'name' => $cleanTitle,
                     'description' => $bluf,
-                    'startDate' => \App\Support\CairoTime::toIso8601(\Carbon\Carbon::parse($flyer->valid_from)->startOfDay()),
-                    'endDate' => \App\Support\CairoTime::toIso8601(\Carbon\Carbon::parse($flyer->valid_until)->endOfDay()),
-                    'eventStatus' => $flyer->isExpired() ? 'EventCancelled' : 'EventScheduled',
+                    'startDate' => $eventStart,
+                    'endDate' => $eventEnd,
+                    // Full schema.org URIs — bare "EventScheduled" is not valid.
+                    // A finished sale is EventCompleted (not "cancelled").
+                    'eventStatus' => $isExpired ? 'https://schema.org/EventCompleted' : 'https://schema.org/EventScheduled',
                     'eventAttendanceMode' => 'https://schema.org/OfflineEventAttendanceMode',
                     'location' => [
                         '@type' => 'Place',
@@ -84,11 +104,25 @@
                     'organizer' => ['@id' => $organizationId],
                 ],
                 [
+                    '@type' => 'SpecialAnnouncement',
+                    '@id' => $announcementId,
+                    'name' => $cleanTitle,
+                    'text' => $bluf,
+                    'datePosted' => $flyer->created_at?->timezone('Africa/Cairo')->toIso8601String(),
+                    'expires' => $eventEnd,
+                    'category' => 'عروض وتخفيضات متاجر السوبرماركت في مصر',
+                    'announcementLocation' => [
+                        '@type' => 'AdministrativeArea',
+                        'name' => 'Egypt',
+                    ],
+                    'url' => $pageUrl,
+                ],
+                [
                     '@type' => 'ItemList',
                     '@id' => $itemListId,
                     'name' => 'قائمة أسعار وسلع ' . $cleanTitle,
-                    'numberOfItems' => $flyer->items->count(),
-                    'itemListElement' => $flyer->items->take(50)->values()->map(function ($item, $idx) use ($pageUrl, $flyer, $coverImage, $pageImages) {
+                    'numberOfItems' => $discountedItems->count(),
+                    'itemListElement' => $discountedItems->map(function ($item, $idx) use ($pageUrl, $flyer, $coverImage, $pageImages, $isExpired) {
                         $hasOld = $item->old_price && (float) $item->old_price > (float) $item->sale_price;
                         $offer = [
                             '@type' => 'Offer',
@@ -96,28 +130,35 @@
                             'price' => number_format((float) $item->sale_price, 2, '.', ''),
                             'priceCurrency' => 'EGP',
                             'priceValidUntil' => \Carbon\Carbon::parse($flyer->valid_until)->format('Y-m-d'),
-                            'availability' => $flyer->isExpired() ? 'https://schema.org/Discontinued' : 'https://schema.org/InStock',
+                            'availability' => $isExpired ? 'https://schema.org/Discontinued' : 'https://schema.org/InStock',
                             'seller' => ['@type' => 'Organization', 'name' => $flyer->retailer->name],
                         ];
                         if ($hasOld) {
                             $offer['priceSpecification'] = [
                                 '@type' => 'UnitPriceSpecification',
-                                'priceType' => 'https://schema.org/ListPrice',
+                                // The struck-through old price is a strikethrough,
+                                // NOT a ListPrice (ListPrice claims a real RRP).
+                                'priceType' => 'https://schema.org/StrikethroughPrice',
                                 'price' => number_format((float) $item->old_price, 2, '.', ''),
                                 'priceCurrency' => 'EGP',
                             ];
                         }
+                        $product = [
+                            '@type' => 'Product',
+                            'name' => $item->product_name,
+                            'image' => $pageImages[$item->flyer_page_id] ?? $coverImage,
+                            'url' => $pageUrl . '#item-' . $item->id,
+                            'offers' => $offer,
+                        ];
+                        // Brand hygiene: ONLY a real brand — NEVER fall back to
+                        // the product name (a Product is not its own Brand).
+                        if ($item->brand?->name) {
+                            $product['brand'] = ['@type' => 'Brand', 'name' => $item->brand->name];
+                        }
                         return [
                             '@type' => 'ListItem',
                             'position' => $idx + 1,
-                            'item' => [
-                                '@type' => 'Product',
-                                'name' => $item->product_name,
-                                'image' => $pageImages[$item->flyer_page_id] ?? $coverImage,
-                                'url' => $pageUrl . '#item-' . $item->id,
-                                'brand' => ['@type' => 'Brand', 'name' => $item->brand?->name ?: $item->product_name],
-                                'offers' => $offer,
-                            ],
+                            'item' => $product,
                         ];
                     })->all(),
                 ],
@@ -153,10 +194,10 @@
                         <p class="mt-0.5 text-xs text-amber-800">
                             الأسعار والخصومات الواردة أدناه محفوظة كأرشيف تاريخي لمقارنة تطور الأسعار في مصر.
                         </p>
-                        @if($latestActive = $flyer->retailer->latestActiveFlyer())
+                        @if($latestActiveFlyer ?? null)
                             <div class="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-xl bg-white p-3 border border-amber-200">
                                 <span class="text-xs font-bold text-slate-700">تتوفر الآن مجلة جديدة سارية لهذا المتجر:</span>
-                                <a href="{{ route('flyers.show', $latestActive->slug) }}" class="inline-flex items-center gap-1 rounded-lg bg-[#039652] px-3.5 py-1.5 text-xs font-black text-white hover:bg-[#023b55] transition shadow-sm">
+                                <a href="{{ route('flyers.show', $latestActiveFlyer->slug) }}" class="inline-flex items-center gap-1 rounded-lg bg-[#039652] px-3.5 py-1.5 text-xs font-black text-white hover:bg-[#023b55] transition shadow-sm">
                                     مشاهدة عروض {{ $flyer->retailer->name }} السارية الآن ←
                                 </a>
                             </div>
@@ -239,15 +280,21 @@
                     @php
                         $fullImageUrl = R2Url::asset($page->image_path);
                         $mobileOptimizedUrl = R2Url::resizedAsset($page->image_path, 600);
+                        // Real intrinsic dimensions from the DB — hardcoded
+                        // guesses cause CLS on non-A4 pages.
+                        $pageW = (int) ($page->width ?: 1200);
+                        $pageH = (int) ($page->height ?: 1600);
                     @endphp
-                    <button type="button" data-index="{{ $loop->index }}" aria-label="تكبير صفحة {{ $page->page_number }}" class="lightbox-trigger block w-full cursor-zoom-in focus:outline-none focus:ring-2 focus:ring-[#039652] focus:ring-offset-2" style="aspect-ratio: 3/4;">
+                    <button type="button" data-index="{{ $loop->index }}" aria-label="تكبير صفحة {{ $page->page_number }}" class="lightbox-trigger block w-full cursor-zoom-in focus:outline-none focus:ring-2 focus:ring-[#039652] focus:ring-offset-2" style="aspect-ratio: {{ $pageW }}/{{ $pageH }};">
                         <img
                             src="{{ $fullImageUrl }}"
-                            srcset="{{ $fullImageUrl }} 1200w, {{ $mobileOptimizedUrl }} 600w"
-                            sizes="(max-width: 640px) 100vw, 768px"
+                            @if ($mobileOptimizedUrl && $mobileOptimizedUrl !== $fullImageUrl)
+                                srcset="{{ $fullImageUrl }} {{ $pageW }}w, {{ $mobileOptimizedUrl }} 600w"
+                                sizes="(max-width: 640px) 100vw, 768px"
+                            @endif
                             alt="{{ $cleanTitle }} - صفحة {{ $page->page_number }}"
-                            width="1200"
-                            height="1600"
+                            width="{{ $pageW }}"
+                            height="{{ $pageH }}"
                             @if ($loop->first) loading="eager" fetchpriority="high" decoding="async" @else loading="lazy" decoding="async" @endif
                             class="w-full h-auto object-contain"
                         >
@@ -323,7 +370,7 @@
     </script>
     <script>
     document.addEventListener('DOMContentLoaded', function(){
-        const pages = @json($flyer->pages->sortBy('page_number')->values()->map(fn($p) => ['src' => \App\Support\R2Url::asset($p->image_path), 'alt' => $cleanTitle.' - صفحة '.$p->page_number]));
+        const pages = {!! json_encode($flyer->pages->sortBy('page_number')->values()->map(fn($p) => ['src' => \App\Support\R2Url::asset($p->image_path), 'alt' => $cleanTitle.' - صفحة '.$p->page_number])->all(), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE) ?: '[]' !!};
         if(!pages.length) return;
         let current = 0;
         let zoomed = false;
@@ -462,7 +509,7 @@
         </div>
         <div class="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4">
             @foreach ($sameRetailerFlyers as $related)
-                @php $cov = $related->coverPage ?? $related->pages->first(); $u = $cov ? \App\Support\R2Url::asset($cov->image_path) : '/img/placeholder-flyer.png'; @endphp
+                @php $cov = $related->coverPage; $u = $cov ? \App\Support\R2Url::asset($cov->image_path) : '/img/placeholder-flyer.png'; @endphp
                 <a href="{{ route('flyers.show', $related->slug) }}" class="group flex flex-col overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm transition hover:border-[#039652] hover:shadow-md">
                     <div class="relative aspect-[3/4] overflow-hidden bg-slate-100">
                         <img src="{{ $u }}" alt="{{ $related->title }}" width="400" height="530" loading="lazy" class="h-full w-full object-cover transition duration-300 group-hover:scale-[1.03]">
@@ -487,7 +534,7 @@
         </div>
         <div class="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4">
             @foreach ($competitorFlyers as $comp)
-                @php $cov = $comp->coverPage ?? $comp->pages->first(); $u = $cov ? \App\Support\R2Url::asset($cov->image_path) : '/img/placeholder-flyer.png'; @endphp
+                @php $cov = $comp->coverPage; $u = $cov ? \App\Support\R2Url::asset($cov->image_path) : '/img/placeholder-flyer.png'; @endphp
                 <a href="{{ route('flyers.show', $comp->slug) }}" class="group flex flex-col overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm transition hover:border-[#039652] hover:shadow-md">
                     <div class="relative aspect-[3/4] overflow-hidden bg-slate-100">
                         <img src="{{ $u }}" alt="{{ $comp->title }}" width="400" height="530" loading="lazy" class="h-full w-full object-cover transition duration-300 group-hover:scale-[1.03]">
@@ -515,7 +562,7 @@
         <p class="mb-4 text-xs text-slate-500">للمقارنة ومعرفة تطور الأسعار قبل الشراء — توثيق تاريخي لآخر 30 يوم</p>
         <div class="grid grid-cols-2 gap-4 sm:grid-cols-3">
             @foreach ($archiveFlyers as $arc)
-                @php $cov = $arc->coverPage ?? $arc->pages->first(); $u = $cov ? \App\Support\R2Url::asset($cov->image_path) : '/img/placeholder-flyer.png'; @endphp
+                @php $cov = $arc->coverPage; $u = $cov ? \App\Support\R2Url::asset($cov->image_path) : '/img/placeholder-flyer.png'; @endphp
                 <a href="{{ route('flyers.show', $arc->slug) }}" class="flex flex-col overflow-hidden rounded-xl border border-slate-200 bg-white opacity-95 hover:opacity-100 hover:border-[#023b55]/20 transition">
                     <div class="relative aspect-[3/4] overflow-hidden bg-slate-100">
                         <img src="{{ $u }}" alt="{{ $arc->title }}" width="400" height="530" loading="lazy" class="h-full w-full object-cover grayscale hover:grayscale-0 transition">

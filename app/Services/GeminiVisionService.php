@@ -4,11 +4,14 @@ declare(strict_types=1);
 
 namespace App\Services;
 
+use App\Exceptions\GeminiRateLimitedException;
 use App\Models\Flyer;
+use App\Support\PublicUrlGuard;
 use Carbon\Carbon;
 use Illuminate\Http\Client\Response;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
+use Psr\Http\Message\ResponseInterface;
 use RuntimeException;
 use Throwable;
 
@@ -18,11 +21,15 @@ final class GeminiVisionService
 
     private const TIMEOUT_SECONDS = 60;
 
+    /** Hard cap per classification image download — protects the 128MB worker. */
+    private const MAX_INLINE_IMAGE_BYTES = 15 * 1024 * 1024;
+
     private function model(): string
     {
-        $model = (string) (config('services.gemini.model') ?? env('GEMINI_MODEL', 'gemini-2.5-flash'));
+        // Config-only by contract: env() is resolved once in config/services.php.
+        $model = trim((string) config('services.gemini.model', 'gemini-2.5-flash'));
 
-        return trim($model) !== '' ? trim($model) : 'gemini-2.5-flash';
+        return $model !== '' ? $model : 'gemini-2.5-flash';
     }
 
     private const MAX_RETRIES = 4;
@@ -213,12 +220,20 @@ final class GeminiVisionService
     }
 
     /**
-     * Core Gemini HTTP call with 429 retry and invalid JSON handling.
+     * Core Gemini HTTP call with capped transient-5xx retry.
+     *
+     * Auth travels in the `x-goog-api-key` header — never `?key=` in the
+     * query string, which leaks into access/proxy logs.
+     *
+     * On 429 the call throws GeminiRateLimitedException immediately so the
+     * queue job can release() itself and free the timeout-bounded worker,
+     * instead of the worker burning its whole runtime in usleep() loops.
      *
      * @param  array<string, mixed>  $payload
      * @return array<string, mixed>
      *
      * @throws RuntimeException
+     * @throws GeminiRateLimitedException
      */
     private function callGemini(array $payload, string $apiKey): array
     {
@@ -226,6 +241,9 @@ final class GeminiVisionService
 
         $attempt = 0;
         $delayMs = self::INITIAL_RETRY_DELAY_MS;
+        // Cap inline backoff: any longer wait must happen via job release(),
+        // never inside the (timeout-bounded) worker process.
+        $maxDelayMs = 5000;
 
         while (true) {
             $attempt++;
@@ -236,34 +254,27 @@ final class GeminiVisionService
                     ->withHeaders([
                         'Content-Type' => 'application/json',
                         'Accept' => 'application/json',
+                        'x-goog-api-key' => $apiKey,
                     ])
                     ->withOptions([
                         'http_errors' => false,
                     ])
-                    ->post($url.'?key='.$apiKey, $payload);
+                    ->post($url, $payload);
 
                 $status = $response->status();
 
                 if ($status === 429) {
                     $retryAfter = (int) $response->header('Retry-After');
-                    // Linear backoff scaled to the 60s RPM window:
-                    // Attempt 1 = 8s, Attempt 2 = 16s, Attempt 3 = 24s, Attempt 4 = 32s.
-                    // Honors server-sent Retry-After when present.
-                    $waitMs = $retryAfter > 0 ? $retryAfter * 1000 : ($attempt * self::INITIAL_RETRY_DELAY_MS);
 
                     Log::warning('Gemini API 429 Too Many Requests.', [
                         'attempt' => $attempt,
                         'retry_after' => $retryAfter,
-                        'wait_ms' => $waitMs,
                     ]);
 
-                    if ($attempt >= self::MAX_RETRIES) {
-                        throw new RuntimeException('Gemini API rate limited (429) after '.$attempt.' attempts.');
-                    }
-
-                    usleep($waitMs * 1000);
-
-                    continue;
+                    throw new GeminiRateLimitedException(
+                        'Gemini API rate limited (429) after '.$attempt.' attempt(s).',
+                        $retryAfter,
+                    );
                 }
 
                 if (! $response->successful()) {
@@ -275,10 +286,10 @@ final class GeminiVisionService
                         'attempt' => $attempt,
                     ]);
 
-                    // Retry on 5xx transient
+                    // Retry on 5xx transient with a capped backoff
                     if ($status >= 500 && $status < 600 && $attempt < self::MAX_RETRIES) {
-                        usleep($delayMs * 1000);
-                        $delayMs *= 2;
+                        usleep(min($delayMs, $maxDelayMs) * 1000);
+                        $delayMs = min($delayMs * 2, $maxDelayMs);
 
                         continue;
                     }
@@ -305,12 +316,14 @@ final class GeminiVisionService
                 }
 
                 return $this->extractJsonFromCandidate($json);
+            } catch (GeminiRateLimitedException $e) {
+                throw $e;
             } catch (RuntimeException $e) {
-                // Re-throw 429 already handled; don't retry if max reached
-                if (str_contains($e->getMessage(), '429') && $attempt < self::MAX_RETRIES) {
-                    continue;
-                }
-
+                // Deliberate failures — permanent 4xx API errors (400/401/403/
+                // 404), empty/invalid bodies, malformed candidates — must
+                // propagate immediately instead of burning the retry budget.
+                // Connection-level failures (ConnectionException) are NOT
+                // RuntimeExceptions and still fall through to the retry below.
                 throw $e;
             } catch (Throwable $e) {
                 Log::error('Gemini HTTP call failed.', [
@@ -322,8 +335,8 @@ final class GeminiVisionService
                     throw new RuntimeException('Gemini HTTP call failed after '.$attempt.' attempts: '.$e->getMessage(), 0, $e);
                 }
 
-                usleep($delayMs * 1000);
-                $delayMs *= 2;
+                usleep(min($delayMs, $maxDelayMs) * 1000);
+                $delayMs = min($delayMs * 2, $maxDelayMs);
             }
         }
     }
@@ -390,13 +403,14 @@ final class GeminiVisionService
 
     private function apiKey(): string
     {
-        $key = (string) (config('services.gemini.key') ?? env('GEMINI_API_KEY', ''));
+        // Config-only by contract: env() is resolved once in config/services.php.
+        $key = trim((string) config('services.gemini.key', ''));
 
-        if (trim($key) === '') {
+        if ($key === '') {
             throw new RuntimeException('GEMINI_API_KEY is not configured.');
         }
 
-        return trim($key);
+        return $key;
     }
 
     /**
@@ -407,14 +421,35 @@ final class GeminiVisionService
     private function fetchImageAsInlineData(string $url): ?array
     {
         try {
+            // SSRF guard BEFORE any byte is fetched: webhook-supplied URLs must
+            // never probe loopback/private/reserved origins or internal metadata.
+            PublicUrlGuard::assertPublicHttpUrl($url);
+
             $response = Http::timeout(15)
                 ->withHeaders([
-                    'User-Agent' => '3roodNet-GeminiVision/1.0',
+                    'User-Agent' => 'Magalatna-GeminiVision/1.0',
                     'Accept' => 'image/*',
                 ])
                 ->withOptions([
-                    'allow_redirects' => true,
+                    // Redirect SSRF guard: every 30x hop is re-validated — a
+                    // redirect must never pivot into loopback/private/reserved
+                    // IP ranges or internal hostnames.
+                    'allow_redirects' => [
+                        'max' => 5,
+                        'on_redirect' => static function ($request, $response, $uri): void {
+                            PublicUrlGuard::assertPublicHttpUrl((string) $uri);
+                        },
+                    ],
                     'http_errors' => false,
+                    // Abort inside Guzzle's on_headers hook BEFORE the body
+                    // streams into worker memory.
+                    'on_headers' => static function (ResponseInterface $headers): void {
+                        $contentLength = (int) ($headers->getHeaderLine('Content-Length') ?: 0);
+
+                        if ($contentLength > self::MAX_INLINE_IMAGE_BYTES) {
+                            throw new RuntimeException('Image exceeds maximum allowed size (Content-Length).');
+                        }
+                    },
                 ])
                 ->get($url);
 
@@ -430,6 +465,16 @@ final class GeminiVisionService
             $binary = $response->body();
 
             if ($binary === '') {
+                return null;
+            }
+
+            // Re-check after download: chunked responses lack Content-Length.
+            if (strlen($binary) > self::MAX_INLINE_IMAGE_BYTES) {
+                Log::warning('Classification image exceeds size cap, skipping.', [
+                    'url' => $url,
+                    'bytes' => strlen($binary),
+                ]);
+
                 return null;
             }
 
@@ -486,6 +531,38 @@ final class GeminiVisionService
     }
 
     /**
+     * Normalize a date-ish string to the Arabic "d month year" format used in
+     * prompts. Non-ISO inputs pass through untouched (Gatekeeper callers may
+     * already send pre-formatted Arabic dates).
+     */
+    private function formatArabicDate(?string $date): string
+    {
+        $date = trim((string) $date);
+
+        if ($date === '' || preg_match('/^\d{4}-\d{2}-\d{2}$/', $date) !== 1) {
+            return $date;
+        }
+
+        $months = [
+            1 => 'يناير', 2 => 'فبراير', 3 => 'مارس', 4 => 'أبريل',
+            5 => 'مايو', 6 => 'يونيو', 7 => 'يوليو', 8 => 'أغسطس',
+            9 => 'سبتمبر', 10 => 'أكتوبر', 11 => 'نوفمبر', 12 => 'ديسمبر',
+        ];
+
+        try {
+            $carbon = Carbon::createFromFormat('Y-m-d', $date, 'Africa/Cairo');
+        } catch (Throwable) {
+            return $date;
+        }
+
+        if ($carbon === false) {
+            return $date;
+        }
+
+        return $carbon->day.' '.$months[(int) $carbon->month].' '.$carbon->year;
+    }
+
+    /**
      * BLUF Summary prompt — strict Arabic only, 2 sentences, high-CTR atomic quotable (2026 SEO).
      */
     private function blufPrompt(string $retailerName, string $title, string $validFrom, string $validUntil, array $topProducts, float $maxDiscount, ?string $occasion = null): string
@@ -519,6 +596,10 @@ PROMPT;
     public function generateBlufSummary(string $retailerName, string $title, string $validFrom, string $validUntil, int $totalPages, array $topProducts = [], float $maxDiscount = 0.0, ?string $occasion = null): string
     {
         $apiKey = $this->apiKey();
+        // Normalize ISO inputs to the Arabic day-month-year format the prompt
+        // demands, so callers passing raw Y-m-d strings get consistent output.
+        $validFrom = $this->formatArabicDate($validFrom);
+        $validUntil = $this->formatArabicDate($validUntil);
         $prompt = $this->blufPrompt($retailerName, $title, $validFrom, $validUntil, $topProducts, $maxDiscount, $occasion);
 
         $payload = [
@@ -538,7 +619,9 @@ PROMPT;
 
         $raw = $this->callGeminiRawText($payload, $apiKey);
         $text = trim(html_entity_decode($raw, ENT_QUOTES | ENT_HTML5, 'UTF-8'));
-        $text = str_replace(['"', '"', '"', '&quot;', '&#34;', '&#x22;'], '', $text);
+        // Strip straight AND curly quotes plus their HTML entities — curly
+        // variants otherwise survive into titles and break JSON-LD rendering.
+        $text = str_replace(['"', '“', '”', '„', '«', '»', '&quot;', '&#34;', '&#x22;'], '', $text);
 
         // Allow Latin brand acronyms/names while rejecting pure English sentences
         $arabicCount = preg_match_all('/[\x{0600}-\x{06FF}]/u', $text);
@@ -551,8 +634,10 @@ PROMPT;
             throw new RuntimeException('Summary does not meet Arabic ratio requirements.');
         }
 
-        // Ensure 2 sentences (split by Arabic full stop)
-        $sentences = preg_split('/[.!؟。]+/u', $text, -1, PREG_SPLIT_NO_EMPTY);
+        // Ensure 2 sentences (split by Arabic full stop). (?<!\d)…(?!\d): a
+        // dot BETWEEN digits is a decimal separator (37.55%) — never a
+        // sentence boundary, so the 2nd sentence is no longer truncated.
+        $sentences = preg_split('/(?<!\d)[.!؟。]+(?!\d)/u', $text, -1, PREG_SPLIT_NO_EMPTY);
         $sentences = array_map('trim', $sentences);
         $sentences = array_filter($sentences);
         if (count($sentences) > 2) {
@@ -610,18 +695,33 @@ PROMPT;
         $title = $flyer->title ?? 'العرض';
         $validFrom = $flyer->valid_from instanceof Carbon ? $flyer->valid_from->format('Y-m-d') : (string) $flyer->valid_from;
         $validUntil = $flyer->valid_until instanceof Carbon ? $flyer->valid_until->format('Y-m-d') : (string) $flyer->valid_until;
+        // Consistent Arabic date format in the prompt (same as BLUF)
+        $validFrom = $this->formatArabicDate($validFrom);
+        $validUntil = $this->formatArabicDate($validUntil);
 
-        // Build hero deals with exact prices
-        $heroDeals = $flyer->items()->orderByDesc('discount_percent')->limit(4)->get()->map(function ($item) {
-            $old = $item->old_price ? number_format((float) $item->old_price, 2, '.', '').' ج.م' : null;
-            $sale = number_format((float) $item->sale_price, 2, '.', '').' ج.م';
-            $discount = $item->discount_percent ? round((float) $item->discount_percent).'%' : '';
-            $oldPart = $old ? " بدلاً من {$old} بخصم {$discount}" : '';
+        // Trim ".00"/trailing zeros AFTER 2-decimal formatting: "47.00" → "47",
+        // "47.50" → "47.5" — the model copies prices verbatim into the copy.
+        $formatPrice = static function ($value): string {
+            return rtrim(rtrim(number_format((float) $value, 2, '.', ''), '0'), '.');
+        };
 
-            return "{$item->product_name} بسعر {$sale}{$oldPart}";
-        })->all();
+        // Build hero deals with exact prices — discounted items ONLY
+        // (an item without a markdown is not a "hero deal" / top saving).
+        $heroDeals = $flyer->items()
+            ->where('sale_price', '>', 0)
+            ->orderByDesc('discount_percent')
+            ->limit(4)
+            ->get()
+            ->map(function ($item) use ($formatPrice) {
+                $old = $item->old_price ? $formatPrice($item->old_price).' ج.م' : null;
+                $sale = $formatPrice($item->sale_price).' ج.م';
+                $discount = $item->discount_percent ? round((float) $item->discount_percent).'%' : '';
+                $oldPart = $old ? " بدلاً من {$old} بخصم {$discount}" : '';
 
-        $discountRange = 'تصل إلى '.number_format((float) ($flyer->items()->max('discount_percent') ?? 0), 2, '.', '').'%';
+                return "{$item->product_name} بسعر {$sale}{$oldPart}";
+            })->all();
+
+        $discountRange = 'تصل إلى '.number_format((float) ($flyer->items()->where('sale_price', '>', 0)->max('discount_percent') ?? 0), 2, '.', '').'%';
         $discountRange = rtrim(rtrim($discountRange, '0'), '.');
         // Fix space bug
         $discountRange = str_replace('. ', '.', $discountRange);
@@ -635,7 +735,8 @@ PROMPT;
 
         $raw = $this->callGeminiRawText($payload, $apiKey);
         $text = trim(html_entity_decode($raw, ENT_QUOTES | ENT_HTML5, 'UTF-8'));
-        $text = str_replace(['"', '"', '"', '&quot;'], '', $text);
+        // Strip straight AND curly quotes plus their HTML entities
+        $text = str_replace(['"', '“', '”', '„', '«', '»', '&quot;', '&#34;', '&#x22;'], '', $text);
         // Allow Latin brand acronyms/names while rejecting pure English sentences
         $arabicCount = preg_match_all('/[\x{0600}-\x{06FF}]/u', $text);
         $totalLetters = preg_match_all('/\p{L}/u', $text);
@@ -657,32 +758,84 @@ PROMPT;
     }
 
     /**
-     * Editorial Overview prompt — 150 words, 2 paragraphs, fluff-free
-     */
-    /**
-     * Raw text call without JSON schema (for BLUF).
+     * Raw text call without JSON schema (for BLUF / editorial copy).
+     *
+     * Auth travels in the `x-goog-api-key` header — never `?key=` in the
+     * query string. Transient 5xx responses are retried with a capped
+     * backoff; 429 throws GeminiRateLimitedException so queue jobs can
+     * release() instead of the worker sleeping. Errors NEVER include the
+     * API key.
      *
      * @param  array<string, mixed>  $payload
+     *
+     * @throws RuntimeException
+     * @throws GeminiRateLimitedException
      */
     private function callGeminiRawText(array $payload, string $apiKey): string
     {
         $url = self::BASE_URL.'/'.$this->model().':generateContent';
-        $response = Http::timeout(self::TIMEOUT_SECONDS)
-            ->withHeaders(['Content-Type' => 'application/json'])
-            ->post($url.'?key='.$apiKey, $payload);
 
-        if (! $response->successful()) {
-            throw new RuntimeException('Gemini BLUF error: HTTP '.$response->status());
+        $attempt = 0;
+        $maxAttempts = 3;
+        $delayMs = 2000;
+
+        while (true) {
+            $attempt++;
+
+            $response = Http::timeout(self::TIMEOUT_SECONDS)
+                ->withHeaders([
+                    'Content-Type' => 'application/json',
+                    'Accept' => 'application/json',
+                    'x-goog-api-key' => $apiKey,
+                ])
+                ->withOptions([
+                    'http_errors' => false,
+                ])
+                ->post($url, $payload);
+
+            $status = $response->status();
+
+            if ($status === 429) {
+                $retryAfter = (int) $response->header('Retry-After');
+
+                Log::warning('Gemini raw-text call rate limited (429).', [
+                    'attempt' => $attempt,
+                    'retry_after' => $retryAfter,
+                ]);
+
+                throw new GeminiRateLimitedException(
+                    'Gemini API rate limited (429) on raw-text call after '.$attempt.' attempt(s).',
+                    $retryAfter,
+                );
+            }
+
+            if (! $response->successful()) {
+                Log::error('Gemini raw-text call failed.', [
+                    'status' => $status,
+                    'body_snippet' => substr((string) $response->body(), 0, 1000),
+                    'attempt' => $attempt,
+                ]);
+
+                // Retry transient 5xx with a capped backoff
+                if ($status >= 500 && $status < 600 && $attempt < $maxAttempts) {
+                    usleep($delayMs * 1000);
+                    $delayMs = min($delayMs * 2, 5000);
+
+                    continue;
+                }
+
+                throw new RuntimeException('Gemini BLUF error: HTTP '.$status);
+            }
+
+            $json = $response->json();
+            $text = $json['candidates'][0]['content']['parts'][0]['text'] ?? '';
+
+            if (! is_string($text) || trim($text) === '') {
+                throw new RuntimeException('Gemini BLUF empty response');
+            }
+
+            return trim($text);
         }
-
-        $json = $response->json();
-        $text = $json['candidates'][0]['content']['parts'][0]['text'] ?? '';
-
-        if (! is_string($text) || trim($text) === '') {
-            throw new RuntimeException('Gemini BLUF empty response');
-        }
-
-        return trim($text);
     }
 
     /**
@@ -692,11 +845,14 @@ PROMPT;
     private function classificationPrompt(int $imageCount = 1): string
     {
         $today = now('Africa/Cairo')->format('Y-m-d');
+        // Dynamic year — a hardcoded year silently misclassifies every post
+        // dated January of the following year (the "2027 timebomb").
+        $currentYear = now('Africa/Cairo')->year;
 
         return <<<PROMPT
-You are the STRICT Gatekeeper for عروض نت (Egyptian retail flyer aggregator).
+You are the STRICT Gatekeeper for مجلاتنا (Egyptian retail flyer aggregator).
 
-Current date (Africa/Cairo): {$today}. Assume year 2026 if year not explicitly visible in post/image.
+Current date (Africa/Cairo): {$today}. Assume year {$currentYear} if year not explicitly visible in post/image.
 TOTAL_IMAGES_IN_POST: {$imageCount}.
 
 Your primary mission is to identify REAL MULTI-PRODUCT RETAIL FLYERS and AGGRESSIVELY REJECT marketing noise.
@@ -723,19 +879,19 @@ Instructions:
 - is_flyer = true ONLY if it contains an actual verifiable multi-product price catalog OR a valid Flash album as defined above.
 - reason = concise Arabic explanation (1 sentence) why it was accepted or rejected.
 - flyer_title = STRICT Title formulas (ANTI-CANNIBALIZATION): NEVER return shallow titles like "عروض كازيون". Keep under 65 chars, front-load brand and dates.
-  * FORMULA A (Single-Day / Flash): "عروض [اسم المتجر] [اسم اليوم بالعربية] [رقم اليوم] [اسم الشهر بالعربية] [السنة] | عرض اليوم الواحد" — e.g. "عروض كازيون الأربعاء 9 سبتمبر 2026 | عرض اليوم الواحد"
-  * FORMULA B (Multi-Day): "عروض [اسم المتجر] من [X] حتى [Y] [اسم الشهر بالعربية] [السنة] | [المناسبة]" — e.g. "عروض كارفور من 10 حتى 20 سبتمبر 2026 | مجلة العروض والتوفير"
-- valid_from / valid_until = Extract ONLY explicit, verifiable dates stated in caption or image. Normalize to YYYY-MM-DD (year 2026 if year not visible; today is {$today}). NEVER invent, estimate, or hallucinate dates. If unsure, or if the post is an installment/app/single-product promo, return is_flyer = false.
+  * FORMULA A (Single-Day / Flash): "عروض [اسم المتجر] [اسم اليوم بالعربية] [رقم اليوم] [اسم الشهر بالعربية] [السنة] | عرض اليوم الواحد" — e.g. "عروض كازيون الأربعاء 9 سبتمبر {$currentYear} | عرض اليوم الواحد"
+  * FORMULA B (Multi-Day): "عروض [اسم المتجر] من [X] حتى [Y] [اسم الشهر بالعربية] [السنة] | [المناسبة]" — e.g. "عروض كارفور من 10 حتى 20 سبتمبر {$currentYear} | مجلة العروض والتوفير"
+- valid_from / valid_until = Extract ONLY explicit, verifiable dates stated in caption or image. Normalize to YYYY-MM-DD (year {$currentYear} if year not visible; today is {$today}). NEVER invent, estimate, or hallucinate dates. If unsure, or if the post is an installment/app/single-product promo, return is_flyer = false.
 - EGYPTIAN RETAIL TEMPORAL PARSING — MUST explicitly support all 4 core structures:
   1. Single-Day Flash Deals ("يوم السبت 12 سبتمبر فقط"): valid_from = valid_until = that exact day.
-  2. Two-Day Weekend Offers ("يوم الجمعة 11 سبتمبر ويوم السبت 12 سبتمبر"): valid_from="2026-09-11", valid_until="2026-09-12".
+  2. Two-Day Weekend Offers ("يوم الجمعة 11 سبتمبر ويوم السبت 12 سبتمبر"): valid_from="{$currentYear}-09-11", valid_until="{$currentYear}-09-12".
   3. Cross-Month Campaigns ("من 11 سبتمبر حتى 1 أكتوبر"): increment the month for end dates.
   4. Open-ended with Start Date ("ساري من 10 سبتمبر وحتى نفاذ الكمية"): Calculate valid_until as valid_from + 10 days.
      EXCEPTION — "Until Stock Lasts" (حتى نفاذ الكمية): if the post contains a clear explicit START date (valid_from) AND the phrase "حتى نفاذ الكمية" (variants: "حتى نفاد الكمية", "حتي نفاذ الكميه", "until stock lasts"), you MAY accept it as a valid flyer (is_flyer = true) — BUT ONLY if it ALSO passes the REAL FLYER multi-product catalog test above; brand promos and single-product ads remain rejected (is_flyer = false). If BOTH valid_from and valid_until are missing/cannot be extracted, you MUST reject — no exception applies.
 === EGYPTIAN SLANG & COLLOQUIAL DATE RULES ===
 - "إنهاردة" / "النهارده" means "Today" ({$today}); "بكرة" / "بكره" means "Tomorrow".
-- If text says "من إنهاردة وحتى 16-9-2026", valid_from = "{$today}", valid_until = "2026-09-16".
-- If text says "إنهاردة وبكرة الإثنين والثلاثاء 7 و 8 سبتمبر", valid_from = "2026-09-07", valid_until = "2026-09-08".
+- If text says "من إنهاردة وحتى 16-9-{$currentYear}", valid_from = "{$today}", valid_until = "{$currentYear}-09-16".
+- If text says "إنهاردة وبكرة الإثنين والثلاثاء 7 و 8 سبتمبر", valid_from = "{$currentYear}-09-07", valid_until = "{$currentYear}-09-08".
 - Never reject a post simply because it uses colloquial Egyptian date phrasing like "من إنهاردة".
 === GOVERNORATES ===
 - applicable_governorates = List of Egyptian governorates mentioned (Arabic names e.g., "القاهرة", "الجيزة", "الإسكندرية" or English "Cairo","Giza"). Return [] if applies to all Egypt / no restriction mentioned.

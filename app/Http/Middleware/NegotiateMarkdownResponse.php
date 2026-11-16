@@ -22,10 +22,24 @@ final class NegotiateMarkdownResponse
     {
         $response = $next($request);
 
-        // Ensure Vary header for CDN caching differentiation on every response.
-        $response->headers->set('Vary', 'Accept', false);
+        // Merge `Accept` into any existing Vary value — Symfony's set(..., false)
+        // would append a SECOND Vary header line, which some CDN tiers treat
+        // as malformed and silently drop (cache-key fragmentation).
+        $existingVary = (string) $response->headers->get('Vary', '');
+        $varyTokens = array_values(array_filter(array_map(
+            static fn (string $t): string => trim($t),
+            explode(',', $existingVary),
+        ), static fn (string $t): bool => $t !== ''));
 
-        if (self::wantsMarkdown($request)) {
+        if (! in_array('Accept', $varyTokens, true)) {
+            $varyTokens[] = 'Accept';
+        }
+
+        $response->headers->set('Vary', implode(', ', $varyTokens));
+
+        if (self::wantsMarkdown($request) && ! $response->headers->has('X-Robots-Tag')) {
+            // Fallback only: controllers set the richer "noindex, follow"
+            // (plus canonical Link headers); never downgrade it to "noindex".
             $response->headers->set('X-Robots-Tag', 'noindex');
         }
 

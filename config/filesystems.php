@@ -76,7 +76,7 @@ return [
                 $url = (string) preg_replace('#^https:(?!//)#i', 'https://', $url);
                 $url = (string) preg_replace('#^http:(?!//)#i', 'http://', $url);
                 if (! str_starts_with(strtolower($url), 'http://') && ! str_starts_with(strtolower($url), 'https://')) {
-                    $url = 'https://' . ltrim($url, '/');
+                    $url = 'https://'.ltrim($url, '/');
                 }
 
                 return rtrim($url, '/');
@@ -86,6 +86,9 @@ return [
             'throw' => true,
             'visibility' => 'public',
             'report' => false,
+            // Cloudflare Image Transformations (/cdn-cgi/image/) is a PAID zone
+            // feature — Free Plan returns 403/404. Opt-in only.
+            'image_resizing_enabled' => env('CLOUDFLARE_IMAGE_RESIZING_ENABLED', false),
         ],
 
     ],
