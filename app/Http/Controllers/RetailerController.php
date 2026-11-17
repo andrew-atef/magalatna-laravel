@@ -6,6 +6,7 @@ namespace App\Http\Controllers;
 
 use App\Enums\FlyerStatus;
 use App\Models\Flyer;
+use App\Models\FlyerItem;
 use App\Models\Retailer;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
@@ -66,6 +67,31 @@ final class RetailerController extends Controller
             ->where('valid_until', '>=', $cairoToday)
             ->count();
 
+        // GEO / AI-crawler item-level price highlights: the top-discounted
+        // items across this retailer's LIVE-TODAY flyers, in ONE constrained
+        // query — max 15 rows, selected columns only, flyer hydrated as
+        // id/slug/title/valid_until for deep links. Skipped entirely when no
+        // flyer is live today (gate runs BEFORE any query executes).
+        $topRetailerItems = collect();
+        if ($activeCount > 0) {
+            $topRetailerItems = FlyerItem::query()
+                ->with(['flyer:id,slug,title,valid_until', 'brand:id,name'])
+                ->where('sale_price', '>', 0)
+                ->whereHas('flyer', function ($q) use ($retailer, $cairoToday): void {
+                    $q->where('retailer_id', $retailer->id)
+                        ->where('status', FlyerStatus::Published)
+                        // "السارية اليوم" = live today: a flyer starting tomorrow
+                        // must never contribute items to a today-labeled table
+                        // (mirrors the $activeCount gate above).
+                        ->where('valid_from', '<=', $cairoToday)
+                        ->where('valid_until', '>=', $cairoToday);
+                })
+                // Items with no computed discount sort last (never as "0%").
+                ->orderByRaw('CASE WHEN discount_percent IS NULL THEN 1 ELSE 0 END, discount_percent DESC')
+                ->limit(15)
+                ->get(['id', 'flyer_id', 'brand_id', 'product_name', 'sale_price', 'old_price', 'discount_percent', 'unit']);
+        }
+
         // SEO metadata: canonical = /{retailer:slug}, targeted Arabic Title (smart clean_name to avoid مصر مصر stuttering)
         $year = Carbon::now('Africa/Cairo')->year;
         $seoTitle = "عروض {$retailer->clean_name} في مصر اليوم {$year} | أحدث المجلات والتخفيضات";
@@ -92,6 +118,7 @@ final class RetailerController extends Controller
             'expiredFlyers' => $expiredFlyers,
             'otherActiveFlyers' => $otherActiveFlyers,
             'activeCount' => $activeCount,
+            'topRetailerItems' => $topRetailerItems,
             'seoTitle' => $seoTitle,
             'seoDescription' => $seoDescription,
             'canonical' => $canonical,

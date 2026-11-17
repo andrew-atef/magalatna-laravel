@@ -252,6 +252,50 @@
         @endif
     </section>
 
+    <!-- Top Active Deals (item-level price highlights) - GEO for AI crawlers -->
+    @if ($topRetailerItems->isNotEmpty())
+        <section class="mb-12">
+            <div class="mb-4 flex items-center justify-between">
+                <h2 class="text-lg font-black text-[#023b55] sm:text-xl">أبرز أسعار وعروض {{ $retailer->clean_name }} السارية اليوم</h2>
+                <span class="text-xs font-semibold text-slate-500">أسعار فعلية من المجلات السارية</span>
+            </div>
+            <div class="overflow-x-auto rounded-2xl border border-slate-200 bg-white shadow-sm">
+                <table class="w-full min-w-[640px] text-right text-sm">
+                    <thead>
+                        <tr class="border-b border-slate-200 bg-slate-50 text-xs text-slate-600">
+                            <th scope="col" class="px-4 py-3 font-black">اسم السلعة</th>
+                            <th scope="col" class="px-4 py-3 font-black">الوحدة</th>
+                            <th scope="col" class="px-4 py-3 font-black">سعر العرض</th>
+                            <th scope="col" class="px-4 py-3 font-black">السعر القديم</th>
+                            <th scope="col" class="px-4 py-3 font-black">نسبة التوفير</th>
+                        </tr>
+                    </thead>
+                    <tbody class="divide-y divide-slate-100">
+                        @foreach ($topRetailerItems as $item)
+                            <tr class="transition hover:bg-[#039652]/5">
+                                <td class="px-4 py-3 font-bold text-[#023b55]">
+                                    <a href="{{ route('flyers.show', $item->flyer->slug) }}#item-{{ $item->id }}" class="hover:text-[#039652] hover:underline">
+                                        {{ $item->product_name }}@if ($item->brand) <span class="font-normal text-slate-500">— {{ $item->brand->name }}</span>@endif
+                                    </a>
+                                </td>
+                                <td class="px-4 py-3 text-slate-600">{{ $item->unit ?? '—' }}</td>
+                                <td class="px-4 py-3 font-black text-[#023b55]">{{ number_format((float) $item->sale_price, 2) }} ج.م</td>
+                                <td class="px-4 py-3 text-slate-600">{{ $item->old_price !== null ? number_format((float) $item->old_price, 2).' ج.م' : '—' }}</td>
+                                <td class="px-4 py-3">
+                                    @if ($item->discount_percent !== null)
+                                        <span class="rounded bg-[#039652]/10 px-2 py-0.5 text-xs font-black text-[#027a42]">-{{ round((float) $item->discount_percent) }}%</span>
+                                    @else
+                                        <span class="text-slate-500">—</span>
+                                    @endif
+                                </td>
+                            </tr>
+                        @endforeach
+                    </tbody>
+                </table>
+            </div>
+        </section>
+    @endif
+
     <!-- Recently Expired (Price History) - Navy -->
     @if ($expiredFlyers->isNotEmpty())
         <section class="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
