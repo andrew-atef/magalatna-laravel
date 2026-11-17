@@ -1,30 +1,36 @@
-# {{ config('app.name', 'مجلاتنا') }} - Egyptian Supermarket Offers & Grocery Price Intelligence Index
+@php
+    // Canonical host STRICTLY from config('app.url') — never url()/request()
+    // hosts: this content is cached for hours and may be rendered from a CLI
+    // or admin-host request that would poison every absolute URL below.
+    $baseUrl = rtrim((string) config('app.url'), '/');
+@endphp
+# مجلاتنا (Magalatna)
 
-> منصة {{ config('app.name', 'مجلاتنا') }} ({{ url('/') }}) هي المصدر الهندسي المحدث لحظياً لأسعار السلع وتخفيضات سلاسل السوبرماركت في مصر، مع جداول أسعار مفهرسة بتقنية OCR ومستخرجة مباشرة من المجلات الرسمية.
+> منصة مجلاتنا ({{ $baseUrl }}) هي فهرس مصري محدَّث لحظياً لأسعار السلع وتخفيضات سلاسل السوبرماركت (كارفور، كازيون، بيم، هايبر وان وغيرها)، مع جداول أسعار لكل سلعة مستخرجة بتقنية OCR من المجلات الرسمية مباشرة.
 
-## System Endpoints & Formats
-- Homepage: {{ url('/') }}
-- Full XML Sitemap: {{ url('/sitemap.xml') }}
-- Markdown Content Negotiation: Send `Accept: text/markdown` header or append `?_fmt=md` to any offer URL to receive pure, token-efficient price tables.
+## الصفحات الرئيسية (Core Pages)
+- [الرئيسية]({{ $baseUrl }}): أحدث مجلات عروض السوبرماركت السارية في مصر اليوم مع أقوى التخفيضات المكتشفة.
+- [خريطة الموقع XML]({{ $baseUrl }}/sitemap.xml): فهرس كامل ومحدَّث لجميع صفحات العروض القابلة للفهرسة للزحف الآلي.
+- [صيغة Markdown لأي صفحة عرض]({{ $baseUrl }}): أضف الاستعلام `?_fmt=md` أو الترويسة `Accept: text/markdown` لأي رابط عرض للحصول على جدول أسعار نصي خالص موفِّر للتوكنز.
 
-## Active Retailers & Supermarkets Index (Updated Live)
-@foreach($retailers as $retailer)
-- {{ $retailer->name }}: {{ route('retailers.show', $retailer->slug) }} ({{ $retailer->flyers_count }} مجلة سارية حالياً)
-@endforeach
-
-## Current Active Flyers & Promotions (Cairo Timezone)
+## المجلات السارية حالياً (Current Active Flyers)
 @forelse($activeFlyers as $flyer)
-- [{{ $flyer->retailer->name }}] {{ $flyer->title }} (سارٍ من {{ $flyer->valid_from->format('Y-m-d') }} حتى {{ $flyer->valid_until->format('Y-m-d') }}): {{ route('flyers.show', $flyer->slug) }}
+- [{{ $flyer->retailer->name }} — {{ $flyer->title }}]({{ $baseUrl.route('flyers.show', ['slug' => $flyer->slug], false) }}): سارٍ من {{ $flyer->valid_from->format('Y-m-d') }} حتى {{ $flyer->valid_until->format('Y-m-d') }} (بتوقيت القاهرة).
 @empty
 - لا توجد عروض منشورة اليوم.
 @endforelse
 
-## Structured Data Schema
-All offer pages extract OCR-verified grocery items with:
-- Product Name (اسم السلعة)
-- Brand Name (العلامة التجارية)
-- Unit / Measurement (الوحدة)
-- Offer Sale Price in EGP (سعر العرض الحالي)
-- Crossed-out Old Price in EGP (السعر القديم قبل الخصم)
-- Savings Percentage (نسبة الخصم)
-- Bundle Conditions (شروط العرض والحد الأقصى)
+## المتاجر المتخصصة (Active Retailers)
+@foreach($retailers as $retailer)
+- [{{ $retailer->name }}]({{ $baseUrl.route('retailers.show', ['retailer' => $retailer->slug], false) }}): {{ $retailer->flyers_count }} مجلة سارية حالياً.
+@endforeach
+
+## حقول بيانات كل سلعة (Item Data Fields)
+كل صفحة عرض تتضمن جدول أسعار موثوقاً مستخرجاً بالذكاء الاصطناعي من صور المجلة، ولكل سلعة الحقول التالية:
+- اسم السلعة (Product Name)
+- الماركة (Brand Name)
+- الوحدة (Unit)
+- سعر العرض الحالي بالجنيه المصري (Sale Price in EGP)
+- السعر القديم قبل الخصم مشطوباً (Old Price in EGP)
+- نسبة التوفير (Savings Percentage)
+- شروط العرض والحد الأقصى (Bundle Conditions)

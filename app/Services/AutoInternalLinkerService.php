@@ -217,7 +217,13 @@ final class AutoInternalLinkerService
                 foreach ($items as $item) {
                     $pName = trim((string) $item->product_name);
                     if (mb_strlen($pName) >= 3) {
-                        $map[$pName] ??= rtrim((string) config('app.url'), '/').route('flyers.show', ['slug' => $currentFlyer->slug], false);
+                        // Deep-link to the item's OWN table row anchor instead of
+                        // pointing N identical links at the flyer root URL: the
+                        // root target would duplicate the canonical page in the
+                        // link graph and waste crawl equity on one URL.
+                        $map[$pName] ??= rtrim((string) config('app.url'), '/')
+                            .route('flyers.show', ['slug' => $currentFlyer->slug], false)
+                            .'#item-'.$item->id;
                     }
                 }
             } catch (Throwable) {

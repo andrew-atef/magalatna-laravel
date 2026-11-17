@@ -64,21 +64,27 @@
             if ($schemaMainEntity !== null) {
                 $collectionPage['mainEntity'] = $schemaMainEntity;
             }
-            $retailerGraph = [
-                [
-                    '@type' => 'Organization',
-                    '@id' => $orgId,
-                    'name' => $siteNameForSchema,
-                    'url' => $baseUrl . '/',
-                    'logo' => [
-                        '@type' => 'ImageObject',
-                        'url' => $baseUrl . '/favicon.svg',
-                        'width' => 140,
-                        'height' => 36,
-                    ],
-                    'areaServed' => 'EG',
-                    'sameAs' => array_values(array_filter((array) config('app.social_links', []))),
+            // Real social profiles only — NEVER emit an empty "sameAs": []
+            // (Rich Results flags an empty array as an invalid property).
+            $siteSocialLinks = array_values(array_filter((array) config('app.social_links', [])));
+            $siteOrganization = [
+                '@type' => 'Organization',
+                '@id' => $orgId,
+                'name' => $siteNameForSchema,
+                'url' => $baseUrl . '/',
+                'logo' => [
+                    '@type' => 'ImageObject',
+                    'url' => $baseUrl . '/favicon.svg',
+                    'width' => 140,
+                    'height' => 36,
                 ],
+                'areaServed' => 'EG',
+            ];
+            if ($siteSocialLinks !== []) {
+                $siteOrganization['sameAs'] = $siteSocialLinks;
+            }
+            $retailerGraph = [
+                $siteOrganization,
                 [
                     '@type' => 'WebSite',
                     '@id' => $websiteId,
@@ -132,7 +138,7 @@
                     @endif
                 </p>
                 <div class="mt-4 flex flex-wrap gap-2">
-                    <span class="inline-flex items-center gap-1.5 rounded-full bg-[#039652]/10 px-3 py-1 text-xs font-bold text-[#039652] border border-[#039652]/20">
+                    <span class="inline-flex items-center gap-1.5 rounded-full bg-[#039652]/10 px-3 py-1 text-xs font-bold text-[#027a42] border border-[#039652]/20">
                         <span class="h-2 w-2 rounded-full bg-[#039652]"></span>
                         {{ $activeCount }} مجلة سارية الآن
                     </span>
@@ -191,7 +197,7 @@
                                 @elseif ($isPast)
                                     <span class="rounded bg-slate-100 px-2 py-0.5 text-[10px] font-bold text-slate-500">منتهي</span>
                                 @else
-                                    <span class="rounded bg-[#039652]/10 px-2 py-0.5 font-bold text-[#039652]">سارٍ الآن</span>
+                                    <span class="rounded bg-[#039652]/10 px-2 py-0.5 font-bold text-[#027a42]">سارٍ الآن</span>
                                 @endif
                             </div>
                         </div>
@@ -234,7 +240,7 @@
                                         </h3>
                                         <div class="mt-3 flex items-center justify-between border-t border-slate-100 pt-3 text-[11px]">
                                             <span class="text-slate-500">{{ $altFrom->format('d/m') }} → {{ $altUntil->format('d/m/Y') }}</span>
-                                            <span class="rounded bg-[#039652]/10 px-2 py-0.5 font-bold text-[#039652]">سارٍ الآن</span>
+                                            <span class="rounded bg-[#039652]/10 px-2 py-0.5 font-bold text-[#027a42]">سارٍ الآن</span>
                                         </div>
                                     </div>
                                 </article>

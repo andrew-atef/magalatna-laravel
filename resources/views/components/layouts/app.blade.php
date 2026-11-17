@@ -144,7 +144,6 @@
             <a href="{{ route('home') }}" class="flex items-center gap-2 no-underline shrink-0" aria-label="{{ config('app.name', 'مجلاتنا') }} - الرئيسية">
                 <img src="/logo.webp" alt="مجلاتنا - عروض وتخفيضات السوبرماركت في مصر" width="140" height="36" class="h-9 w-auto object-contain" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'">
                 <span class="hidden h-9 w-9 items-center justify-center rounded-xl bg-[#023b55] text-white font-black text-xl shadow-md shadow-[#023b55]/20 border border-[#039652]/30">ع</span>
-                <span class="sr-only">{{ config('app.name', 'مجلاتنا') }}</span>
             </a>
 
             <!-- Desktop Navigation (lg+) -->
@@ -156,8 +155,14 @@
                 <a href="{{ $carrefour ? route('retailers.show', ['retailer' => $carrefour->slug]) : '#' }}" class="hover:text-[#039652] transition-colors">كارفور</a>
                 @php $bim = $headerRetailers->firstWhere('slug','bimmisr') ?? $headerRetailers->firstWhere('slug','bim'); @endphp
                 <a href="{{ $bim ? route('retailers.show', ['retailer' => $bim->slug]) : '#' }}" class="hover:text-[#039652] transition-colors">بيم</a>
-                <a href="{{ route('home', ['q' => 'اليوم الواحد']) }}" class="hover:text-[#039652] transition-colors">عروض اليوم الواحد</a>
-                <a href="{{ route('home', ['type' => 'magazines']) }}" class="hover:text-[#039652] transition-colors">جميع المجلات</a>
+                {{-- Interactive <button>, NOT a crawlable <a>: a global-header ?q=
+                search link on EVERY page floods GSC with internal-search
+                crawl-bloat URLs. Bots do not execute onclick handlers. --}}
+                <button type="button" onclick="window.location.href='{{ route('home', ['q' => 'اليوم الواحد']) }}'" class="cursor-pointer hover:text-[#039652] transition-colors">عروض اليوم الواحد</button>
+                {{-- Anchor to the in-page section — ?type=magazines is a pure
+                duplicate URL (HomeController never filters by type): it only
+                created duplicate cache keys and noindex bloat. --}}
+                <a href="{{ route('home') }}#latest-flyers" class="hover:text-[#039652] transition-colors">جميع المجلات</a>
             </nav>
 
             <!-- Desktop Search Bar (lg+) -->
@@ -204,7 +209,10 @@
     </header>
 
     <!-- Mobile Drawer - Stores List -->
-    <div id="mobile-drawer" class="fixed inset-0 z-50 hidden" aria-hidden="true">
+    {{-- inert while closed: aria-hidden alone does not stop focus from
+    reaching the drawer's links/buttons while it is display:none-cycled —
+    Lighthouse "focusable elements inside aria-hidden" / prohibited-ARIA. --}}
+    <div id="mobile-drawer" class="fixed inset-0 z-50 hidden" aria-hidden="true" inert>
         <div id="mobile-drawer-backdrop" class="absolute inset-0 bg-black/50 backdrop-blur-sm"></div>
         <div class="absolute right-0 top-0 h-full w-80 max-w-[85vw] bg-white shadow-2xl flex flex-col">
             <div class="flex items-center justify-between border-b border-slate-200 px-4 py-3">
@@ -216,10 +224,12 @@
             <div class="flex-1 overflow-y-auto px-2 py-3">
                 <nav class="space-y-1">
                     <a href="{{ route('home') }}" class="flex items-center gap-2 rounded-xl px-3 py-2.5 text-sm font-bold text-[#023b55] hover:bg-[#039652]/10 hover:text-[#039652] transition">الرئيسية</a>
-                    <a href="{{ route('home', ['type' => 'magazines']) }}" class="flex items-center gap-2 rounded-xl px-3 py-2.5 text-sm font-bold text-[#023b55] hover:bg-[#039652]/10 hover:text-[#039652] transition">جميع المجلات</a>
-                    <a href="{{ route('home', ['q' => 'اليوم الواحد']) }}" class="flex items-center gap-2 rounded-xl px-3 py-2.5 text-sm font-bold text-[#023b55] hover:bg-[#039652]/10 hover:text-[#039652] transition">عروض اليوم الواحد</a>
+                    <a href="{{ route('home') }}#latest-flyers" class="flex items-center gap-2 rounded-xl px-3 py-2.5 text-sm font-bold text-[#023b55] hover:bg-[#039652]/10 hover:text-[#039652] transition">جميع المجلات</a>
+                    {{-- Interactive <button>, NOT a crawlable <a>: no ?q= URL leaks
+                    into the crawl graph from the global drawer. --}}
+                    <button type="button" onclick="window.location.href='{{ route('home', ['q' => 'اليوم الواحد']) }}'" class="flex w-full cursor-pointer items-center gap-2 rounded-xl px-3 py-2.5 text-right text-sm font-bold text-[#023b55] hover:bg-[#039652]/10 hover:text-[#039652] transition">عروض اليوم الواحد</button>
                     <div class="my-2 border-t border-slate-100"></div>
-                    <p class="px-3 py-1 text-xs font-black text-slate-400">المتاجر</p>
+                    <p class="px-3 py-1 text-xs font-black text-slate-600">المتاجر</p>
                     @foreach ($headerRetailers as $navRet)
                         <a href="{{ route('retailers.show', $navRet->slug) }}" class="flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-bold text-[#023b55] hover:bg-slate-50 hover:text-[#039652] transition">
                             @if ($navRet->logo_path)
@@ -302,12 +312,14 @@
             if(!drawer) return;
             drawer.classList.remove('hidden');
             drawer.setAttribute('aria-hidden','false');
+            drawer.inert = false;
             document.body.style.overflow='hidden';
         }
         function closeDrawer(){
             if(!drawer) return;
             drawer.classList.add('hidden');
             drawer.setAttribute('aria-hidden','true');
+            drawer.inert = true;
             document.body.style.overflow='';
         }
         if(searchBtn) searchBtn.addEventListener('click', toggleSearch);

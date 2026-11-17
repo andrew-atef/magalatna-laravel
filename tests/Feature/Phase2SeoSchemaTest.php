@@ -153,9 +153,11 @@ final class Phase2SeoSchemaTest extends TestCase
             (string) $event['endDate'],
         );
 
-        // SpecialAnnouncement node + Organization sameAs (from config).
+        // SpecialAnnouncement node + Organization sameAs hygiene:
+        // empty social config → the sameAs key is OMITTED entirely
+        // ("sameAs": [] is flagged as an invalid property by Rich Results).
         $this->assertSame($event['endDate'], $announcement['expires']);
-        $this->assertSame([], $organization['sameAs']);
+        $this->assertArrayNotHasKey('sameAs', $organization);
     }
 
     public function test_show_json_ld_omits_fake_brand_when_brand_exists(): void
@@ -184,6 +186,62 @@ final class Phase2SeoSchemaTest extends TestCase
         $this->assertNotNull($itemList);
         $firstProduct = $itemList['itemListElement'][0]['item'];
         $this->assertArrayNotHasKey('brand', $firstProduct);
+    }
+
+    public function test_show_json_ld_emits_same_as_image_and_valid_from_only_with_real_data(): void
+    {
+        // Non-empty (with a blank entry to prove filtering) social config →
+        // sameAs IS emitted with exactly the real profiles.
+        config(['app.social_links' => ['https://facebook.com/magalatna', '', 'https://x.com/magalatna']]);
+
+        $flyer = $this->createPublishedFlyer([], ['slug' => 'sameas-offer', 'total_pages' => 1]);
+        $this->addPage($flyer, 'flyers/pages/p1.webp');
+        $this->addItem($flyer, [
+            'product_name' => 'زيت عباد الشمس',
+            'slug' => 'sameas-item-'.uniqid(),
+            'sale_price' => 50.0,
+            'old_price' => 80.0,
+            'discount_percent' => 37.5,
+        ]);
+
+        $content = (string) $this->get('/offers/sameas-offer')->assertOk()->getContent();
+        $this->assertSame(1, preg_match('/<script type="application\/ld\+json">\s*(\{.*?\})\s*<\/script>/s', $content, $m));
+        $decoded = json_decode($m[1], true, 512, JSON_THROW_ON_ERROR);
+
+        $organization = null;
+        $event = null;
+        $itemList = null;
+        foreach ($decoded['@graph'] as $node) {
+            if ($node['@type'] === 'Organization') {
+                $organization = $node;
+            }
+            if ($node['@type'] === 'SaleEvent') {
+                $event = $node;
+            }
+            if ($node['@type'] === 'ItemList') {
+                $itemList = $node;
+            }
+        }
+
+        $this->assertNotNull($organization);
+        $this->assertNotNull($event);
+        $this->assertNotNull($itemList);
+
+        // Real profiles only — blank entries filtered out, no empty array.
+        $this->assertSame(
+            ['https://facebook.com/magalatna', 'https://x.com/magalatna'],
+            $organization['sameAs'],
+        );
+
+        // SaleEvent carries the real cover image (Event "image" notice).
+        $this->assertNotEmpty($event['image']);
+
+        // Offer validFrom mirrors the Cairo-anchored SaleEvent startDate.
+        $firstOffer = $itemList['itemListElement'][0]['item']['offers'];
+        $this->assertSame($event['startDate'], $firstOffer['validFrom']);
+
+        // Product description is real data (name + retailer + unit), not filler.
+        $this->assertStringContainsString('زيت عباد الشمس', $itemList['itemListElement'][0]['item']['description']);
     }
 
     public function test_resized_asset_never_emits_cdn_cgi_when_disabled(): void

@@ -23,44 +23,51 @@
         @php
             $homeOrganizationId = $homeUrl . '#organization';
             $homeWebsiteId = $homeUrl . '#website';
-            $homeGraph = [
-                [
-                    '@type' => 'Organization',
-                    '@id' => $homeOrganizationId,
-                    'name' => $siteName,
-                    'url' => $homeUrl,
-                    'logo' => [
-                        '@type' => 'ImageObject',
-                        'url' => url('/favicon.svg'),
-                        'width' => 140,
-                        'height' => 36,
-                    ],
-                    'areaServed' => 'EG',
-                    'knowsAbout' => [
-                        'عروض كارفور مصر',
-                        'تخفيضات كازيون',
-                        'عروض بيم الأسبوعية',
-                        'أسعار السلع في مصر',
-                    ],
+            // Real social profiles only — NEVER emit an empty "sameAs": []
+            // (Rich Results flags an empty array as an invalid property).
+            $homeSocialLinks = array_values(array_filter((array) config('app.social_links', [])));
+            $homeOrganization = [
+                '@type' => 'Organization',
+                '@id' => $homeOrganizationId,
+                'name' => $siteName,
+                'url' => $homeUrl,
+                'logo' => [
+                    '@type' => 'ImageObject',
+                    'url' => url('/favicon.svg'),
+                    'width' => 140,
+                    'height' => 36,
                 ],
-                [
-                    '@type' => 'WebSite',
-                    '@id' => $homeWebsiteId,
-                    'name' => $siteName,
-                    'url' => $homeUrl,
-                    'publisher' => ['@id' => $homeOrganizationId],
-                    'sameAs' => array_values(array_filter((array) config('app.social_links', []))),
-                    'potentialAction' => [
-                        '@type' => 'SearchAction',
-                        'target' => [
-                            '@type' => 'EntryPoint',
-                            // rtrim() kills the double-slash bug ("...com/?q=..." not "...com//?q=...")
-                            'urlTemplate' => $homeUrl . '?q={search_term_string}',
-                        ],
-                        'query-input' => 'required name=search_term_string',
-                    ],
+                'areaServed' => 'EG',
+                'knowsAbout' => [
+                    'عروض كارفور مصر',
+                    'تخفيضات كازيون',
+                    'عروض بيم الأسبوعية',
+                    'أسعار السلع في مصر',
                 ],
             ];
+            if ($homeSocialLinks !== []) {
+                $homeOrganization['sameAs'] = $homeSocialLinks;
+            }
+            $homeWebsite = [
+                '@type' => 'WebSite',
+                '@id' => $homeWebsiteId,
+                'name' => $siteName,
+                'url' => $homeUrl,
+                'publisher' => ['@id' => $homeOrganizationId],
+                'potentialAction' => [
+                    '@type' => 'SearchAction',
+                    'target' => [
+                        '@type' => 'EntryPoint',
+                        // rtrim() kills the double-slash bug ("...com/?q=..." not "...com//?q=...")
+                        'urlTemplate' => $homeUrl . '?q={search_term_string}',
+                    ],
+                    'query-input' => 'required name=search_term_string',
+                ],
+            ];
+            if ($homeSocialLinks !== []) {
+                $homeWebsite['sameAs'] = $homeSocialLinks;
+            }
+            $homeGraph = [$homeOrganization, $homeWebsite];
             $homeUnified = [
                 '@context' => 'https://schema.org',
                 '@graph' => $homeGraph,
@@ -125,14 +132,14 @@
                                 {{ $item->flyer->retailer->name }}
                             </a>
                             @if ($item->discount_percent)
-                                <span class="rounded-full bg-[#039652]/10 px-1.5 py-0.5 text-[10px] font-black text-[#039652]">-{{ round((float) $item->discount_percent) }}%</span>
+                                <span class="rounded-full bg-[#039652]/10 px-1.5 py-0.5 text-[10px] font-black text-[#027a42]">-{{ round((float) $item->discount_percent) }}%</span>
                             @endif
                         </div>
                         <a href="{{ route('flyers.show', $item->flyer->slug) }}#item-{{ $item->id }}" class="mt-2 flex flex-1 flex-col hover:text-[#039652]" aria-label="{{ $item->product_name }} - {{ $item->flyer->retailer->name }}">
                             <div class="line-clamp-2 text-xs font-bold text-[#023b55] group-hover:text-[#039652] transition-colors">{{ $item->product_name }}</div>
                             <div class="mt-auto pt-2">
                                 @if ($item->old_price)
-                                    <div class="text-[11px] text-slate-400 line-through">{{ number_format((float) $item->old_price, 2) }} ج.م</div>
+                                    <div class="text-[11px] text-slate-600 line-through">{{ number_format((float) $item->old_price, 2) }} ج.م</div>
                                 @endif
                                 <div class="text-sm font-black text-[#039652]">{{ number_format((float) $item->sale_price, 2) }} ج.م</div>
                             </div>
@@ -166,7 +173,9 @@
     @endif
 
     <!-- المجلات السارية حالياً (Active Flyers Grid) - Navy headings -->
-    <section class="mb-12">
+    {{-- #latest-flyers: the global nav's "جميع المجلات" links HERE (never to a
+    ?type=magazines duplicate URL); scroll-mt clears the sticky header. --}}
+    <section id="latest-flyers" class="mb-12 scroll-mt-20">
         <div class="mb-4 flex items-center justify-between">
             <h2 class="text-lg font-black text-[#023b55] sm:text-xl">أحدث مجلات العروض السارية</h2>
             <span class="text-xs font-semibold text-slate-500">{{ $flyers->total() }} مجلة سارية</span>
@@ -185,8 +194,12 @@
                             alt="{{ $flyer->title }}"
                             width="600"
                             height="800"
-                            {{-- LCP: ONLY the first above-the-fold cover is eager+high priority; the rest lazy-load. --}}
-                            @if ($loop->first) loading="eager" fetchpriority="high" decoding="async" @else loading="lazy" decoding="async" @endif
+                            {{-- LCP: the first TWO above-the-fold covers are eager
+                            (card 1 also fetchpriority=high) so the Mobile LCP
+                            image starts downloading immediately; the rest lazy-load. --}}
+                            @if ($loop->index === 0) loading="eager" fetchpriority="high" decoding="async"
+                            @elseif ($loop->index === 1) loading="eager" decoding="async"
+                            @else loading="lazy" decoding="async" @endif
                             class="h-full w-full object-cover transition duration-300 group-hover:scale-105"
                         >
                         <span class="absolute right-2 top-2 rounded-lg bg-slate-900/80 px-2 py-1 text-[11px] font-bold text-white backdrop-blur">
@@ -210,14 +223,14 @@
                         @endphp
                         <div class="mt-3 flex items-center justify-between border-t border-slate-100 pt-3 text-[11px]">
                             @if ($flyer->isExpired())
-                                <span class="text-slate-400">انتهى: {{ $until->format('d/m/Y') }}</span>
-                                <span class="rounded bg-slate-100 px-2 py-0.5 text-[10px] font-bold text-slate-500">منتهي</span>
+                                <span class="text-slate-600">انتهى: {{ $until->format('d/m/Y') }}</span>
+                                <span class="rounded bg-slate-100 px-2 py-0.5 text-[10px] font-bold text-slate-600">منتهي</span>
                             @elseif ($from->isFuture())
                                 <span class="font-bold text-[#023b55]">يبدأ: {{ $from->format('d/m/Y') }}</span>
                                 <span class="rounded bg-[#fcc023] px-2 py-0.5 text-[10px] font-bold text-slate-900">قريباً</span>
                             @else
-                                <span class="text-slate-500">سارٍ حتى: {{ $until->format('d/m/Y') }}</span>
-                                <span class="rounded bg-[#039652]/10 px-2 py-0.5 font-bold text-[#039652]">سارٍ الآن</span>
+                                <span class="text-slate-600">سارٍ حتى: {{ $until->format('d/m/Y') }}</span>
+                                <span class="rounded bg-[#039652]/10 px-2 py-0.5 font-bold text-[#027a42]">سارٍ الآن</span>
                             @endif
                         </div>
                     </div>
@@ -239,7 +252,7 @@
         <section id="hot-deals" class="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm scroll-mt-20">
             <div class="mb-4 flex items-center justify-between">
                 <h2 class="text-lg font-black text-[#023b55]">أقوى تخفيضات السلع والمنتجات اليوم</h2>
-                <a href="{{ route('home', ['type' => 'magazines']) }}" class="text-xs font-bold text-[#039652] hover:underline">عرض الكل ←</a>
+                <a href="{{ route('home') }}#latest-flyers" class="text-xs font-bold text-[#039652] hover:underline">عرض الكل ←</a>
             </div>
             <div class="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
                 @foreach ($hotItems as $item)
@@ -249,14 +262,14 @@
                                 {{ $item->flyer->retailer->name }}
                             </a>
                             @if ($item->discount_percent)
-                                <span class="rounded-full bg-[#039652]/10 px-1.5 py-0.5 text-[10px] font-black text-[#039652]">-{{ round((float) $item->discount_percent) }}%</span>
+                                <span class="rounded-full bg-[#039652]/10 px-1.5 py-0.5 text-[10px] font-black text-[#027a42]">-{{ round((float) $item->discount_percent) }}%</span>
                             @endif
                         </div>
                         <a href="{{ route('flyers.show', $item->flyer->slug) }}#item-{{ $item->id }}" class="mt-2 flex flex-1 flex-col" aria-label="{{ $item->product_name }} - {{ $item->flyer->retailer->name }}">
                             <div class="line-clamp-2 text-xs font-bold text-[#023b55] group-hover:text-[#039652] transition-colors">{{ $item->product_name }}</div>
                             <div class="mt-auto pt-2">
                                 @if ($item->old_price)
-                                    <div class="text-[11px] text-slate-400 line-through">{{ number_format((float) $item->old_price, 2) }} ج.م</div>
+                                    <div class="text-[11px] text-slate-600 line-through">{{ number_format((float) $item->old_price, 2) }} ج.م</div>
                                 @endif
                                 <div class="text-sm font-black text-[#039652]">{{ number_format((float) $item->sale_price, 2) }} ج.م</div>
                             </div>

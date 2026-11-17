@@ -48,24 +48,32 @@
             // (a take(50) truncation makes the count a lie for rich results).
             $discountedItems = $flyer->items->where('sale_price', '>', 0)->values();
 
-            $graph = [
-                [
-                    '@type' => 'Organization',
-                    '@id' => $organizationId,
-                    'name' => $siteName,
-                    'url' => $homeUrl,
-                    'logo' => [
-                        '@type' => 'ImageObject',
-                        'url' => $homeUrl.'favicon.svg',
-                        'width' => 140,
-                        'height' => 36,
-                    ],
-                    'areaServed' => [
-                        '@type' => 'Country',
-                        'name' => 'EG',
-                    ],
-                    'sameAs' => array_values(array_filter((array) config('app.social_links', []))),
+            // Real social profiles only — NEVER emit an empty "sameAs": []
+            // (Rich Results flags an empty array as an invalid property).
+            $socialLinks = array_values(array_filter((array) config('app.social_links', [])));
+
+            $organizationSchema = [
+                '@type' => 'Organization',
+                '@id' => $organizationId,
+                'name' => $siteName,
+                'url' => $homeUrl,
+                'logo' => [
+                    '@type' => 'ImageObject',
+                    'url' => $homeUrl.'favicon.svg',
+                    'width' => 140,
+                    'height' => 36,
                 ],
+                'areaServed' => [
+                    '@type' => 'Country',
+                    'name' => 'EG',
+                ],
+            ];
+            if ($socialLinks !== []) {
+                $organizationSchema['sameAs'] = $socialLinks;
+            }
+
+            $graph = [
+                $organizationSchema,
                 [
                     '@type' => 'WebSite',
                     '@id' => $websiteId,
@@ -87,6 +95,9 @@
                     '@id' => $eventId,
                     'name' => $cleanTitle,
                     'description' => $bluf,
+                    // Cover image resolves the optional "image" notice in
+                    // Google Rich Results for Event structured data.
+                    'image' => [$coverImage],
                     'startDate' => $eventStart,
                     'endDate' => $eventEnd,
                     // Full schema.org URIs — bare "EventScheduled" is not valid.
@@ -122,13 +133,17 @@
                     '@id' => $itemListId,
                     'name' => 'قائمة أسعار وسلع ' . $cleanTitle,
                     'numberOfItems' => $discountedItems->count(),
-                    'itemListElement' => $discountedItems->map(function ($item, $idx) use ($pageUrl, $flyer, $coverImage, $pageImages, $isExpired) {
+                    'itemListElement' => $discountedItems->map(function ($item, $idx) use ($pageUrl, $flyer, $coverImage, $pageImages, $isExpired, $eventStart) {
                         $hasOld = $item->old_price && (float) $item->old_price > (float) $item->sale_price;
                         $offer = [
                             '@type' => 'Offer',
                             'url' => $pageUrl . '#item-' . $item->id,
                             'price' => number_format((float) $item->sale_price, 2, '.', ''),
                             'priceCurrency' => 'EGP',
+                            // Cairo-anchored start instant — same computation as
+                            // the SaleEvent startDate; resolves the optional
+                            // "validFrom" notice in Rich Results.
+                            'validFrom' => $eventStart,
                             'priceValidUntil' => \Carbon\Carbon::parse($flyer->valid_until)->format('Y-m-d'),
                             'availability' => $isExpired ? 'https://schema.org/Discontinued' : 'https://schema.org/InStock',
                             'seller' => ['@type' => 'Organization', 'name' => $flyer->retailer->name],
@@ -146,6 +161,10 @@
                         $product = [
                             '@type' => 'Product',
                             'name' => $item->product_name,
+                            // Real-data description: product + which retailer's
+                            // flyer + unit — resolves the optional "description"
+                            // notice with verifiable data (never fabricated copy).
+                            'description' => $item->product_name . ' - عرض سارٍ في ' . $flyer->retailer->name . ($item->unit ? ' (' . $item->unit . ')' : ''),
                             'image' => $pageImages[$item->flyer_page_id] ?? $coverImage,
                             'url' => $pageUrl . '#item-' . $item->id,
                             'offers' => $offer,
@@ -232,7 +251,7 @@
                         سارٍ من {{ $from->format('d/m/Y') }} حتى {{ $until->format('d/m/Y') }}
                     </span>
                 @else
-                    <span class="rounded-xl border border-[#039652]/30 bg-[#039652]/10 px-3 py-1.5 text-xs font-bold text-[#039652]">
+                    <span class="rounded-xl border border-[#039652]/30 bg-[#039652]/10 px-3 py-1.5 text-xs font-bold text-[#027a42]">
                         سارٍ حتى {{ \Carbon\Carbon::parse($flyer->valid_until)->format('d/m/Y') }}
                     </span>
                 @endif
@@ -442,7 +461,7 @@
         <h2 class="mb-2 text-lg font-black text-[#023b55]">جدول السلع والأسعار المفصلة في هذا العرض</h2>
         <p class="mb-4 text-xs text-slate-500 flex flex-wrap items-center gap-2">
             <span>تم استخراج وتدقيق هذه الأسعار تلقائياً عبر الذكاء الاصطناعي.</span>
-            <span class="inline-flex items-center gap-1 rounded-md bg-[#039652]/10 px-2 py-0.5 font-bold text-[#039652]">
+            <span class="inline-flex items-center gap-1 rounded-md bg-[#039652]/10 px-2 py-0.5 font-bold text-[#027a42]">
                 🕒 آخر رصد وتحديث للأسعار: {{ $flyer->updated_at?->timezone('Africa/Cairo')->format('Y/m/d h:i A') }} ({{ $flyer->updated_at?->timezone('Africa/Cairo')->diffForHumans() }})
             </span>
         </p>
@@ -469,7 +488,7 @@
                                     {{-- Interactive <button>, NOT a crawlable <a>: one ?q= search link per
                                     item row flooded GSC with 152 internal-search crawl-bloat URLs. Bots do
                                     not execute onclick, so this emits zero discoverable ?q= URLs. --}}
-                                    <button type="button" onclick="window.location.href='{{ route('home', ['q' => $compareQuery]) }}'" class="mt-1 inline-flex items-center gap-1 rounded-full border border-[#039652]/20 bg-[#039652]/10 px-2 py-0.5 text-[10px] font-bold text-[#039652] hover:bg-[#039652] hover:text-white transition cursor-pointer">قارن الأسعار 🔍</button>
+                                    <button type="button" onclick="window.location.href='{{ route('home', ['q' => $compareQuery]) }}'" class="mt-1 inline-flex items-center gap-1 rounded-full border border-[#039652]/20 bg-[#039652]/10 px-2 py-0.5 text-[10px] font-bold text-[#027a42] hover:bg-[#039652] hover:text-white transition cursor-pointer">قارن الأسعار 🔍</button>
                                 @endif
                             </td>
                             <td class="p-3 text-slate-500">{{ $item->brand?->name ?: '—' }}</td>
@@ -485,7 +504,7 @@
                             <td class="p-3">
                                 @if ($item->discount_percent)
                                     @php $isSuper = (float) $item->discount_percent > 30; @endphp
-                                    <span class="rounded px-2 py-0.5 text-[11px] font-bold {{ $isSuper ? 'bg-[#fcc023]/20 text-slate-900 border border-[#fcc023]/30' : 'bg-[#039652]/10 text-[#039652]' }}">
+                                    <span class="rounded px-2 py-0.5 text-[11px] font-bold {{ $isSuper ? 'bg-[#fcc023]/20 text-slate-900 border border-[#fcc023]/30' : 'bg-[#039652]/10 text-[#027a42]' }}">
                                         خصم {{ round((float) $item->discount_percent) }}%
                                     </span>
                                 @else

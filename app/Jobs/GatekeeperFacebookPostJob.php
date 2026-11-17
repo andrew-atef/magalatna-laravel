@@ -811,7 +811,15 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
         }
 
         if (mb_strlen($title) > 65) {
+            // Word-boundary truncation: cut at the LAST SPACE before the 65-char
+            // cap so Arabic words are never chopped mid-word ("| مه", "| تخفيضا"),
+            // then trim dangling separators/whitespace left by the cut.
             $title = mb_substr($title, 0, 65);
+            $lastSpace = mb_strrpos($title, ' ');
+            if ($lastSpace !== false && $lastSpace > 20) {
+                $title = mb_substr($title, 0, $lastSpace);
+            }
+            $title = rtrim($title, " \t|-");
         }
 
         return $title;
