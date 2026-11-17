@@ -466,7 +466,10 @@
                                 <div>{{ $item->product_name }}</div>
                                 @php $compareQuery = $item->brand?->name ?: \Illuminate\Support\Str::words($item->product_name, 2, ''); $compareQuery = trim((string) $compareQuery); @endphp
                                 @if ($compareQuery !== '')
-                                    <a href="{{ route('home', ['q' => $compareQuery]) }}" rel="nofollow" class="mt-1 inline-flex items-center gap-1 rounded-full border border-[#039652]/20 bg-[#039652]/10 px-2 py-0.5 text-[10px] font-bold text-[#039652] hover:bg-[#039652] hover:text-white transition">قارن الأسعار 🔍</a>
+                                    {{-- Interactive <button>, NOT a crawlable <a>: one ?q= search link per
+                                    item row flooded GSC with 152 internal-search crawl-bloat URLs. Bots do
+                                    not execute onclick, so this emits zero discoverable ?q= URLs. --}}
+                                    <button type="button" onclick="window.location.href='{{ route('home', ['q' => $compareQuery]) }}'" class="mt-1 inline-flex items-center gap-1 rounded-full border border-[#039652]/20 bg-[#039652]/10 px-2 py-0.5 text-[10px] font-bold text-[#039652] hover:bg-[#039652] hover:text-white transition cursor-pointer">قارن الأسعار 🔍</button>
                                 @endif
                             </td>
                             <td class="p-3 text-slate-500">{{ $item->brand?->name ?: '—' }}</td>

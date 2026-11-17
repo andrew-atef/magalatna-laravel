@@ -4,7 +4,6 @@ declare(strict_types=1);
 
 namespace App\Services;
 
-use App\Models\Brand;
 use App\Models\Flyer;
 use App\Models\Retailer;
 use DOMDocument;
@@ -205,17 +204,10 @@ final class AutoInternalLinkerService
             }
         }
 
-        $brands = Cache::remember('auto_linker:brands', self::CACHE_TTL, static function (): array {
-            return Brand::query()->whereNotNull('name')->where('name', '!=', '')->limit(100)->pluck('name')->all();
-        });
-
-        foreach ($brands as $brandName) {
-            $brandName = trim((string) $brandName);
-            if (mb_strlen($brandName) >= 2) {
-                $map[$brandName] ??= rtrim((string) config('app.url'), '/').route('home', ['q' => $brandName], false);
-            }
-        }
-
+        // Brands are deliberately NOT auto-linked: they have no dedicated page,
+        // and mapping them to route('home', ['q' => ...]) flooded GSC with 152
+        // crawl-bloat internal-search URLs. Keywords may ONLY map to dedicated
+        // retailer routes or flyer routes — never ?q= search URLs.
         if ($currentFlyer !== null) {
             try {
                 $items = $currentFlyer->relationLoaded('items')

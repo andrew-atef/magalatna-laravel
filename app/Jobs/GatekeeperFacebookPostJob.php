@@ -22,7 +22,9 @@ use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Bus;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Storage;
 use Throwable;
 
 final class GatekeeperFacebookPostJob implements ShouldQueue
@@ -193,9 +195,14 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
                     // Partially-overlapping but distinct flyers are NEVER swallowed
                     // into one another here; the slug-base check below is the only
                     // secondary signal, and creation stays the default otherwise.
+                    // whereDate is REQUIRED: the date cast persists DATETIME
+                    // strings ('2026-11-16 00:00:00') but $fromStr is a bare
+                    // 'Y-m-d' — a raw equality on SQLite compares STRINGS and
+                    // would never match, silently dead-disabling the primary
+                    // dedup signal (MySQL coerces, SQLite does not).
                     $existingFlyer = Flyer::where('retailer_id', $retailer->id)
-                        ->where('valid_from', $fromStr)
-                        ->where('valid_until', $untilStr)
+                        ->whereDate('valid_from', $fromStr)
+                        ->whereDate('valid_until', $untilStr)
                         ->whereIn('status', [FlyerStatus::Draft, FlyerStatus::PendingReview, FlyerStatus::Published])
                         ->orderBy('id')
                         ->first();
@@ -228,6 +235,23 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
 
                     // 3. STRICT MERGE: If ANY existing flyer matched, merge unique images into it. NEVER create -part-2!
                     if ($existingFlyer !== null) {
+                        // === [REFRESH] same-post re-ingest guard ===
+                        // When THIS raw post is the flyer's ONLY owner, a
+                        // re-ingested richer/reshuffled image set must REBUILD
+                        // the flyer in place: appending would duplicate pages
+                        // the post already owns, creating would spawn -part-2.
+                        $flyerRawCount = (int) RawFacebookPost::where('flyer_id', $existingFlyer->id)->count();
+                        $samePostOwnsFlyer = $this->rawFacebookPostId !== null
+                            && RawFacebookPost::where('flyer_id', $existingFlyer->id)
+                                ->where('id', $this->rawFacebookPostId)
+                                ->exists();
+
+                        if ($samePostOwnsFlyer && $flyerRawCount === 1) {
+                            $this->refreshSinglePostFlyer($existingFlyer);
+
+                            return;
+                        }
+
                         // Immutable photo-signature dedup: Facebook serves identical photos from
                         // rotating edge hosts (scontent-cdg/mrs/prg...), so full-URL comparison
                         // misses duplicates. Match on the host-independent photo signature.
@@ -444,21 +468,86 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
     }
 
     /**
-     * Build ProcessSinglePageJobs and dispatch them as one batch.
-     *
-     * The then() callback enforces the ZERO-ITEMS KILL-SWITCH: if OCR extracted
-     * no products at all, the flyer (and its pages) are deleted — FlyerObserver
-     * reaps the R2 objects and purges the CDN — and the raw post is marked
-     * rejected. It is NEVER published, never purged as live content, never
-     * pinged.
-     * Otherwise it recounts pages straight from the DB (O(1) aggregate — pages
-     * may have merged further while jobs ran), refreshes BLUF/editorial, and
-     * lets FlyerObserver (single authority, via save()) fire the afterCommit
-     * purge + IndexNow dispatches.
+     * [REFRESH] Rebuild a single-post flyer IN PLACE from the re-ingested
+     * payload. ZERO R2 LEAK: every stale page's image_path is captured BEFORE
+     * the teardown (afterwards the rows are cascade-deleted and unrecoverable),
+     * and the async reap is dispatched ->afterCommit() once the teardown
+     * transaction is durably committed — never network I/O inside a transaction.
+     */
+    private function refreshSinglePostFlyer(Flyer $existingFlyer): void
+    {
+        $staleR2Paths = $existingFlyer->pages()
+            ->whereNotNull('image_path')
+            ->pluck('image_path')
+            ->filter()
+            ->values()
+            ->all();
+
+        DB::transaction(function () use ($existingFlyer): void {
+            // Teardown in ONE transaction: items + pages + total_pages reset.
+            $existingFlyer->items()->delete();
+            $existingFlyer->pages()->delete();
+            $existingFlyer->total_pages = count($this->imageUrls);
+            // saveQuietly: the teardown must NOT fire the observer purge; the
+            // rebuilt batch's audited save() in finalizeFlyerBatch is the
+            // single purge authority.
+            $existingFlyer->saveQuietly();
+        });
+
+        if ($staleR2Paths !== []) {
+            dispatch(static function () use ($staleR2Paths): void {
+                try {
+                    Storage::disk('r2')->delete($staleR2Paths);
+                } catch (Throwable $e) {
+                    Log::warning('[REFRESH] Stale R2 deletion failed.', [
+                        'error' => $e->getMessage(),
+                    ]);
+                }
+            })->afterCommit();
+        }
+
+        Log::info('[REFRESH] Rebuilding flyer in place from the refreshed payload.', [
+            'flyer_id' => $existingFlyer->id,
+            'slug' => $existingFlyer->slug,
+            'pages' => count($this->imageUrls),
+            'reaped_r2_objects' => count($staleR2Paths),
+        ]);
+
+        $this->dispatchPageProcessingBatch(
+            flyerId: $existingFlyer->id,
+            imageUrls: $this->imageUrls,
+            startPageNumber: 0,
+            batchName: 'flyer-'.$existingFlyer->id.'-'.$this->facebookPostId.'-refresh',
+        );
+    }
+
+    /**
+     * Build ProcessSinglePageJobs and dispatch them as one batch whose then()
+     * callback funnels into the shared finalizeFlyerBatch() helper.
      *
      * @param  list<string>  $imageUrls
      */
-    private function dispatchPageProcessingBatch(int $flyerId, array $imageUrls, int $startPageNumber, string $batchName): void
+    private function dispatchPageProcessingBatch(int $flyerId, array $imageUrls, int $startPageNumber, string $batchName, bool $deleteOnZeroItems = true): void
+    {
+        self::dispatchProcessingBatch(
+            flyerId: $flyerId,
+            imageUrls: $imageUrls,
+            startPageNumber: $startPageNumber,
+            batchName: $batchName,
+            rawPostId: $this->rawFacebookPostId,
+            deleteOnZeroItems: $deleteOnZeroItems,
+        );
+    }
+
+    /**
+     * Public static batch dispatcher shared with the ingest controller's
+     * rebuild/append upgrade paths (RawFacebookIngestController::
+     * rebuildFlyerFromPayload / appendPagesToRawFlyer), so every processing
+     * path funnels into ONE finalizer: finalizeFlyerBatch().
+     *
+     * @param  list<string>  $imageUrls
+     */
+    public static function dispatchProcessingBatch(int $flyerId, array $imageUrls, int $startPageNumber, string $batchName, ?int $rawPostId = null, bool $deleteOnZeroItems = true): void
     {
         $jobs = [];
         foreach (array_values($imageUrls) as $index => $imageUrl) {
@@ -469,81 +558,11 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
             );
         }
 
-        $rawPostId = $this->rawFacebookPostId;
-
         Bus::batch($jobs)
             ->name($batchName)
             ->allowFailures()
-            ->then(static function (Batch $batch) use ($flyerId, $rawPostId): void {
-                try {
-                    $flyer = Flyer::find($flyerId);
-
-                    if ($flyer === null) {
-                        Log::error('Flyer not found in batch then callback.', ['flyer_id' => $flyerId]);
-
-                        return;
-                    }
-
-                    // === ZERO-ITEMS / ZERO-PRICE KILL-SWITCH: never publish an empty or 0.00 EGP flyer ===
-                    $validItemsCount = $flyer->items()->where('sale_price', '>', 0)->count();
-
-                    if ($validItemsCount === 0) {
-                        Log::warning('[ABORT_ZERO_PRICE_FLYER] Discarding flyer: 0 products with price > 0.', [
-                            'flyer_id' => $flyer->id,
-                            'title' => $flyer->title,
-                            'retailer' => $flyer->retailer?->slug,
-                            'batch_id' => $batch->id,
-                        ]);
-
-                        if ($rawPostId !== null) {
-                            RawFacebookPost::where('id', $rawPostId)->update([
-                                'status' => 'rejected',
-                                'rejection_reason' => 'تم إلغاء المجلة وحذفها تلقائياً: الصور لا تحتوي على أي أسعار حقيقية للسلع (جميع الأسعار المستخرجة 0.00 ج.م أو منعدمة).',
-                                'flyer_id' => null,
-                            ]);
-                        }
-
-                        // تنظيف وحذف المجلة: Eloquent delete fires
-                        // FlyerObserver::deleting, which captures every page's
-                        // R2 image paths BEFORE SQLite's ON DELETE CASCADE
-                        // wipes flyer_pages — the queued afterCommit closure
-                        // then reaps the R2 objects. Deleting pages()/items()
-                        // via bulk queries first would fire zero model events
-                        // and orphan every WebP file on R2.
-                        $flyer->delete();
-
-                        return; // خروج فوري - لن تُنشر ولن تلوث الموقع
-                    }
-
-                    // O(1) recount from the DB — never trust a stale in-memory counter.
-                    $flyer->total_pages = (int) $flyer->pages()->count();
-
-                    $autoPublish = (bool) config('app.auto_publish_flyers', true);
-                    if ($flyer->status !== FlyerStatus::Published) {
-                        $flyer->status = $autoPublish ? FlyerStatus::Published : FlyerStatus::PendingReview;
-                    }
-
-                    $flyer->bluf_summary = self::buildBlufSummary($flyer);
-                    $flyer->editorial_overview = self::buildEditorialOverview($flyer);
-                    // Auditable save (NOT saveQuietly): FlyerObserver is the SINGLE
-                    // authority for the Cloudflare purge + sitemap/llms cache forget
-                    // + IndexNow ping on publish. It fires once, afterCommit, with
-                    // the full canonical URL set — no double purge, no double ping.
-                    $flyer->save();
-
-                    Log::info($autoPublish ? 'Flyer auto-published with verified items.' : 'Flyer merged and pending_review with verified items.', [
-                        'flyer_id' => $flyer->id,
-                        'items_count' => $validItemsCount,
-                        'batch_id' => $batch->id,
-                        'status' => $flyer->status->value,
-                    ]);
-                } catch (Throwable $e) {
-                    Log::error('Failed in batch then() for flyer.', [
-                        'flyer_id' => $flyerId,
-                        'error' => $e->getMessage(),
-                        'trace' => $e->getTraceAsString(),
-                    ]);
-                }
+            ->then(static function (Batch $batch) use ($flyerId, $rawPostId, $deleteOnZeroItems): void {
+                self::finalizeFlyerBatch($batch, $flyerId, $rawPostId, $deleteOnZeroItems);
             })
             ->catch(function (Batch $batch, Throwable $e): void {
                 Log::error('Batch processing caught failure.', [
@@ -561,6 +580,178 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
             ->onQueue('default')
             ->dispatch();
     }
+
+    /**
+     * Single authoritative post-batch finalizer shared by EVERY processing
+     * path (fresh ingest, [CONSOLIDATION] append, [REFRESH] rebuild, and the
+     * ingest controller's rebuild/append upgrades).
+     *
+     * 1. Zero-price kill-switch: 0 items with sale_price > 0 → mark the raw
+     *    post rejected and delete the flyer via MODEL delete (never bulk
+     *    pages()->delete() first — FlyerObserver::deleting captures every R2
+     *    path BEFORE the cascade and reaps the objects afterCommit). For
+     *    rebuild/upgrade batches ($deleteOnZeroItems === false) the flyer is
+     *    kept alive instead: recount + saveQuietly + stand down.
+     * 2. [GATEKEEPER_DEDUP]: remove duplicate [normalized_name, sale_price] items.
+     * 3. Recount total_pages straight from the DB (O(1) aggregate — pages may
+     *    have merged further while the batch ran).
+     * 4. Set status per config('app.auto_publish_flyers') and rebuild the
+     *    BLUF/editorial copy.
+     * 5. Audited save() (NOT saveQuietly): FlyerObserver is the SINGLE
+     *    authority for the Cloudflare purge + sitemap/llms cache forget +
+     *    IndexNow ping, fired once, afterCommit, with the full canonical URL
+     *    set. 'total_pages' is in its wasChanged() list, so refreshes/upgrades
+     *    of already-Published flyers always purge the CDN.
+     * 6. Logs carry $validItemsCount — never an undefined $itemsCount.
+     */
+    public static function finalizeFlyerBatch(Batch $batch, int $flyerId, ?int $rawPostId = null, bool $deleteOnZeroItems = true): void
+    {
+        try {
+            $flyer = Flyer::find($flyerId);
+
+            if ($flyer === null) {
+                Log::error('Flyer not found in batch then callback.', ['flyer_id' => $flyerId]);
+
+                return;
+            }
+
+            // === 1. ZERO-ITEMS / ZERO-PRICE KILL-SWITCH ===
+            $validItemsCount = $flyer->items()->where('sale_price', '>', 0)->count();
+
+            if ($validItemsCount === 0) {
+                if ($deleteOnZeroItems) {
+                    Log::warning('[ABORT_ZERO_PRICE_FLYER] Discarding flyer: 0 products with price > 0.', [
+                        'flyer_id' => $flyer->id,
+                        'title' => $flyer->title,
+                        'retailer' => $flyer->retailer?->slug,
+                        'batch_id' => $batch->id,
+                    ]);
+
+                    if ($rawPostId !== null) {
+                        RawFacebookPost::where('id', $rawPostId)->update([
+                            'status' => 'rejected',
+                            'rejection_reason' => 'تم إلغاء المجلة وحذفها تلقائياً: الصور لا تحتوي على أي أسعار حقيقية للسلع (جميع الأسعار المستخرجة 0.00 ج.م أو منعدمة).',
+                            'flyer_id' => null,
+                        ]);
+                    }
+
+                    // تنظيف وحذف المجلة: Eloquent delete fires
+                    // FlyerObserver::deleting, which captures every page's
+                    // R2 image paths BEFORE SQLite's ON DELETE CASCADE
+                    // wipes flyer_pages — the queued afterCommit closure
+                    // then reaps the R2 objects. Deleting pages()/items()
+                    // via bulk queries first would fire zero model events
+                    // and orphan every WebP file on R2.
+                    $flyer->delete();
+
+                    return; // خروج فوري - لن تُنشر ولن تلوث الموقع
+                }
+
+                // Rebuild/upgrade safety: a partial re-extraction may yield
+                // zero items while the flyer stays live — never kill a live
+                // flyer for an upgrade batch, just recount and stand down.
+                Log::warning('[GATEKEEPER_ZERO_ITEMS_STAND_DOWN] Upgrade batch extracted 0 priced items; flyer kept alive.', [
+                    'flyer_id' => $flyer->id,
+                    'batch_id' => $batch->id,
+                ]);
+
+                $flyer->total_pages = (int) $flyer->pages()->count();
+                $flyer->saveQuietly();
+
+                return;
+            }
+
+            // === 2. [GATEKEEPER_DEDUP] auto item deduplication ===
+            $dedupedCount = self::dedupFlyerItems($flyer);
+
+            if ($dedupedCount > 0) {
+                Log::info('[GATEKEEPER_DEDUP] Removed duplicate items.', [
+                    'flyer_id' => $flyer->id,
+                    'removed' => $dedupedCount,
+                ]);
+            }
+
+            // === 3. O(1) recount from the DB — never trust a stale counter. ===
+            $flyer->total_pages = (int) $flyer->pages()->count();
+
+            // === 4. Status + copy rebuild. ===
+            $autoPublish = (bool) config('app.auto_publish_flyers', true);
+            if ($flyer->status !== FlyerStatus::Published) {
+                $flyer->status = $autoPublish ? FlyerStatus::Published : FlyerStatus::PendingReview;
+            }
+
+            $flyer->bluf_summary = self::buildBlufSummary($flyer);
+            $flyer->editorial_overview = self::buildEditorialOverview($flyer);
+
+            // === 5. Auditable save (NOT saveQuietly): FlyerObserver is the
+            // SINGLE authority for the Cloudflare purge + sitemap/llms cache
+            // forget + IndexNow ping on publish/refresh. It fires once,
+            // afterCommit, with the full canonical URL set — no double purge,
+            // no double ping.
+            $flyer->save();
+
+            // === 6. Log with $validItemsCount (never undefined $itemsCount). ===
+            Log::info($autoPublish ? 'Flyer auto-published with verified items.' : 'Flyer merged and pending_review with verified items.', [
+                'flyer_id' => $flyer->id,
+                'items_count' => $validItemsCount,
+                'deduped_items' => $dedupedCount,
+                'batch_id' => $batch->id,
+                'status' => $flyer->status->value,
+            ]);
+        } catch (Throwable $e) {
+            Log::error('Failed in batch then() for flyer.', [
+                'flyer_id' => $flyerId,
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
+            ]);
+        }
+    }
+
+    /**
+     * [GATEKEEPER_DEDUP] Remove items whose [normalized product name,
+     * sale_price] pair duplicates an earlier (lower-id) item. OCR commonly
+     * emits the same offer twice from adjacent flyer tiles.
+     *
+     * Bulk delete is safe here: flyer_items carry no R2 assets, so no model
+     * events are needed.
+     *
+     * @return int number of items removed
+     */
+    private static function dedupFlyerItems(Flyer $flyer): int
+    {
+        $items = $flyer->items()->orderBy('id')->get(['id', 'product_name', 'sale_price']);
+
+        $seen = [];
+        $duplicateIds = [];
+
+        foreach ($items as $item) {
+            $name = trim((string) preg_replace('/\s+/u', ' ', (string) $item->product_name));
+
+            // Nameless rows are never collapsed — they carry no dedup signal.
+            if ($name === '') {
+                continue;
+            }
+
+            $key = mb_strtolower($name).'|'.round((float) $item->sale_price, 2);
+
+            if (isset($seen[$key])) {
+                $duplicateIds[] = (int) $item->id;
+
+                continue;
+            }
+
+            $seen[$key] = true;
+        }
+
+        if ($duplicateIds === []) {
+            return 0;
+        }
+
+        $flyer->items()->whereIn('id', $duplicateIds)->delete();
+
+        return count($duplicateIds);
+    }
+
 
     private function formatTitle(string $retailerName, Carbon $validFrom, Carbon $validUntil, ?string $rawTitle): string
     {

@@ -6,22 +6,27 @@ namespace App\Http\Controllers\Api\V1;
 
 use App\Http\Controllers\Controller;
 use App\Jobs\GatekeeperFacebookPostJob;
+use App\Models\Flyer;
 use App\Models\RawFacebookPost;
 use App\Models\Retailer;
+use App\Support\FacebookMediaHelper;
 use Carbon\Carbon;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Storage;
 use Illuminate\Validation\ValidationException;
+use Throwable;
 
 final class RawFacebookIngestController extends Controller
 {
     /**
      * Handle raw Facebook post ingestion.
      *
-     * Validates payload, dispatches Gatekeeper job, returns 202 within 100ms.
+     * Validates payload, resolves duplicates/upgrades, dispatches Gatekeeper,
+     * returns 202 within 100ms.
      */
     public function __invoke(Request $request): JsonResponse
     {
@@ -34,7 +39,8 @@ final class RawFacebookIngestController extends Controller
                 'retailer_slug' => ['required', 'string', 'max:255', 'exists:retailers,slug'],
                 'facebook_post_id' => ['required', 'string', 'max:255'],
                 'post_text' => ['nullable', 'string', 'max:10000'],
-                'image_urls' => ['required', 'array', 'min:1', 'max:100'],
+                // 120-image album cap (production alignment).
+                'image_urls' => ['required', 'array', 'min:1', 'max:120'],
                 'image_urls.*' => ['required', 'string', 'url:http,https', 'max:4096'],
                 'published_at' => ['nullable', 'date'],
             ]);
@@ -85,36 +91,13 @@ final class RawFacebookIngestController extends Controller
 
             $fingerprint = hash('sha256', $retailer->id.'|'.$normalizedFullText.'|'.implode('|', $imagePaths));
 
-            // Atomic claim: Cache::add is a single SET-if-absent (NX) — two
-            // concurrent duplicates can never both pass. Cache::get runs ONLY
-            // on collision, to report which post already won.
-            if (! Cache::add("ingest_fp:{$fingerprint}", $facebookPostId, now()->addHours(24))) {
-                $existingFingerprintPostId = (string) Cache::get("ingest_fp:{$fingerprint}", $facebookPostId);
-
-                Log::info('[INGEST_DEDUP] Duplicate post content within 24h, skipping.', [
-                    'retailer_slug' => $retailerSlug,
-                    'duplicate_of' => $existingFingerprintPostId,
-                ]);
-
-                return new JsonResponse(
-                    data: [
-                        'message' => 'Post already processed (content match).',
-                        'facebook_post_id' => $existingFingerprintPostId,
-                        'duplicate' => true,
-                    ],
-                    status: 202,
-                );
-            }
-
             // Serialize the check+upsert per (retailer, facebook_post_id): two
-            // concurrent webhook retries must not both pass the terminal-status
-            // check and double-dispatch Gatekeeper (SQLite has no row locks).
+            // concurrent webhook retries must not both pass the duplicate check
+            // and double-dispatch Gatekeeper (SQLite has no row locks).
             $lock = Cache::lock("ingest_post:{$retailer->id}:{$facebookPostId}", 10);
             if (! $lock->get()) {
-                // Contention is transient — release the fingerprint claim so a
-                // request that never ran cannot poison dedup for 24h.
-                Cache::forget("ingest_fp:{$fingerprint}");
-
+                // Contention is transient — nothing was claimed yet, so there
+                // is no fingerprint to release.
                 return new JsonResponse(
                     data: [
                         'message' => 'Post is already being processed.',
@@ -127,93 +110,88 @@ final class RawFacebookIngestController extends Controller
             }
 
             try {
-                // Idempotency: never clobber an administrative/terminal state —
-                // accepted/manually_approved/rejected posts keep BOTH their
-                // status AND their stored content; only genuinely new or
-                // retryable (pending/failed) posts re-enter the pipeline.
-                [$rawPost, $shouldQueue] = DB::transaction(function () use ($retailer, $facebookPostId, $postText, $imageUrls, $publishedAtUtc): array {
-                    $existingPost = RawFacebookPost::query()
-                        ->where('retailer_id', $retailer->id)
-                        ->where('facebook_post_id', $facebookPostId)
-                        ->first();
+                // 1. EXACT (retailer_id, facebook_post_id) check under the lock:
+                // a known post is either a terminal duplicate OR an upgrade
+                // candidate carrying a richer image set — never blindly re-queued.
+                $existingPost = RawFacebookPost::query()
+                    ->where('retailer_id', $retailer->id)
+                    ->where('facebook_post_id', $facebookPostId)
+                    ->first();
 
-                    if ($existingPost !== null && ! in_array($existingPost->status, ['pending', 'failed'], true)) {
-                        return [$existingPost, false];
-                    }
-
-                    $post = RawFacebookPost::query()->updateOrCreate(
-                        [
-                            'retailer_id' => $retailer->id,
-                            'facebook_post_id' => $facebookPostId,
-                        ],
-                        [
-                            'post_text' => $postText,
-                            'image_urls' => $imageUrls,
-                            'published_at' => $publishedAtUtc,
-                            'status' => 'pending',
-                        ],
-                    );
-
-                    return [$post, true];
-                });
-
-                if (! $shouldQueue) {
-                    Log::info('Facebook post re-ingested with terminal status preserved, Gatekeeper NOT redispatched.', [
-                        'retailer_slug' => $retailerSlug,
-                        'facebook_post_id' => $facebookPostId,
-                        'status' => $rawPost->status,
-                    ]);
-
-                    return new JsonResponse(
-                        data: [
-                            'message' => 'Already processed.',
-                            'facebook_post_id' => $facebookPostId,
-                            'retailer_slug' => $retailerSlug,
-                            'queued' => false,
-                        ],
-                        status: 202,
-                    );
+                if ($existingPost !== null) {
+                    return $this->ingestRicherOrConfirm($existingPost, $imageUrls, $postText, $publishedAtUtc, $fingerprint);
                 }
-            } catch (\Throwable $e) {
-                // DB failure: release the fingerprint claim so the scraper's
-                // valid retry is not locked out for 24h by a transient error.
-                Cache::forget("ingest_fp:{$fingerprint}");
 
-                throw $e;
+                // 2. 24h content fingerprint: Cache::add is the atomic SET-NX
+                // claim (two concurrent duplicates can never both pass); the
+                // cached pointer resolves to the previous RawFacebookPost (by
+                // ID or facebook_post_id) to feed the richer-set upgrade check.
+                if (! Cache::add("ingest_fp:{$fingerprint}", $facebookPostId, now()->addHours(24))) {
+                    $fingerprintOwner = $this->resolveFingerprintOwner(
+                        (string) Cache::get("ingest_fp:{$fingerprint}", ''),
+                        $retailer,
+                    );
+
+                    if ($fingerprintOwner !== null) {
+                        return $this->ingestRicherOrConfirm($fingerprintOwner, $imageUrls, $postText, $publishedAtUtc, $fingerprint);
+                    }
+                    // Stale pointer (its row was deleted): fall through as new.
+                }
+
+                // 3. Fallback: 24h normalized-text-snippet match — a scraper
+                // retry with a SHIFTED facebook_post_id but near-identical text
+                // must meet the upgrade check instead of spawning -part-2 flyers.
+                $textMatchPost = $this->findRecentTextSnippetMatch($retailer, $postText);
+
+                if ($textMatchPost !== null) {
+                    return $this->ingestRicherOrConfirm($textMatchPost, $imageUrls, $postText, $publishedAtUtc, $fingerprint);
+                }
+
+                // 4. Genuinely new post: persist, claim the fingerprint pointer,
+                // dispatch asynchronously — must return 202 within 100ms.
+                $rawPost = RawFacebookPost::query()->create([
+                    'retailer_id' => $retailer->id,
+                    'facebook_post_id' => $facebookPostId,
+                    'post_text' => $postText,
+                    'image_urls' => $imageUrls,
+                    'published_at' => $publishedAtUtc,
+                    'status' => 'pending',
+                ]);
+
+                // Upgrade the pointer to the durable raw-post ID.
+                Cache::put("ingest_fp:{$fingerprint}", (string) $rawPost->id, now()->addHours(24));
+
+                // afterCommit: never dispatch before the row is durably committed.
+                GatekeeperFacebookPostJob::dispatch(
+                    retailerSlug: $retailerSlug,
+                    facebookPostId: $facebookPostId,
+                    postText: $postText,
+                    imageUrls: $imageUrls,
+                    publishedAt: $publishedAtUtc->toIso8601String(),
+                    rawFacebookPostId: $rawPost->id,
+                )->afterCommit();
+
+                Log::info('Facebook post ingested, Gatekeeper dispatched.', [
+                    'retailer_slug' => $retailerSlug,
+                    'facebook_post_id' => $facebookPostId,
+                    'image_count' => count($imageUrls),
+                ]);
+
+                return new JsonResponse(
+                    data: [
+                        'message' => 'Accepted for processing.',
+                        'facebook_post_id' => $facebookPostId,
+                        'retailer_slug' => $retailerSlug,
+                        'queued' => true,
+                    ],
+                    status: 202,
+                );
             } finally {
                 $lock->release();
             }
-
-            // Dispatch asynchronously — must return 202 within 100ms, no blocking
-            // work here. afterCommit: never before the DB transaction above is
-            // durably committed.
-            GatekeeperFacebookPostJob::dispatch(
-                retailerSlug: $retailerSlug,
-                facebookPostId: $facebookPostId,
-                postText: $postText,
-                imageUrls: $imageUrls,
-                publishedAt: $publishedAtUtc->toIso8601String(),
-                rawFacebookPostId: $rawPost->id,
-            )->afterCommit();
-
-            Log::info('Facebook post ingested, Gatekeeper dispatched.', [
-                'retailer_slug' => $retailerSlug,
-                'facebook_post_id' => $facebookPostId,
-                'image_count' => count($imageUrls),
-            ]);
-
-            return new JsonResponse(
-                data: [
-                    'message' => 'Accepted for processing.',
-                    'facebook_post_id' => $facebookPostId,
-                    'retailer_slug' => $retailerSlug,
-                    'queued' => true,
-                ],
-                status: 202,
-            );
         } catch (ValidationException $e) {
             throw $e;
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             // NEVER echo $e->getMessage() to the client — it leaks DB paths,
             // SQL fragments and host names. Full detail stays in the log.
             if ($fingerprint !== null) {
@@ -230,6 +208,345 @@ final class RawFacebookIngestController extends Controller
                 status: 500,
             );
         }
+    }
+
+    /**
+     * Duplicate/upgrade gate for EVERY re-ingest of a known post (exact ID
+     * match, fingerprint hit, or 24h text-snippet hit).
+     *
+     * - `$newUrls === []`: identical/subset re-post → refresh the 24h
+     *   fingerprint claim, NEVER shrink the stored set, NEVER clobber terminal
+     *   state → 202 `queued: false, duplicate: true`.
+     * - `$newUrls !== []`: strictly richer image set → rebuild the single-post
+     *   flyer in place, append new pages to a multi-post shared flyer, or
+     *   re-dispatch Gatekeeper for a not-yet-processed post.
+     *
+     * @param  list<string>  $imageUrls
+     */
+    private function ingestRicherOrConfirm(
+        RawFacebookPost $storedPost,
+        array $imageUrls,
+        string $postText,
+        Carbon $publishedAtUtc,
+        string $fingerprint,
+    ): JsonResponse {
+        $storedImages = array_values((array) ($storedPost->image_urls ?? []));
+        $newUrls = $this->newSignatureUrls($storedImages, $imageUrls);
+        $isRetryable = in_array((string) $storedPost->status, ['pending', 'failed'], true);
+        $pointer = (string) ($storedPost->id ?? $storedPost->facebook_post_id);
+
+        if ($newUrls === []) {
+            // Identical or subset re-post: refresh the 24h fingerprint claim so
+            // rotating scraper re-posts keep deduping. NEVER shrink the stored
+            // set, NEVER clobber terminal state — transient Gatekeeper failures
+            // are the job's own tries/backoff business; an identical re-ingest
+            // is ALWAYS confirmed as a duplicate.
+            Cache::put("ingest_fp:{$fingerprint}", $pointer, now()->addHours(24));
+
+            Log::info('[INGEST_DEDUP] Duplicate post content within 24h, skipping.', [
+                'duplicate_of' => $storedPost->facebook_post_id,
+            ]);
+
+            return new JsonResponse(
+                data: [
+                    'message' => 'Post already processed (content match).',
+                    'facebook_post_id' => $storedPost->facebook_post_id,
+                    'queued' => false,
+                    'duplicate' => true,
+                ],
+                status: 202,
+            );
+        }
+
+        // Strictly richer image set — the merged superset can only grow.
+        $mergedImages = array_values(array_unique(array_merge($storedImages, $newUrls)));
+
+        $flyer = $storedPost->flyer_id !== null ? Flyer::find($storedPost->flyer_id) : null;
+
+        if ($flyer === null) {
+            if (! $isRetryable) {
+                // Terminal post that never produced a flyer (admin-accepted or
+                // rejected): the hardened contract forbids resurrecting it —
+                // no overwrite, no re-dispatch.
+                Cache::put("ingest_fp:{$fingerprint}", $pointer, now()->addHours(24));
+
+                return new JsonResponse(
+                    data: [
+                        'message' => 'Already processed.',
+                        'facebook_post_id' => $storedPost->facebook_post_id,
+                        'queued' => false,
+                        'duplicate' => true,
+                    ],
+                    status: 202,
+                );
+            }
+
+            // Still unprocessed: upgrade the payload and re-dispatch Gatekeeper.
+            $storedPost->update([
+                'image_urls' => $mergedImages,
+                'post_text' => $postText !== '' ? $postText : $storedPost->post_text,
+                'published_at' => $publishedAtUtc,
+                'status' => 'pending',
+            ]);
+
+            Cache::put("ingest_fp:{$fingerprint}", $pointer, now()->addHours(24));
+
+            GatekeeperFacebookPostJob::dispatch(
+                retailerSlug: (string) $storedPost->retailer?->slug,
+                facebookPostId: (string) $storedPost->facebook_post_id,
+                postText: (string) ($storedPost->post_text ?? ''),
+                imageUrls: $mergedImages,
+                publishedAt: $publishedAtUtc->toIso8601String(),
+                rawFacebookPostId: (int) $storedPost->id,
+            )->afterCommit();
+
+            Log::info('[INGEST_UPGRADE] Enriched payload on unprocessed post; Gatekeeper re-dispatched.', [
+                'raw_post_id' => $storedPost->id,
+                'stored_images' => count($storedImages),
+                'merged_images' => count($mergedImages),
+            ]);
+
+            return new JsonResponse(
+                data: [
+                    'message' => 'Accepted (enriched payload).',
+                    'facebook_post_id' => $storedPost->facebook_post_id,
+                    'queued' => true,
+                    'upgraded' => true,
+                ],
+                status: 202,
+            );
+        }
+
+        Cache::put("ingest_fp:{$fingerprint}", $pointer, now()->addHours(24));
+
+        $flyerRawCount = (int) RawFacebookPost::query()->where('flyer_id', $flyer->id)->count();
+
+        if ($flyerRawCount > 1) {
+            // Multi-post shared flyer: append ONLY the genuinely new pages.
+            $this->appendPagesToRawFlyer($flyer, $newUrls, (string) $storedPost->facebook_post_id);
+            $storedPost->update(['image_urls' => $mergedImages]);
+
+            Log::info('[INGEST_UPGRADE] Appended richer images to shared flyer.', [
+                'flyer_id' => $flyer->id,
+                'appended' => count($newUrls),
+            ]);
+
+            return new JsonResponse(
+                data: [
+                    'message' => 'Accepted (appended richer images).',
+                    'facebook_post_id' => $storedPost->facebook_post_id,
+                    'queued' => true,
+                    'upgraded' => true,
+                ],
+                status: 202,
+            );
+        }
+
+        // Single-post flyer: rebuild IN PLACE — no -part-2, zero R2 orphans.
+        $this->rebuildFlyerFromPayload($flyer, $storedPost, $mergedImages);
+
+        Log::info('[INGEST_UPGRADE] Flyer rebuilt in place from richer payload.', [
+            'flyer_id' => $flyer->id,
+            'pages' => count($mergedImages),
+        ]);
+
+        return new JsonResponse(
+            data: [
+                'message' => 'Accepted (flyer upgraded in place).',
+                'facebook_post_id' => $storedPost->facebook_post_id,
+                'queued' => true,
+                'upgraded' => true,
+            ],
+            status: 202,
+        );
+    }
+
+    /**
+     * Host-independent photo-signature comparison: Facebook serves the same
+     * photo from rotating edge hosts (scontent-cdg/mrs/prg...), so full-URL
+     * comparison misses duplicates. Returns the incoming URLs whose signature
+     * is NOT already stored (host-variated duplicates collapsed).
+     *
+     * @param  list<string>  $storedImages
+     * @param  list<string>  $incomingImages
+     * @return list<string>
+     */
+    private function newSignatureUrls(array $storedImages, array $incomingImages): array
+    {
+        $seenSignatures = [];
+
+        foreach ($storedImages as $url) {
+            $signature = FacebookMediaHelper::extractPhotoSignature((string) $url);
+
+            if ($signature !== '') {
+                $seenSignatures[$signature] = true;
+            }
+        }
+
+        $newUrls = [];
+
+        foreach ($incomingImages as $url) {
+            $signature = FacebookMediaHelper::extractPhotoSignature((string) $url);
+
+            if ($signature !== '' && isset($seenSignatures[$signature])) {
+                continue;
+            }
+
+            if ($signature !== '') {
+                $seenSignatures[$signature] = true;
+            }
+
+            $newUrls[] = (string) $url;
+        }
+
+        return $newUrls;
+    }
+
+    /**
+     * Resolve the cached fingerprint pointer to its RawFacebookPost. Historic
+     * pointers may hold either the raw-post ID or the facebook_post_id.
+     */
+    private function resolveFingerprintOwner(string $cachedPointer, Retailer $retailer): ?RawFacebookPost
+    {
+        $pointer = trim($cachedPointer);
+
+        if ($pointer === '') {
+            return null;
+        }
+
+        if (ctype_digit($pointer)) {
+            $byId = RawFacebookPost::query()->find((int) $pointer);
+
+            if ($byId !== null) {
+                return $byId;
+            }
+        }
+
+        return RawFacebookPost::query()
+            ->where('retailer_id', $retailer->id)
+            ->where('facebook_post_id', $pointer)
+            ->first();
+    }
+
+    /**
+     * Fallback 24h dedup: a scraper retry with a DIFFERENT facebook_post_id
+     * but near-identical text must still meet ingestRicherOrConfirm() instead
+     * of respawning a whole new flyer. Whitespace runs in the snippet degrade
+     * to '%' so newlines in the stored raw text still match; ESCAPE '\' keeps
+     * literal % _ \ inside Arabic copy from acting as wildcards.
+     */
+    private function findRecentTextSnippetMatch(Retailer $retailer, string $postText): ?RawFacebookPost
+    {
+        $normalized = trim((string) preg_replace('/\s+/u', ' ', $postText));
+
+        // Image-only / too-short posts must never text-match.
+        if (mb_strlen($normalized) < 20) {
+            return null;
+        }
+
+        $snippet = mb_substr($normalized, 0, 60);
+        $likePattern = str_replace(' ', '%', addcslashes($snippet, '\\%_'));
+
+        return RawFacebookPost::query()
+            ->where('retailer_id', $retailer->id)
+            // Direct >= comparison keeps the created_at index usable.
+            ->where('created_at', '>=', now()->subHours(24))
+            ->where('post_text', 'LIKE', '%'.$likePattern.'%')
+            ->orderBy('id')
+            ->first();
+    }
+
+    /**
+     * Rebuild a single-post flyer IN PLACE from a richer payload: stale
+     * pages/items torn down inside ONE transaction, then a fresh full-set
+     * processing batch. The slug survives — no -part-2 spam, no 404 churn.
+     *
+     * ZERO R2 LEAK: every stale page's image_path is captured BEFORE the
+     * teardown (afterwards the rows are cascade-deleted and unrecoverable),
+     * and the async reap is dispatched ->afterCommit() once the teardown is
+     * durably committed — never network I/O inside a transaction.
+     *
+     * @param  list<string>  $mergedImages
+     */
+    private function rebuildFlyerFromPayload(Flyer $flyer, RawFacebookPost $storedPost, array $mergedImages): void
+    {
+        $oldR2Paths = $flyer->pages()
+            ->whereNotNull('image_path')
+            ->pluck('image_path')
+            ->filter()
+            ->values()
+            ->all();
+
+        DB::transaction(function () use ($flyer, $storedPost, $mergedImages): void {
+            $flyer->items()->delete();
+            $flyer->pages()->delete();
+            $flyer->total_pages = count($mergedImages);
+            // saveQuietly: the teardown itself must NOT fire the observer purge;
+            // finalizeFlyerBatch's audited save() is the single purge authority.
+            $flyer->saveQuietly();
+
+            $storedPost->update(['image_urls' => $mergedImages]);
+        });
+
+        if ($oldR2Paths !== []) {
+            dispatch(static function () use ($oldR2Paths): void {
+                try {
+                    Storage::disk('r2')->delete($oldR2Paths);
+                } catch (Throwable $e) {
+                    Log::warning('[INGEST_REBUILD] Stale R2 deletion failed.', [
+                        'error' => $e->getMessage(),
+                    ]);
+                }
+            })->afterCommit();
+        }
+
+        GatekeeperFacebookPostJob::dispatchProcessingBatch(
+            flyerId: (int) $flyer->id,
+            imageUrls: $mergedImages,
+            startPageNumber: 0,
+            batchName: 'flyer-'.$flyer->id.'-'.$storedPost->facebook_post_id.'-rebuilt',
+            rawPostId: null,
+            // Upgrade safety: a partial re-extraction must never kill a live flyer.
+            deleteOnZeroItems: false,
+        );
+
+        Log::info('[INGEST_REBUILD] Flyer rebuild dispatched.', [
+            'flyer_id' => $flyer->id,
+            'pages' => count($mergedImages),
+            'reaped_r2_objects' => count($oldR2Paths),
+        ]);
+    }
+
+    /**
+     * Append ONLY the genuinely new pages to a multi-post shared flyer.
+     *
+     * @param  list<string>  $newUrls
+     */
+    private function appendPagesToRawFlyer(Flyer $flyer, array $newUrls, string $facebookPostId): void
+    {
+        $maxDbPage = (int) ($flyer->pages()->max('page_number') ?? 0);
+        $startPageNumber = max((int) $flyer->total_pages, $maxDbPage);
+
+        DB::transaction(function () use ($flyer, $newUrls): void {
+            $flyer->total_pages = (int) $flyer->total_pages + count($newUrls);
+            $flyer->saveQuietly();
+        });
+
+        GatekeeperFacebookPostJob::dispatchProcessingBatch(
+            flyerId: (int) $flyer->id,
+            imageUrls: $newUrls,
+            startPageNumber: $startPageNumber,
+            batchName: 'flyer-'.$flyer->id.'-'.$facebookPostId.'-appended',
+            rawPostId: null,
+            // Upgrade safety: a partial re-extraction must never kill a live flyer.
+            deleteOnZeroItems: false,
+        );
+
+        Log::info('[INGEST_APPEND] Page append dispatched.', [
+            'flyer_id' => $flyer->id,
+            'appended' => count($newUrls),
+            'start_page' => $startPageNumber + 1,
+        ]);
     }
 
     /**

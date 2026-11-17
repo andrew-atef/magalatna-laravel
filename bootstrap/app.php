@@ -19,6 +19,9 @@ return Application::configure(basePath: dirname(__DIR__))
             'ingest.secret'  => VerifyIngestWebhookSecret::class,
         ]);
         $middleware->web(append: [
+            // Canonical host protection FIRST: a www.magalatna.com request is
+            // 301'd to the apex before any session/view work happens.
+            \App\Http\Middleware\VerifyCanonicalHost::class,
             \App\Http\Middleware\NegotiateMarkdownResponse::class,
         ]);
     })
