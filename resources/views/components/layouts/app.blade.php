@@ -4,6 +4,8 @@
     'ogTitle' => null,
     'ogDescription' => null,
     'ogImage' => null,
+    'ogImageWidth' => null,
+    'ogImageHeight' => null,
     'ogType' => 'website',
     'robots' => 'index, follow, max-image-preview:large, max-snippet:-1, max-video-preview:-1',
     'canonical' => null,
@@ -96,6 +98,13 @@
     <meta property="og:title" content="{{ $ogTitle ?? ($metaTitle ?? $siteName) }}">
     <meta property="og:description" content="{{ $ogDescription ?? ($metaDescription ?? '') }}">
     <meta property="og:image" content="{{ $ogImage ?: url('/img/og-cover.png') }}">
+    {{-- Explicit dimensions help EVERY crawler (not just Facebook) size the
+    preview instantly without fetching the image — declared only when the
+    caller knows the real pixel size (never a guessed/wrong pair). --}}
+    @if (is_numeric($ogImageWidth) && is_numeric($ogImageHeight))
+        <meta property="og:image:width" content="{{ (int) $ogImageWidth }}">
+        <meta property="og:image:height" content="{{ (int) $ogImageHeight }}">
+    @endif
     <meta property="og:url" content="{{ $canonicalUrl }}">
 
     <meta name="twitter:card" content="summary_large_image">

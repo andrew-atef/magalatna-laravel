@@ -2,10 +2,14 @@
     use App\Support\R2Url;
     $r2DiskUrl = R2Url::base();
     $logoUrl = $retailer->logo_path ? R2Url::asset($retailer->logo_path) : null;
+    // og:image resolved by the controller: latest active flyer's Discover
+    // composite (1280x720) → cover master → logo → site fallback.
+    $ogImage = $ogImage ?? $logoUrl ?: url('/img/og-cover.png');
     // Canonical strictly from config('app.url') + relative route.
     // Paginated hubs (?page=2+) carry their OWN self-canonical with ?page=N
     // (noindex,follow robots is emitted below unchanged).
     $baseUrl = rtrim((string) config('app.url'), '/');
+    $homeUrl = $baseUrl.'/';
     $canonicalUrl = $canonical ?? ($baseUrl.route('retailers.show', ['retailer' => $retailer->slug], false));
     $isPaginated = (int) request('page', 1) > 1;
     if ($isPaginated) {
@@ -15,6 +19,11 @@
     $year = \Carbon\Carbon::now('Africa/Cairo')->year;
     $metaTitle = $seoTitle ?? "عروض {$retailer->clean_name} في مصر اليوم {$year} | أحدث المجلات والتخفيضات";
     $metaDesc = $seoDescription ?? "تصفح أحدث عروض {$retailer->clean_name} في مصر اليوم {$year} - مجلات أسعار محدثة، خصومات حصرية ومقارنة أسعار السلع قبل الشراء.";
+    // Evergreen hub data (FAQ + freshness) come straight from the model so
+    // the schema and the visible section can NEVER drift apart.
+    $faqsList = $retailer->faqs_list;
+    $effectiveLastmod = $retailer->effective_lastmod;
+    $upcomingCount = (int) ($upcomingCount ?? 0);
 @endphp
 
 <x-layouts.app
@@ -22,7 +31,7 @@
     :meta-description="$metaDesc"
     :og-title="$metaTitle"
     :og-description="$metaDesc"
-    :og-image="$logoUrl ?: url('/img/og-cover.png')"
+    :og-image="$ogImage"
     og-type="website"
     :robots="$robotsMeta"
     :canonical="$canonicalUrl"
@@ -90,6 +99,21 @@
             if ($siteSocialLinks !== []) {
                 $siteOrganization['sameAs'] = $siteSocialLinks;
             }
+            // FAQPage node from $retailer->faqs_list (admin-curated or smart
+            // defaults — the SAME source the visible FAQ section renders) —
+            // keeps Google's FAQ rich results in sync with what users see.
+            $faqSchemaNode = [
+                '@type' => 'FAQPage',
+                '@id' => $canonicalUrl.'#faqpage',
+                'mainEntity' => collect($faqsList)->map(static fn (array $faq): array => [
+                    '@type' => 'Question',
+                    'name' => (string) $faq['question'],
+                    'acceptedAnswer' => [
+                        '@type' => 'Answer',
+                        'text' => (string) $faq['answer'],
+                    ],
+                ])->values()->all(),
+            ];
             $retailerGraph = [
                 $siteOrganization,
                 [
@@ -103,11 +127,12 @@
                     '@type' => 'BreadcrumbList',
                     '@id' => $breadcrumbId,
                     'itemListElement' => [
-                        ['@type' => 'ListItem', 'position' => 1, 'name' => 'الرئيسية', 'item' => $baseUrl . '/'],
+                        ['@type' => 'ListItem', 'position' => 1, 'name' => 'الرئيسية', 'item' => $homeUrl],
                         ['@type' => 'ListItem', 'position' => 2, 'name' => $retailer->name, 'item' => $canonicalUrl],
                     ],
                 ],
                 $collectionPage,
+                $faqSchemaNode,
             ];
             $retailerUnified = [
                 '@context' => 'https://schema.org',
@@ -120,7 +145,7 @@
     <!-- Breadcrumb - Navy -->
     <nav class="mb-4 text-xs font-semibold text-slate-500" aria-label="Breadcrumb">
         <ol class="flex items-center gap-1.5">
-            <li><a href="{{ route('home') }}" class="hover:text-[#039652]">الرئيسية</a></li>
+            <li><a href="{{ $homeUrl }}" class="hover:text-[#039652]">الرئيسية</a></li>
             <li>/</li>
             <li class="text-[#023b55] font-bold">{{ $retailer->name }}</li>
         </ol>
@@ -147,15 +172,36 @@
                 <div class="mt-4 flex flex-wrap gap-2">
                     <span class="inline-flex items-center gap-1.5 rounded-full bg-[#039652]/10 px-3 py-1 text-xs font-bold text-[#027a42] border border-[#039652]/20">
                         <span class="h-2 w-2 rounded-full bg-[#039652]"></span>
-                        {{ $activeCount }} مجلة سارية الآن
+                        {{ \App\Support\ArabicDateHelper::pluralizeCount($activeCount, 'مجلة سارية اليوم', 'مجلتان ساريتان اليوم', 'مجلات سارية اليوم', 'مجلة سارية اليوم') }}
                     </span>
+                    @if ($upcomingCount > 0)
+                        <span class="inline-flex items-center gap-1.5 rounded-full bg-[#fcc023]/15 px-3 py-1 text-xs font-bold text-slate-900 border border-[#fcc023]/40">
+                            ⏳ {{ \App\Support\ArabicDateHelper::pluralizeCount($upcomingCount, 'مجلة تبدأ قريباً', 'مجلتان تبدآن قريباً', 'مجلات تبدأ قريباً', 'مجلة تبدأ قريباً') }}
+                        </span>
+                    @endif
                     <span class="inline-flex items-center rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold text-slate-600">
-                        آخر تحديث: {{ $retailer->updated_at->format('d/m/Y') }}
+                        آخر تحديث: {{ $effectiveLastmod->format('d/m/Y') }}
                     </span>
+                    @if (trim((string) $retailer->hotline) !== '')
+                        <span class="inline-flex items-center gap-1 rounded-full bg-[#023b55]/10 px-3 py-1 text-xs font-bold text-[#023b55] border border-[#023b55]/15">
+                            📞 الخط الساخن: <a href="tel:{{ $retailer->hotline }}" class="underline decoration-dotted hover:text-[#039652]" dir="ltr">{{ $retailer->hotline }}</a>
+                        </span>
+                    @endif
+                    @if ((int) ($retailer->branches_count ?? 0) > 0)
+                        <span class="inline-flex items-center rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold text-slate-600">
+                            🏪 {{ $retailer->branches_count }}+ فرع بمصر
+                        </span>
+                    @endif
                     @if ($retailer->is_active)
                         <span class="inline-flex items-center rounded-full bg-[#023b55]/10 px-3 py-1 text-xs font-bold text-[#023b55] border border-[#023b55]/15">متجر نشط</span>
                     @endif
                 </div>
+                @if (trim((string) $retailer->schedule_summary) !== '')
+                    <div class="mt-4 rounded-xl border border-[#039652]/20 bg-[#039652]/5 px-4 py-3 text-xs leading-relaxed text-slate-700">
+                        <span class="font-black text-[#027a42]">📅 مواعيد نزول العروض:</span>
+                        {{ $retailer->schedule_summary }}
+                    </div>
+                @endif
             </div>
         </div>
     </section>
@@ -164,7 +210,7 @@
     <section class="mb-12">
         <div class="mb-4 flex items-center justify-between">
             <h2 class="text-lg font-black text-[#023b55] sm:text-xl">مجلات {{ $retailer->name }} السارية الآن</h2>
-            <span class="text-xs font-semibold text-slate-500">{{ $activeFlyers->total() }} مجلة</span>
+            <span class="text-xs font-semibold text-slate-500">{{ \App\Support\ArabicDateHelper::pluralizeCount($activeFlyers->total(), 'مجلة', 'مجلتان', 'مجلات', 'مجلة') }}</span>
         </div>
 
         @if($activeFlyers->isNotEmpty())
@@ -270,7 +316,7 @@
                 <span class="text-xs font-semibold text-slate-500">أسعار فعلية من المجلات السارية</span>
             </div>
             <div class="overflow-x-auto rounded-2xl border border-slate-200 bg-white shadow-sm">
-                <table class="w-full min-w-[640px] text-right text-sm">
+                <table class="w-full min-w-[760px] text-right text-sm">
                     <thead>
                         <tr class="border-b border-slate-200 bg-slate-50 text-xs text-slate-600">
                             <th scope="col" class="px-4 py-3 font-black">اسم السلعة</th>
@@ -278,10 +324,17 @@
                             <th scope="col" class="px-4 py-3 font-black">سعر العرض</th>
                             <th scope="col" class="px-4 py-3 font-black">السعر القديم</th>
                             <th scope="col" class="px-4 py-3 font-black">نسبة التوفير</th>
+                            <th scope="col" class="px-4 py-3 font-black">المجلة / العرض</th>
+                            <th scope="col" class="px-4 py-3 font-black">تاريخ الانتهاء</th>
                         </tr>
                     </thead>
                     <tbody class="divide-y divide-slate-100">
                         @foreach ($topRetailerItems as $item)
+                            @php
+                                // null-safe: a misshapen item must never 500 the hub.
+                                $dealFlyer = $item->flyer;
+                                $dealUntil = $dealFlyer?->valid_until ? \Carbon\Carbon::parse($dealFlyer->valid_until, 'Africa/Cairo') : null;
+                            @endphp
                             <tr class="transition hover:bg-[#039652]/5">
                                 <td class="px-4 py-3 font-bold text-[#023b55]">
                                     <a href="{{ route('flyers.show', $item->flyer->slug) }}#item-{{ $item->id }}" class="hover:text-[#039652] hover:underline">
@@ -298,6 +351,14 @@
                                         <span class="text-slate-500">—</span>
                                     @endif
                                 </td>
+                                <td class="px-4 py-3 text-xs text-slate-600">
+                                    @if ($dealFlyer)
+                                        <a href="{{ route('flyers.show', $dealFlyer->slug) }}" class="font-bold text-[#023b55] hover:text-[#039652] hover:underline">{{ $dealFlyer->title }}</a>
+                                    @else
+                                        —
+                                    @endif
+                                </td>
+                                <td class="px-4 py-3 text-xs text-slate-600">{{ $dealUntil?->format('d/m/Y') ?? '—' }}</td>
                             </tr>
                         @endforeach
                     </tbody>
@@ -321,18 +382,42 @@
                         $coverUrl = R2Url::cardThumb($coverPage);
                     @endphp
                     <article class="flex flex-col overflow-hidden rounded-xl border border-slate-200 bg-slate-50 opacity-90">
-                        <a href="{{ route('flyers.show', $flyer->slug) }}" class="relative aspect-[3/4] overflow-hidden bg-slate-100">
+                        <a href="{{ route('flyers.show', $flyer->slug) }}" rel="nofollow" class="relative aspect-[3/4] overflow-hidden bg-slate-100">
                             <img src="{{ $coverUrl }}" alt="{{ $flyer->title }}" width="400" height="533" loading="lazy" class="h-full w-full object-cover grayscale">
                             <span class="absolute inset-0 bg-slate-900/10"></span>
                             <span class="absolute right-2 top-2 rounded-lg bg-slate-700 px-2 py-1 text-[11px] font-bold text-white">منتهي {{ \Carbon\Carbon::parse($flyer->valid_until)->format('d/m') }}</span>                        </a>
                         <div class="p-3">
                             <h3 class="line-clamp-2 text-xs font-bold text-slate-700">
-                                <a href="{{ route('flyers.show', $flyer->slug) }}">{{ $flyer->title }}</a>
+                                <a href="{{ route('flyers.show', $flyer->slug) }}" rel="nofollow">{{ $flyer->title }}</a>
                             </h3>
                         </div>
                     </article>
                 @endforeach
             </div>
+        </section>
+    @endif
+
+    <!-- Permanent Store Information (anti thin-content) + FAQ -->
+    @if (trim((string) $retailer->about_text) !== '' || $faqsList !== [])
+        <section class="mt-12 rounded-2xl border border-slate-200 bg-white p-6 shadow-sm sm:p-8">
+            @if (trim((string) $retailer->about_text) !== '')
+                <h2 class="text-lg font-black text-[#023b55] sm:text-xl">نبذة عن {{ $retailer->name }}</h2>
+                <div class="prose-sm mt-3 max-w-none text-sm leading-relaxed text-slate-700 [&_ol_li]:list-decimal [&_ol]:list-decimal [&_ul_li]:list-disc [&_ul]:list-disc [&_ul]:ps-5">
+                    {!! $retailer->about_text !!}
+                </div>
+            @endif
+
+            @if ($faqsList !== [])
+                <h2 class="mt-8 text-lg font-black text-[#023b55] sm:text-xl">الأسئلة الشائعة عن عروض {{ $retailer->clean_name }}</h2>
+                <div class="mt-4 space-y-5">
+                    @foreach ($faqsList as $faq)
+                        <div class="rounded-xl border border-slate-200 bg-slate-50/60 p-4">
+                            <h3 class="text-sm font-black text-[#023b55]">{{ $faq['question'] }}</h3>
+                            <p class="mt-2 text-sm leading-relaxed text-slate-700">{{ $faq['answer'] }}</p>
+                        </div>
+                    @endforeach
+                </div>
+            @endif
         </section>
     @endif
 </x-layouts.app>

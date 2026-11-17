@@ -129,6 +129,14 @@ final class DiscoverSeoUpgradeTest extends TestCase
         $this->assertSame('RIFF', substr($discoverBinary, 0, 4));
         $this->assertSame('WEBP', substr($discoverBinary, 8, 4));
 
+        // The ACTUAL encoded file MUST be 1280x720 — Google Discover and the
+        // og:image:width/height meta tags we now declare would be wrong for
+        // any smaller canvas (og:image previews degrade below 1200px wide).
+        $info = getimagesizefromstring($discoverBinary);
+        $this->assertNotFalse($info);
+        $this->assertSame(1280, $info[0]);
+        $this->assertSame(720, $info[1]);
+
         // Soft ≤70KB target (logs above it, never fails) — assert sane size.
         $this->assertLessThan(200 * 1024, strlen($discoverBinary));
     }

@@ -114,6 +114,56 @@ final class RetailerResource extends Resource
                             ->helperText('عند تفعيله، سيقوم السكرابر بفحص وتنزيل المجلات آلياً كل 5 دقائق.'),
                     ])
                     ->columns(2),
+
+                Forms\Components\Section::make('SEO, E-E-A-T & Store Information')
+                    ->description('بيانات دائمة تمنع الـ Thin Content وتغذي FAQPage Schema وثقة جوجل في الصفحة.')
+                    ->schema([
+                        Forms\Components\TextInput::make('hotline')
+                            ->label('الخط الساخن / خدمة العملاء')
+                            ->tel()
+                            ->maxLength(50)
+                            ->placeholder('19609'),
+
+                        Forms\Components\TextInput::make('branches_count')
+                            ->label('عدد الفروع في مصر')
+                            ->numeric()
+                            ->minValue(0)
+                            ->maxValue(100000)
+                            ->placeholder('450'),
+
+                        Forms\Components\TextInput::make('app_url')
+                            ->label('رابط التطبيق الرسمي')
+                            ->url()
+                            ->maxLength(500)
+                            ->placeholder('https://play.google.com/...'),
+
+                        Forms\Components\Textarea::make('schedule_summary')
+                            ->label('مواعيد نزول المجلات المعتادة')
+                            ->rows(2)
+                            ->columnSpanFull()
+                            ->placeholder('تصدر مجلة كازيون الأسبوعية (عرض التلات) كل ثلاثاء، بالإضافة إلى عروض الويك إند واليوم الواحد.'),
+
+                        Forms\Components\RichEditor::make('about_text')
+                            ->label('نبذة تعريفية شاملة عن المتجر')
+                            ->columnSpanFull()
+                            ->helperText('نص تعريفي دائم يمنع الـ Thin Content ويشرح تاريخ السلسلة وانتشارها في مصر.'),
+
+                        Forms\Components\Repeater::make('faqs')
+                            ->label('الأسئلة الشائعة (FAQ)')
+                            ->schema([
+                                Forms\Components\TextInput::make('question')
+                                    ->label('السؤال')
+                                    ->required(),
+                                Forms\Components\Textarea::make('answer')
+                                    ->label('الإجابة')
+                                    ->required()
+                                    ->rows(2),
+                            ])
+                            ->collapsible()
+                            ->itemLabel(fn (array $state): ?string => $state['question'] ?? 'سؤال جديد')
+                            ->columnSpanFull(),
+                    ])
+                    ->columns(2),
             ]);
     }
 
