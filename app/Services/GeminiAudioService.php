@@ -97,7 +97,7 @@ final class GeminiAudioService
         }
 
         $ulid = (string) Str::ulid();
-        $audioPath = $tempDir.'/audio_'.$ulid.'.wav';
+        $audioPath = $tempDir.'/audio_'.$ulid;
 
         try {
             /** @var \Illuminate\Http\Client\Response $response */
@@ -118,19 +118,26 @@ final class GeminiAudioService
                 throw new RuntimeException('Gemini TTS error: HTTP '.$response->status().' - '.substr((string) $response->body(), 0, 500));
             }
 
-            $base64Audio = $this->extractAudioBase64($response->json() ?? []);
+            $extracted = $this->extractAudio($response->json() ?? []);
 
-            if ($base64Audio === null) {
+            if ($extracted['base64'] === null) {
                 throw new RuntimeException('Gemini TTS response carries no inline audio data.');
             }
 
-            $binary = base64_decode($base64Audio, true);
+            $binary = base64_decode($extracted['base64'], true);
 
             if ($binary === false || $binary === '') {
                 throw new RuntimeException('Gemini TTS audio base64 payload failed to decode.');
             }
 
-            if (file_put_contents($audioPath, $binary) === false) {
+            // Gemini TTS streams RAW PCM (audio/L16;codec=pcm;rate=24000) —
+            // ffprobe/ffmpeg cannot read headerless PCM. Containerize into a
+            // real WAV (or pass through mp3/wav) BEFORE hitting the disk.
+            [$container, $audioBytes] = $this->containerize($binary, $extracted['mimeType']);
+
+            $audioPath = $tempDir.'/audio_'.$ulid.'.'.$container;
+
+            if (file_put_contents($audioPath, $audioBytes) === false) {
                 throw new RuntimeException('Failed to write temporary audio file: '.$audioPath);
             }
 
@@ -157,11 +164,14 @@ final class GeminiAudioService
      * returns a JSON ARRAY of response chunks:
      *   [ {candidates:[{content:{parts:[{inlineData:{data:...}}]}}]}, {...} ]
      * while plain generateContent returns a single object — both shapes are
-     * accepted and every inline audio chunk is merged in order.
+     * accepted and every inline audio chunk is merged in order. The FIRST
+     * part's mimeType is reported (Gemini TTS serves raw PCM as
+     * "audio/L16;codec=pcm;rate=24000").
      *
      * @param  array<string, mixed>  $decoded
+     * @return array{base64: ?string, mimeType: ?string}
      */
-    private function extractAudioBase64(array $decoded): ?string
+    private function extractAudio(array $decoded): array
     {
         $chunks = $decoded;
 
@@ -171,6 +181,7 @@ final class GeminiAudioService
         }
 
         $audioParts = [];
+        $mimeType = null;
 
         foreach ($chunks as $chunk) {
             if (! is_array($chunk)) {
@@ -184,14 +195,78 @@ final class GeminiAudioService
             }
 
             foreach ($parts as $part) {
-                $data = is_array($part) ? ($part['inlineData']['data'] ?? null) : null;
+                if (! is_array($part)) {
+                    continue;
+                }
+
+                $data = $part['inlineData']['data'] ?? null;
 
                 if (is_string($data) && $data !== '') {
                     $audioParts[] = $data;
                 }
+
+                if ($mimeType === null) {
+                    $mime = $part['inlineData']['mimeType'] ?? null;
+
+                    if (is_string($mime) && $mime !== '') {
+                        $mimeType = $mime;
+                    }
+                }
             }
         }
 
-        return $audioParts === [] ? null : implode('', $audioParts);
+        return [
+            'base64' => $audioParts === [] ? null : implode('', $audioParts),
+            'mimeType' => $mimeType,
+        ];
+    }
+
+    /**
+     * Normalize the TTS payload into a real audio container ffprobe/ffmpeg
+     * can read:
+     *  - audio/mpeg            → passed through as .mp3
+     *  - real RIFF/WAVE bytes  → passed through as .wav
+     *  - everything else (raw PCM "audio/L16;codec=pcm;rate=24000" and
+     *    headerless audio)     → wrapped in a 16-bit mono PCM WAV header
+     *    (sample rate parsed from the mimeType, default 24000).
+     *
+     * @return array{0: string, 1: string} [container extension, file bytes]
+     */
+    private function containerize(string $binary, ?string $mimeType): array
+    {
+        $mime = strtolower((string) $mimeType);
+
+        if (str_contains($mime, 'mpeg') || str_contains($mime, '/mp3')) {
+            return ['mp3', $binary];
+        }
+
+        // Already a real WAV (RIFF magic) — pass through untouched.
+        if (str_starts_with($binary, 'RIFF') && strlen($binary) > 44) {
+            return ['wav', $binary];
+        }
+
+        $sampleRate = 24000;
+
+        if (preg_match('/rate=(\d+)/', $mime, $m) === 1 && (int) $m[1] > 0) {
+            $sampleRate = (int) $m[1];
+        }
+
+        // 16-bit signed little-endian mono PCM (Gemini "audio/L16").
+        $dataLength = strlen($binary);
+        $header = 'RIFF'
+            .pack('V', 36 + $dataLength)
+            .'WAVE'
+            .'fmt '
+            .pack('V', 16)          // fmt chunk size
+            .pack('v', 1)           // PCM format
+            .pack('v', 1)           // mono
+            .pack('V', $sampleRate)
+            .pack('V', $sampleRate * 2) // byte rate = rate × block align
+            .pack('v', 2)           // block align = channels × bits/8
+            .pack('v', 16)          // bits per sample
+            .'data'
+            .pack('V', $dataLength);
+
+        return ['wav', $header.$binary];
     }
 }

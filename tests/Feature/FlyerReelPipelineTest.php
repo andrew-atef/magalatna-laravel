@@ -10,6 +10,7 @@ use App\Models\FlyerItem;
 use App\Models\FlyerPage;
 use App\Models\FlyerReel;
 use App\Models\Retailer;
+use App\Services\GeminiAudioService;
 use App\Services\LowMemoryReelComposerService;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Http;
@@ -144,7 +145,8 @@ final class FlyerReelPipelineTest extends TestCase
                 ],
             ], 200),
             // TTS synthesis (streaming — audio split across 2 chunks to prove
-            // the concatenation logic; "Tavi" voice, temperature 1)
+            // the concatenation logic; "Tavi" voice, temperature 1). The
+            // mimeType is the REAL Gemini TTS payload: raw PCM, headerless.
             '*/models/gemini-3.8-flash-tts:streamGenerateContent' => (static function () {
                 // One continuous base64 stream, split mid-payload exactly like
                 // real streamGenerateContent chunks (padding only at the end).
@@ -155,14 +157,14 @@ final class FlyerReelPipelineTest extends TestCase
                     [
                         'candidates' => [
                             ['content' => ['parts' => [
-                                ['inlineData' => ['mimeType' => 'audio/wav', 'data' => substr($full, 0, $half)]],
+                                ['inlineData' => ['mimeType' => 'audio/L16;codec=pcm;rate=24000', 'data' => substr($full, 0, $half)]],
                             ]]],
                         ],
                     ],
                     [
                         'candidates' => [
                             ['content' => ['parts' => [
-                                ['inlineData' => ['mimeType' => 'audio/wav', 'data' => substr($full, $half)]],
+                                ['inlineData' => ['mimeType' => 'audio/L16;codec=pcm;rate=24000', 'data' => substr($full, $half)]],
                             ]]],
                         ],
                     ],
@@ -201,9 +203,10 @@ final class FlyerReelPipelineTest extends TestCase
         $this->assertTrue(Storage::disk('r2')->exists((string) $reel->video_path));
         $this->assertSame('FAKE_MP4_BYTES', Storage::disk('r2')->get((string) $reel->video_path));
 
-        // Composer got BOTH page images and the synthesized audio.
+        // Composer got BOTH page images and the synthesized audio
+        // (PCM payload + 44-byte RIFF/WAVE header).
         $this->assertSame(2, $composer->lastCall['pages']);
-        $this->assertSame(strlen(self::FAKE_WAV), $composer->lastCall['audio_bytes']);
+        $this->assertSame(strlen(self::FAKE_WAV) + 44, $composer->lastCall['audio_bytes']);
 
         // Temp files are 100% cleaned up (audio + video).
         $tempDir = (string) config('services.reels.temp_dir');
@@ -233,8 +236,9 @@ final class FlyerReelPipelineTest extends TestCase
         });
 
         $this->assertTrue($ttsSeen, 'TTS request was never sent.');
-        $this->assertSame(strlen(self::FAKE_WAV), $composer->lastCall['audio_bytes'],
-            'Streamed audio chunks must concatenate back into the full WAV.');
+        // Raw PCM is wrapped in a 44-byte RIFF/WAVE header before disk.
+        $this->assertSame(strlen(self::FAKE_WAV) + 44, $composer->lastCall['audio_bytes'],
+            'Streamed PCM chunks must concatenate and containerize into a full WAV.');
     }
 
     public function test_command_skips_ready_reel_without_force(): void
@@ -282,5 +286,75 @@ final class FlyerReelPipelineTest extends TestCase
         GenerateFlyerReelJob::dispatchSync($flyer->id);
 
         $this->assertDatabaseMissing('flyer_reels', ['flyer_id' => $flyer->id]);
+    }
+
+    public function test_tts_raw_pcm_is_wrapped_in_a_valid_wav_header(): void
+    {
+        config([
+            'services.gemini.key' => 'test-gemini-key',
+            'services.gemini.tts_model' => 'gemini-3.8-flash-tts',
+            'services.reels.temp_dir' => storage_path('framework/testing/reels'),
+        ]);
+
+        // 400 bytes of fake 16-bit PCM, streamed as Gemini really serves it.
+        $pcm = str_repeat("\x01\x02", 200);
+
+        Http::fake([
+            '*/models/gemini-3.8-flash-tts:streamGenerateContent' => Http::response([
+                ['candidates' => [['content' => ['parts' => [
+                    ['inlineData' => ['mimeType' => 'audio/L16;codec=pcm;rate=24000', 'data' => base64_encode($pcm)]],
+                ]]]]],
+            ], 200),
+        ]);
+
+        $result = app(GeminiAudioService::class)->synthesize('عرض من كازيون فيه توفير تقيل');
+
+        try {
+            $this->assertStringEndsWith('.wav', $result['path']);
+
+            $bytes = (string) file_get_contents($result['path']);
+
+            $this->assertSame('RIFF', substr($bytes, 0, 4));
+            $this->assertSame('WAVE', substr($bytes, 8, 4));
+            // fmt chunk: PCM format (1), mono, 24000 Hz, byte rate 48000.
+            $this->assertSame(1, unpack('v', substr($bytes, 20, 2))[1]);
+            $this->assertSame(1, unpack('v', substr($bytes, 22, 2))[1]);
+            $this->assertSame(24000, unpack('V', substr($bytes, 24, 4))[1]);
+            $this->assertSame(48000, unpack('V', substr($bytes, 28, 4))[1]);
+            // data chunk carries exactly the raw PCM, total = header + payload.
+            $this->assertSame(strlen($pcm), unpack('V', substr($bytes, 40, 4))[1]);
+            $this->assertSame(44 + strlen($pcm), strlen($bytes));
+        } finally {
+            @unlink($result['path']);
+        }
+    }
+
+    public function test_tts_real_wav_and_mp3_payloads_pass_through_untouched(): void
+    {
+        config([
+            'services.gemini.key' => 'test-gemini-key',
+            'services.gemini.tts_model' => 'gemini-3.8-flash-tts',
+            'services.reels.temp_dir' => storage_path('framework/testing/reels'),
+        ]);
+
+        $realWav = 'RIFF'.str_repeat("\x00", 40).'DATA'.str_repeat("\x00", 8);
+
+        Http::fake([
+            '*/models/gemini-3.8-flash-tts:streamGenerateContent' => Http::response([
+                ['candidates' => [['content' => ['parts' => [
+                    ['inlineData' => ['mimeType' => 'audio/wav', 'data' => base64_encode($realWav)]],
+                ]]]]],
+            ], 200),
+        ]);
+
+        $result = app(GeminiAudioService::class)->synthesize('عرض من كازيون فيه توفير تقيل');
+
+        try {
+            // A genuine RIFF/WAVE payload must NOT get a second header.
+            $this->assertStringEndsWith('.wav', $result['path']);
+            $this->assertSame(strlen($realWav), filesize($result['path']));
+        } finally {
+            @unlink($result['path']);
+        }
     }
 }
