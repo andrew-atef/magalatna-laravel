@@ -15,7 +15,12 @@
 
 ## المجلات السارية حالياً (Current Active Flyers)
 @forelse($activeFlyers as $flyer)
-- [{{ $flyer->retailer->name }} — {{ $flyer->title }}]({{ $baseUrl.route('flyers.show', ['slug' => $flyer->slug], false) }}): سارٍ من {{ $flyer->valid_from->format('Y-m-d') }} حتى {{ $flyer->valid_until->format('Y-m-d') }} (بتوقيت القاهرة).
+    @php
+        // Nearest-integer discount (fake-precision decimals like 24.69% read
+        // like machine output) — same rule as BLUF/meta copy.
+        $maxDiscount = (int) round((float) ($flyer->items_max_discount_percent ?? 0));
+    @endphp
+- [{{ $flyer->retailer->name }} — {{ $flyer->title }}]({{ $baseUrl.route('flyers.show', ['slug' => $flyer->slug], false) }}): سارٍ من {{ $flyer->valid_from->format('Y-m-d') }} حتى {{ $flyer->valid_until->format('Y-m-d') }} (بتوقيت القاهرة)، {{ $flyer->items_count }} سلعة مُوثَّقة بجدول أسعار كامل، أقوى خصم {{ $maxDiscount }}%.
 @empty
 - لا توجد عروض منشورة اليوم.
 @endforelse

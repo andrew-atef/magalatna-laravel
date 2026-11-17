@@ -89,10 +89,21 @@ final class FlyerObserver
     {
         // Capture R2 paths BEFORE the delete: flyer_pages.flyer_id has
         // ON DELETE CASCADE, so by the time deleted() runs the rows are gone.
-        self::$pendingR2Paths[(int) $flyer->id] = $flyer->pages()
+        // BOTH the master images AND the cover thumbnails are separate R2
+        // objects that must never outlive their flyer.
+        $imagePaths = $flyer->pages()
             ->whereNotNull('image_path')
-            ->pluck('image_path')
+            ->pluck('image_path');
+
+        $thumbPaths = $flyer->pages()
+            ->whereNotNull('thumb_path')
+            ->pluck('thumb_path');
+
+        self::$pendingR2Paths[(int) $flyer->id] = $imagePaths
+            ->merge($thumbPaths)
+            ->map(static fn (mixed $path): string => trim((string) $path))
             ->filter()
+            ->unique()
             ->values()
             ->all();
     }

@@ -33,8 +33,13 @@ final class LlmsTxtController extends Controller
                 ->where('valid_until', '>=', $todayCairo)
                 ->whereHas('retailer', fn ($q) => $q->where('is_active', true))
                 ->with('retailer')
+                // Answer engines get the FULL catalogue, not a 15-flyer teaser:
+                // every llms.txt flyer line must reconcile with the retailer
+                // counts below it.
+                ->withCount('items')
+                ->withMax('items', 'discount_percent')
                 ->latest('valid_from')
-                ->take(15)
+                ->take(100)
                 ->get();
 
             return view('llms', compact('retailers', 'activeFlyers'))->render();

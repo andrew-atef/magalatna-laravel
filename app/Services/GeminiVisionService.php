@@ -6,6 +6,7 @@ namespace App\Services;
 
 use App\Exceptions\GeminiRateLimitedException;
 use App\Models\Flyer;
+use App\Services\ProductDataNormalizer;
 use App\Support\PublicUrlGuard;
 use Carbon\Carbon;
 use Illuminate\Http\Client\Response;
@@ -138,7 +139,7 @@ final class GeminiVisionService
      * Extract all product offers from a flyer page image.
      *
      * @param  string  $imageBinary  Raw binary of WebP/JPEG/PNG page image
-     * @return array<int, array{product_name: string, sale_price: float, old_price: ?float, unit: ?string, brand_name: ?string, bundle_condition: ?string, extra_attributes: array<string, string>}>
+     * @return array<int, array{product_name: string, sale_price: float, old_price: ?float, unit: ?string, category: string, brand_name: ?string, bundle_condition: ?string, extra_attributes: array<string, string>}>
      *
      * @throws RuntimeException
      */
@@ -721,10 +722,10 @@ PROMPT;
                 return "{$item->product_name} بسعر {$sale}{$oldPart}";
             })->all();
 
-        $discountRange = 'تصل إلى '.number_format((float) ($flyer->items()->where('sale_price', '>', 0)->max('discount_percent') ?? 0), 2, '.', '').'%';
-        $discountRange = rtrim(rtrim($discountRange, '0'), '.');
-        // Fix space bug
-        $discountRange = str_replace('. ', '.', $discountRange);
+        // Round the max discount to the NEAREST INTEGER: "تصل إلى 24.58%"
+        // reads like a fake-precision machine output — shoppers and AI
+        // answer engines quote clean "25%". Same rule as the BLUF builders.
+        $discountRange = 'تصل إلى '.round((float) ($flyer->items()->where('sale_price', '>', 0)->max('discount_percent') ?? 0)).'%';
 
         $prompt = $this->editorialPrompt($retailerName, $title, $validFrom, $validUntil, $heroDeals, $discountRange);
 
@@ -1048,6 +1049,7 @@ For each distinct product bounding box/card, return:
 - sale_price: float (EGP) after applying superscript rule.
 - old_price: nullable float (same rule) if crossed-out price exists.
 - unit: nullable string normalized: one of "كجم","جرام","لتر","مل","قطعة","علبة","كرتونة","حبة","كيس" or null if not stated. Infer from packaging text (e.g., "1 لتر", "500 جم").
+- category: nullable string — classify the product into EXACTLY ONE of these fixed Egyptian-retail categories: "oils_ghee" (cooking oils, ghee, butter), "dairy_cheese" (milk, cheese, yogurt, cream), "meat_poultry" (chicken, meat, fish, tuna, frozen), "groceries" (rice, sugar, flour, pasta, lentils, salt), "beverages_snacks" (juice, soda, tea, coffee, water, biscuits, chocolate, chips, gum), "cleaning_laundry" (detergents, dish soap, bleach, tissues), "personal_care" (shampoo, soap bars, toothpaste, diapers, sanitary pads, hair oils), "home_appliances" (cookware, fridges, washing machines, mixers, fans, blankets), "automotive_tools" (motor oil, car batteries, wipers, power tools), or "other". Motor oil / car products are "automotive_tools", NOT cooking oil. Hair "بديل زيت" is "personal_care", NOT cooking oil.
 - brand_name: nullable brand as printed (e.g., "الضحى", "جهينة", "Nestle") or null.
 - bundle_condition: nullable string for conditions like "حد أقصى 2 قطعة للعميل", "العرض حتى نفاذ الكمية", "2+1", or null.
 - extra_attributes: object of additional key-values (e.g., {"weight":"5 كجم","origin":"مصري","flavor":"فراولة"}). Return {} if none.
@@ -1088,6 +1090,11 @@ PROMPT;
                                 'nullable' => true,
                                 'description' => 'Unit like كجم, لتر, قطعة, or null.',
                             ],
+                            'category' => [
+                                'type' => 'string',
+                                'nullable' => true,
+                                'description' => 'One fixed Egyptian-retail category: oils_ghee, dairy_cheese, meat_poultry, groceries, beverages_snacks, cleaning_laundry, personal_care, home_appliances, automotive_tools, or other.',
+                            ],
                             'brand_name' => [
                                 'type' => 'string',
                                 'nullable' => true,
@@ -1104,8 +1111,8 @@ PROMPT;
                                 'description' => 'Additional key-values, empty object if none.',
                             ],
                         ],
-                        'required' => ['product_name', 'sale_price', 'old_price', 'unit', 'brand_name', 'bundle_condition', 'extra_attributes'],
-                        'propertyOrdering' => ['product_name', 'sale_price', 'old_price', 'unit', 'brand_name', 'bundle_condition', 'extra_attributes'],
+                        'required' => ['product_name', 'sale_price', 'old_price', 'unit', 'category', 'brand_name', 'bundle_condition', 'extra_attributes'],
+                        'propertyOrdering' => ['product_name', 'sale_price', 'old_price', 'unit', 'category', 'brand_name', 'bundle_condition', 'extra_attributes'],
                     ],
                 ],
             ],
@@ -1116,7 +1123,7 @@ PROMPT;
 
     /**
      * @param  array<int, mixed>  $items
-     * @return array<int, array{product_name: string, sale_price: float, old_price: ?float, unit: ?string, brand_name: ?string, bundle_condition: ?string, extra_attributes: array<string, string>}>
+     * @return array<int, array{product_name: string, sale_price: float, old_price: ?float, unit: ?string, category: string, brand_name: ?string, bundle_condition: ?string, extra_attributes: array<string, string>}>
      */
     private function normalizeOcrItems(array $items): array
     {
@@ -1162,6 +1169,14 @@ PROMPT;
             $brand = isset($raw['brand_name']) && is_string($raw['brand_name']) && trim($raw['brand_name']) !== '' ? trim((string) $raw['brand_name']) : null;
             $bundle = isset($raw['bundle_condition']) && is_string($raw['bundle_condition']) && trim($raw['bundle_condition']) !== '' ? trim((string) $raw['bundle_condition']) : null;
 
+            // AI category is only a HINT: the deterministic Egyptian-retail
+            // keyword classifier (ProductDataNormalizer::inferCategory) has
+            // priority and guards the closed category vocabulary.
+            $aiCategory = isset($raw['category']) && is_string($raw['category']) && trim($raw['category']) !== ''
+                ? trim((string) $raw['category'])
+                : null;
+            $category = ProductDataNormalizer::inferCategory($productName, $aiCategory);
+
             $extra = $raw['extra_attributes'] ?? [];
             if (! is_array($extra)) {
                 $extra = [];
@@ -1181,6 +1196,7 @@ PROMPT;
                 'sale_price' => (float) $salePrice,
                 'old_price' => $oldPrice !== null ? (float) $oldPrice : null,
                 'unit' => $unit,
+                'category' => $category,
                 'brand_name' => $brand,
                 'bundle_condition' => $bundle,
                 'extra_attributes' => $extraClean,

@@ -1,25 +1,31 @@
 @if ($paginator->hasPages())
-    <nav role="navigation" aria-label="{{ __('Pagination Navigation') }}">
+    @php
+        // Active ?q= search: every pagination link is a noindex,follow
+        // crawl-trap URL — mark each <a> rel="nofollow" so Googlebot never
+        // burns crawl budget discovering hundreds of item_page=N variants.
+        $pagNofollow = request()->filled('q');
+    @endphp
+    <nav role="navigation" aria-label="التنقل بين الصفحات">
 
         <div class="flex gap-2 items-center justify-between sm:hidden">
 
             @if ($paginator->onFirstPage())
                 <span class="inline-flex items-center px-4 py-2 text-sm font-medium text-gray-600 bg-white border border-gray-300 cursor-not-allowed leading-5 rounded-md dark:text-gray-300 dark:bg-gray-700 dark:border-gray-600">
-                    {!! __('pagination.previous') !!}
+                    السابق
                 </span>
             @else
-                <a href="{{ $paginator->previousPageUrl() }}" rel="prev" class="inline-flex items-center px-4 py-2 text-sm font-medium text-[#023b55] bg-white border border-gray-300 leading-5 rounded-md hover:text-[#039652] hover:border-[#039652]/30 focus:outline-none focus:ring ring-[#039652]/20 focus:border-[#039652] active:bg-gray-100 active:text-[#023b55] transition ease-in-out duration-150 dark:bg-gray-800 dark:border-gray-600 dark:text-gray-200 dark:focus:border-[#039652] dark:active:bg-gray-700 dark:active:text-gray-300 hover:bg-gray-50">
-                    {!! __('pagination.previous') !!}
+                <a href="{{ $paginator->previousPageUrl() }}" @if($pagNofollow) rel="nofollow" @else rel="prev" @endif class="inline-flex items-center px-4 py-2 text-sm font-medium text-[#023b55] bg-white border border-gray-300 leading-5 rounded-md hover:text-[#039652] hover:border-[#039652]/30 focus:outline-none focus:ring ring-[#039652]/20 focus:border-[#039652] active:bg-gray-100 active:text-[#023b55] transition ease-in-out duration-150 dark:bg-gray-800 dark:border-gray-600 dark:text-gray-200 dark:focus:border-[#039652] dark:active:bg-gray-700 dark:active:text-gray-300 hover:bg-gray-50">
+                    السابق
                 </a>
             @endif
 
             @if ($paginator->hasMorePages())
-                <a href="{{ $paginator->nextPageUrl() }}" rel="next" class="inline-flex items-center px-4 py-2 text-sm font-medium text-[#023b55] bg-white border border-gray-300 leading-5 rounded-md hover:text-[#039652] hover:border-[#039652]/30 focus:outline-none focus:ring ring-[#039652]/20 focus:border-[#039652] active:bg-gray-100 active:text-[#023b55] transition ease-in-out duration-150 dark:bg-gray-800 dark:border-gray-600 dark:text-gray-200 dark:focus:border-[#039652] dark:active:bg-gray-700 dark:active:text-gray-300 hover:bg-gray-50">
-                    {!! __('pagination.next') !!}
+                <a href="{{ $paginator->nextPageUrl() }}" @if($pagNofollow) rel="nofollow" @else rel="next" @endif class="inline-flex items-center px-4 py-2 text-sm font-medium text-[#023b55] bg-white border border-gray-300 leading-5 rounded-md hover:text-[#039652] hover:border-[#039652]/30 focus:outline-none focus:ring ring-[#039652]/20 focus:border-[#039652] active:bg-gray-100 active:text-[#023b55] transition ease-in-out duration-150 dark:bg-gray-800 dark:border-gray-600 dark:text-gray-200 dark:focus:border-[#039652] dark:active:bg-gray-700 dark:active:text-gray-300 hover:bg-gray-50">
+                    التالي
                 </a>
             @else
                 <span class="inline-flex items-center px-4 py-2 text-sm font-medium text-gray-600 bg-white border border-gray-300 cursor-not-allowed leading-5 rounded-md dark:text-gray-300 dark:bg-gray-700 dark:border-gray-600">
-                    {!! __('pagination.next') !!}
+                    التالي
                 </span>
             @endif
 
@@ -29,36 +35,37 @@
 
             <div>
                 <p class="text-sm text-gray-700 leading-5 dark:text-gray-600">
-                    {!! __('Showing') !!}
+                    عرض
                     @if ($paginator->firstItem())
                         <span class="font-medium">{{ $paginator->firstItem() }}</span>
-                        {!! __('to') !!}
+                        إلى
                         <span class="font-medium">{{ $paginator->lastItem() }}</span>
                     @else
                         {{ $paginator->count() }}
                     @endif
-                    {!! __('of') !!}
+                    من أصل
                     <span class="font-medium">{{ $paginator->total() }}</span>
-                    {!! __('results') !!}
+                    نتيجة
                 </p>
             </div>
 
             <div>
-                <span class="inline-flex rtl:flex-row-reverse shadow-sm rounded-md">
+                <span class="inline-flex shadow-sm rounded-md">
 
-                    {{-- Previous Page Link --}}
+                    {{-- Previous Page Link — native RTL flex: "السابق" sits on the
+                    RIGHT (start side) and its chevron must POINT RIGHT (→). --}}
                     @if ($paginator->onFirstPage())
-                        <span aria-disabled="true" aria-label="{{ __('pagination.previous') }}">
-                            <span class="inline-flex items-center px-2 py-2 text-sm font-medium text-gray-500 bg-white border border-gray-300 cursor-not-allowed rounded-l-md leading-5 dark:bg-gray-700 dark:border-gray-600 dark:text-gray-400" aria-hidden="true">
+                        <span aria-disabled="true" aria-label="السابق">
+                            <span class="inline-flex items-center px-2 py-2 text-sm font-medium text-gray-500 bg-white border border-gray-300 cursor-not-allowed rounded-s-md leading-5 dark:bg-gray-700 dark:border-gray-600 dark:text-gray-400" aria-hidden="true">
                                 <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 20 20">
-                                    <path fill-rule="evenodd" d="M12.707 5.293a1 1 0 010 1.414L9.414 10l3.293 3.293a1 1 0 01-1.414 1.414l-4-4a1 1 0 010-1.414l4-4a1 1 0 011.414 0z" clip-rule="evenodd" />
+                                    <path fill-rule="evenodd" d="M7.293 14.707a1 1 0 010-1.414L10.586 10 7.293 6.707a1 1 0 011.414-1.414l4 4a1 1 0 010 1.414l-4 4a1 1 0 01-1.414 0z" clip-rule="evenodd" />
                                 </svg>
                             </span>
                         </span>
                     @else
-                        <a href="{{ $paginator->previousPageUrl() }}" rel="prev" class="inline-flex items-center px-2 py-2 text-sm font-medium text-[#023b55] bg-white border border-gray-300 rounded-l-md leading-5 hover:text-[#039652] hover:border-[#039652]/30 focus:outline-none focus:ring ring-[#039652]/20 focus:border-[#039652] active:bg-gray-100 active:text-[#023b55] transition ease-in-out duration-150 dark:bg-gray-800 dark:border-gray-600 dark:active:bg-gray-700 dark:focus:border-[#039652] dark:text-gray-300 dark:hover:bg-gray-900 dark:hover:text-gray-300" aria-label="{{ __('pagination.previous') }}">
+                        <a href="{{ $paginator->previousPageUrl() }}" @if($pagNofollow) rel="nofollow" @else rel="prev" @endif class="inline-flex items-center px-2 py-2 text-sm font-medium text-[#023b55] bg-white border border-gray-300 rounded-s-md leading-5 hover:text-[#039652] hover:border-[#039652]/30 focus:outline-none focus:ring ring-[#039652]/20 focus:border-[#039652] active:bg-gray-100 active:text-[#023b55] transition ease-in-out duration-150 dark:bg-gray-800 dark:border-gray-600 dark:active:bg-gray-700 dark:focus:border-[#039652] dark:text-gray-300 dark:hover:bg-gray-900 dark:hover:text-gray-300" aria-label="السابق">
                             <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 20 20">
-                                <path fill-rule="evenodd" d="M12.707 5.293a1 1 0 010 1.414L9.414 10l3.293 3.293a1 1 0 01-1.414 1.414l-4-4a1 1 0 010-1.414l4-4a1 1 0 011.414 0z" clip-rule="evenodd" />
+                                <path fill-rule="evenodd" d="M7.293 14.707a1 1 0 010-1.414L10.586 10 7.293 6.707a1 1 0 011.414-1.414l4 4a1 1 0 010 1.414l-4 4a1 1 0 01-1.414 0z" clip-rule="evenodd" />
                             </svg>
                         </a>
                     @endif
@@ -80,7 +87,7 @@
                                         <span class="inline-flex items-center px-4 py-2 -ml-px text-sm font-medium text-white bg-[#039652] border border-[#039652] cursor-default leading-5">{{ $page }}</span>
                                     </span>
                                 @else
-                                    <a href="{{ $url }}" class="inline-flex items-center px-4 py-2 -ml-px text-sm font-medium text-[#023b55] bg-white border border-gray-300 leading-5 hover:text-[#039652] hover:border-[#039652]/30 focus:outline-none focus:ring ring-[#039652]/20 focus:border-[#039652] active:bg-gray-100 active:text-[#023b55] transition ease-in-out duration-150 dark:bg-gray-800 dark:border-gray-600 dark:text-gray-300 dark:hover:text-gray-300 dark:active:bg-gray-700 dark:focus:border-[#039652] hover:bg-gray-50" aria-label="{{ __('Go to page :page', ['page' => $page]) }}">
+                                    <a href="{{ $url }}" @if($pagNofollow) rel="nofollow" @endif class="inline-flex items-center px-4 py-2 -ml-px text-sm font-medium text-[#023b55] bg-white border border-gray-300 leading-5 hover:text-[#039652] hover:border-[#039652]/30 focus:outline-none focus:ring ring-[#039652]/20 focus:border-[#039652] active:bg-gray-100 active:text-[#023b55] transition ease-in-out duration-150 dark:bg-gray-800 dark:border-gray-600 dark:text-gray-300 dark:hover:text-gray-300 dark:active:bg-gray-700 dark:focus:border-[#039652] hover:bg-gray-50" aria-label="الصفحة {{ $page }}">
                                         {{ $page }}
                                     </a>
                                 @endif
@@ -88,18 +95,19 @@
                         @endif
                     @endforeach
 
-                    {{-- Next Page Link --}}
+                    {{-- Next Page Link — native RTL flex: "التالي" sits on the
+                    LEFT (end side) and its chevron must POINT LEFT (←). --}}
                     @if ($paginator->hasMorePages())
-                        <a href="{{ $paginator->nextPageUrl() }}" rel="next" class="inline-flex items-center px-2 py-2 -ml-px text-sm font-medium text-[#023b55] bg-white border border-gray-300 rounded-r-md leading-5 hover:text-[#039652] hover:border-[#039652]/30 focus:outline-none focus:ring ring-[#039652]/20 focus:border-[#039652] active:bg-gray-100 active:text-[#023b55] transition ease-in-out duration-150 dark:bg-gray-800 dark:border-gray-600 dark:active:bg-gray-700 dark:focus:border-[#039652] dark:text-gray-300 dark:hover:bg-gray-900 dark:hover:text-gray-300" aria-label="{{ __('pagination.next') }}">
+                        <a href="{{ $paginator->nextPageUrl() }}" @if($pagNofollow) rel="nofollow" @else rel="next" @endif class="inline-flex items-center px-2 py-2 -ml-px text-sm font-medium text-[#023b55] bg-white border border-gray-300 rounded-e-md leading-5 hover:text-[#039652] hover:border-[#039652]/30 focus:outline-none focus:ring ring-[#039652]/20 focus:border-[#039652] active:bg-gray-100 active:text-[#023b55] transition ease-in-out duration-150 dark:bg-gray-800 dark:border-gray-600 dark:active:bg-gray-700 dark:focus:border-[#039652] dark:text-gray-300 dark:hover:bg-gray-900 dark:hover:text-gray-300" aria-label="التالي">
                             <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 20 20">
-                                <path fill-rule="evenodd" d="M7.293 14.707a1 1 0 010-1.414L10.586 10 7.293 6.707a1 1 0 011.414-1.414l4 4a1 1 0 010 1.414l-4 4a1 1 0 01-1.414 0z" clip-rule="evenodd" />
+                                <path fill-rule="evenodd" d="M12.707 5.293a1 1 0 010 1.414L9.414 10l3.293 3.293a1 1 0 01-1.414 1.414l-4-4a1 1 0 010-1.414l4-4a1 1 0 011.414 0z" clip-rule="evenodd" />
                             </svg>
                         </a>
                     @else
-                        <span aria-disabled="true" aria-label="{{ __('pagination.next') }}">
-                            <span class="inline-flex items-center px-2 py-2 -ml-px text-sm font-medium text-gray-500 bg-white border border-gray-300 cursor-not-allowed rounded-r-md leading-5 dark:bg-gray-700 dark:border-gray-600 dark:text-gray-400" aria-hidden="true">
+                        <span aria-disabled="true" aria-label="التالي">
+                            <span class="inline-flex items-center px-2 py-2 -ml-px text-sm font-medium text-gray-500 bg-white border border-gray-300 cursor-not-allowed rounded-e-md leading-5 dark:bg-gray-700 dark:border-gray-600 dark:text-gray-400" aria-hidden="true">
                                 <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 20 20">
-                                    <path fill-rule="evenodd" d="M7.293 14.707a1 1 0 010-1.414L10.586 10 7.293 6.707a1 1 0 011.414-1.414l4 4a1 1 0 010 1.414l-4 4a1 1 0 01-1.414 0z" clip-rule="evenodd" />
+                                    <path fill-rule="evenodd" d="M12.707 5.293a1 1 0 010 1.414L9.414 10l3.293 3.293a1 1 0 01-1.414 1.414l-4-4a1 1 0 010-1.414l4-4a1 1 0 011.414 0z" clip-rule="evenodd" />
                                 </svg>
                             </span>
                         </span>

@@ -6,10 +6,12 @@ namespace App\Jobs;
 
 use App\Enums\FlyerStatus;
 use App\Models\Flyer;
+use App\Models\FlyerItem;
 use App\Models\RawFacebookPost;
 use App\Models\Retailer;
 use App\Services\FlyerSlugService;
 use App\Services\GeminiVisionService;
+use App\Services\ProductDataNormalizer;
 use App\Support\ArabicDateHelper;
 use App\Support\FacebookMediaHelper;
 use Carbon\Carbon;
@@ -708,48 +710,48 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
     }
 
     /**
-     * [GATEKEEPER_DEDUP] Remove items whose [normalized product name,
-     * sale_price] pair duplicates an earlier (lower-id) item. OCR commonly
-     * emits the same offer twice from adjacent flyer tiles.
+     * [GATEKEEPER_DEDUP] Remove duplicate items using the Richest-Row Winner
+     * strategy: OCR commonly re-reads the same offer from adjacent tiles AND
+     * from the flyer COVER — identical [normalized product stem, sale_price]
+     * pairs (or ≥82% similar stems at an equal price) collapse onto the
+     * richest row, and missing fields (old_price / brand_id / unit /
+     * category) are MERGED onto the survivor before the losers are deleted.
      *
      * Bulk delete is safe here: flyer_items carry no R2 assets, so no model
      * events are needed.
      *
      * @return int number of items removed
      */
-    private static function dedupFlyerItems(Flyer $flyer): int
+    public static function dedupFlyerItems(Flyer $flyer): int
     {
-        $items = $flyer->items()->orderBy('id')->get(['id', 'product_name', 'sale_price']);
+        $items = $flyer->items()->orderBy('id')->get();
 
-        $seen = [];
-        $duplicateIds = [];
+        // Nameless rows carry no dedup signal — never collapsed, never merged.
+        $deduplicatable = $items->filter(static fn (FlyerItem $item): bool => trim((string) $item->product_name) !== '');
 
-        foreach ($items as $item) {
-            $name = trim((string) preg_replace('/\s+/u', ' ', (string) $item->product_name));
-
-            // Nameless rows are never collapsed — they carry no dedup signal.
-            if ($name === '') {
-                continue;
-            }
-
-            $key = mb_strtolower($name).'|'.round((float) $item->sale_price, 2);
-
-            if (isset($seen[$key])) {
-                $duplicateIds[] = (int) $item->id;
-
-                continue;
-            }
-
-            $seen[$key] = true;
-        }
-
-        if ($duplicateIds === []) {
+        if ($deduplicatable->count() < 2) {
             return 0;
         }
 
-        $flyer->items()->whereIn('id', $duplicateIds)->delete();
+        /** @var array{kept: list<FlyerItem>, removedIds: list<int>} $result */
+        $result = ProductDataNormalizer::deduplicate($deduplicatable->all());
 
-        return count($duplicateIds);
+        $removedIds = $result['removedIds'];
+
+        if ($removedIds === []) {
+            return 0;
+        }
+
+        // Persist survivor enrichments (missing fields merged in memory).
+        foreach ($result['kept'] as $survivor) {
+            if ($survivor->isDirty()) {
+                $survivor->saveQuietly();
+            }
+        }
+
+        $flyer->items()->whereIn('id', $removedIds)->delete();
+
+        return count($removedIds);
     }
 
 
@@ -852,7 +854,9 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
                 $from = $flyer->valid_from instanceof Carbon ? $flyer->valid_from->format('d/m/Y') : (string) $flyer->valid_from;
                 $until = $flyer->valid_until instanceof Carbon ? $flyer->valid_until->format('d/m/Y') : (string) $flyer->valid_until;
                 $topProducts = $flyer->items()->limit(5)->pluck('product_name')->all();
-                $maxDiscount = (float) ($flyer->items()->max('discount_percent') ?? 0);
+                // Nearest-integer max discount — "25%", never "24.69%"
+                // (matches the Flyer accessors and editorial builders).
+                $maxDiscount = round((float) ($flyer->items()->max('discount_percent') ?? 0));
 
                 /** @var GeminiVisionService $gemini */
                 $gemini = app(GeminiVisionService::class);
@@ -901,11 +905,11 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
                 }
             }
 
-            $maxDiscount = (float) ($flyer->items()->max('discount_percent') ?? 0);
+            $maxDiscount = round((float) ($flyer->items()->max('discount_percent') ?? 0));
             // 0% protection: never publish "بخصومات تصل إلى 0%." — when no real
             // discount was detected, advertise competitive pricing instead.
             $discountPhrase = $maxDiscount > 0
-                ? 'بخصومات تصل إلى '.self::trimDecimal($maxDiscount).'%'
+                ? 'بخصومات تصل إلى '.self::trimDecimal((float) $maxDiscount).'%'
                 : 'بأسعار تنافسية مخفضة';
             $topProducts = $flyer->items()->limit(5)->pluck('product_name')->filter()->implode('، ');
             $topProducts = $topProducts !== '' ? $topProducts : 'سلع متنوعة';
@@ -971,10 +975,10 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
             } catch (Throwable $e) {
             }
 
-            $maxDiscount = (float) ($flyer->items()->max('discount_percent') ?? 0);
+            $maxDiscount = round((float) ($flyer->items()->max('discount_percent') ?? 0));
             // Trim ".00" BEFORE appending the unit — rtrim() on the finished
             // string hits the Arabic "ج.م" suffix and is a no-op.
-            $discountRange = $maxDiscount > 0 ? self::trimDecimal($maxDiscount).'%' : 'متنوعة';
+            $discountRange = $maxDiscount > 0 ? self::trimDecimal((float) $maxDiscount).'%' : 'متنوعة';
             $discountRange = (string) preg_replace('/(\d+)\.\s+(\d)/u', '$1.$2', $discountRange);
 
             $heroDeals = $flyer->items()->orderByDesc('discount_percent')->limit(4)->get();

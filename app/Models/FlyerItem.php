@@ -27,6 +27,7 @@ class FlyerItem extends Model
         'savings_amount',
         'discount_percent',
         'unit',
+        'category',
         'bundle_condition',
         'extra_attributes',
         'is_featured',

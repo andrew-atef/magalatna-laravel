@@ -18,6 +18,54 @@ final class AutoInternalLinkerService
 
     private const MAX_LINKS = 5;
 
+    /**
+     * Semantic editorial renderer (2026 SEO/AEO):
+     *
+     * Plain-text editorial overviews stored as "- bullet" lines + newlines
+     * were rendered as flat `<br>` soup — no list semantics for Google or AI
+     * answer engines. This wraps the SAME auto-linked content into real
+     * `<p>` paragraphs and a real `<ul class="list-disc ..."><li>` list.
+     */
+    public function linkifyEditorial(string $content, ?Flyer $currentFlyer = null): string
+    {
+        $html = $this->linkify($content, $currentFlyer);
+        if ($html === '') {
+            return '';
+        }
+
+        // linkify() escapes everything and renders line breaks as <br> (+ the
+        // preserved raw newline). Split into logical lines on both.
+        $lines = array_values(array_filter(
+            preg_split('/<br\s*\/?>|\n/u', $html) ?: [],
+            static fn (string $line): bool => trim($line) !== '',
+        ));
+
+        $paragraphs = [];
+        $bullets = [];
+        $flushBullets = static function () use (&$bullets, &$paragraphs): void {
+            if ($bullets === []) {
+                return;
+            }
+            $paragraphs[] = '<ul class="list-disc pr-5 space-y-1.5 text-slate-700"><li>'
+                .implode('</li><li>', $bullets)
+                .'</li></ul>';
+            $bullets = [];
+        };
+
+        foreach ($lines as $line) {
+            $line = trim($line);
+            if (preg_match('/^[-–•]\s*/u', $line) === 1) {
+                $bullets[] = trim((string) preg_replace('/^[-–•]\s*/u', '', $line));
+                continue;
+            }
+            $flushBullets();
+            $paragraphs[] = '<p class="my-2">'.$line.'</p>';
+        }
+        $flushBullets();
+
+        return implode("\n", $paragraphs);
+    }
+
     public function linkify(string $content, ?Flyer $currentFlyer = null): string
     {
         $content = trim($content);

@@ -20,6 +20,7 @@ class FlyerPage extends Model
         'flyer_id',
         'page_number',
         'image_path',
+        'thumb_path',
         'width',
         'height',
     ];

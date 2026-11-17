@@ -14,7 +14,13 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="csrf-token" content="{{ csrf_token() }}">
+    {{-- CSRF token ONLY where a session actually exists: stateless public
+    GET pages (home / flyer / hub / legal) render for anonymous visitors and
+    carry no forms — emitting a dynamic per-session token there both leaks a
+    personalization signal and breaks full-page CDN caching. --}}
+    @unless (\App\Support\StatelessRoutes::isStatelessRoute(request()))
+        <meta name="csrf-token" content="{{ csrf_token() }}">
+    @endunless
 
     <link rel="icon" type="image/svg+xml" href="/favicon.svg">
     <meta name="theme-color" content="#023b55">
@@ -26,6 +32,27 @@
         // CLI, www, proxies) into the canonical and poison SEO.
         $baseUrl = rtrim((string) config('app.url'), '/');
         $canonicalUrl = $canonical ?? ($baseUrl.request()->getPathInfo());
+        // Pagination self-canonical: ?page=2+ carries its OWN canonical
+        // (baseUrl + path + ?page=N) instead of pointing at page 1 — a
+        // page-2 → page-1 canonical makes page 2 a duplicate AND drops the
+        // already-emitted noindex,follow robots signal below.
+        $pageNumber = (int) request('page', 1);
+        if ($pageNumber > 1) {
+            $canonicalUrl .= '?page='.$pageNumber;
+        }
+        // Canonical/`?q=` CONFLICT RESOLUTION: a filtered search view
+        // (?q= / ?retailer= / ?type=) is noindex,follow AND an infinite URL
+        // space — it must NOT emit <link rel="canonical"> AT ALL (a canonical
+        // pointing at "/" while noindex would be a contradictory signal and
+        // leaks a duplicate-content vote). Paginated CLEAN pages keep their
+        // self-referencing canonical.
+        $omitCanonical = request()->filled('q')
+            || request()->filled('retailer')
+            || request()->filled('type');
+        // Homepage URL unified to config host + trailing slash so EVERY
+        // internal link matches <link rel="canonical" href=".../"> exactly —
+        // route('home') would embed the request host (www / admin hosts).
+        $homeUrl = $baseUrl.'/';
         $r2Url = (string) config('filesystems.disks.r2.url');
         $r2Host = parse_url($r2Url, PHP_URL_HOST);
     @endphp
@@ -48,9 +75,12 @@
     @else
         <meta name="robots" content="{{ $robots }}">
     @endif
-    {{-- Canonical ALWAYS the clean controller-provided URL (defaults to
-    config host + request PATH) — filter query strings must never leak in. --}}
-    <link rel="canonical" href="{{ $canonicalUrl }}">
+    {{-- Canonical ONLY on canonical-worthy views: filtered search pages
+    (?q=/?retailer=/?type=) emit NO canonical at all — never point a
+    noindex search page at "/" (contradictory + crawl-bloat signal). --}}
+    @unless ($omitCanonical)
+        <link rel="canonical" href="{{ $canonicalUrl }}">
+    @endunless
 
     <link rel="preload" href="/fonts/readex-pro.woff2" as="font" type="font/woff2" crossorigin>
 
@@ -76,14 +106,20 @@
     <link rel="alternate" type="text/plain" href="{{ url('/llms.txt') }}" title="LLMs.txt Manifest">
 
     @php
+        // Organization logo = the REAL 140x36 logo.webp — favicon.svg is a
+        // square icon and fails Google's Organization logo image rules.
         $organizationSchema = [
             '@context' => 'https://schema.org',
             '@type' => 'Organization',
             'name' => $siteName,
-            'url' => $baseUrl.'/',
-            'logo' => $baseUrl.'/favicon.svg',
+            'url' => $homeUrl,
+            'logo' => [
+                '@type' => 'ImageObject',
+                'url' => $homeUrl.'logo.webp',
+                'width' => 140,
+                'height' => 36,
+            ],
             'areaServed' => 'EG',
-            'sameAs' => array_values(array_filter((array) config('app.social_links', []))),
             'knowsAbout' => [
                 'عروض كارفور مصر',
                 'تخفيضات كازيون',
@@ -91,6 +127,12 @@
                 'أسعار السلع في مصر',
             ],
         ];
+        // Real social profiles only — NEVER emit an empty "sameAs": []
+        // (Rich Results flags an empty array as an invalid property).
+        $layoutSocialLinks = array_values(array_filter((array) config('app.social_links', [])));
+        if ($layoutSocialLinks !== []) {
+            $organizationSchema['sameAs'] = $layoutSocialLinks;
+        }
     @endphp
     @if (! request()->routeIs('flyers.show') && ! request()->routeIs('home') && ! request()->routeIs('retailers.show'))
         <script type="application/ld+json">{!! json_encode($organizationSchema, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE) !!}</script>
@@ -141,14 +183,14 @@
     <header class="sticky top-0 z-40 border-b-2 border-[#023b55]/10 bg-white/95 backdrop-blur">
         <div class="mx-auto flex max-w-7xl items-center justify-between gap-2 px-4 py-3 sm:px-6">
             <!-- Logo & Brand (always visible - right in RTL) -->
-            <a href="{{ route('home') }}" class="flex items-center gap-2 no-underline shrink-0" aria-label="{{ config('app.name', 'مجلاتنا') }} - الرئيسية">
+            <a href="{{ $homeUrl }}" class="flex items-center gap-2 no-underline shrink-0" aria-label="{{ config('app.name', 'مجلاتنا') }} - الرئيسية">
                 <img src="/logo.webp" alt="مجلاتنا - عروض وتخفيضات السوبرماركت في مصر" width="140" height="36" class="h-9 w-auto object-contain" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'">
                 <span class="hidden h-9 w-9 items-center justify-center rounded-xl bg-[#023b55] text-white font-black text-xl shadow-md shadow-[#023b55]/20 border border-[#039652]/30">ع</span>
             </a>
 
             <!-- Desktop Navigation (lg+) -->
             <nav class="hidden lg:flex items-center gap-3 xl:gap-4 text-xs font-bold text-[#023b55]">
-                <a href="{{ route('home') }}" class="hover:text-[#039652] transition-colors {{ request()->routeIs('home') && !request()->has('q') && !request()->has('type') ? 'text-[#039652]' : '' }}">الرئيسية</a>
+                <a href="{{ $homeUrl }}" class="hover:text-[#039652] transition-colors {{ request()->routeIs('home') && !request()->has('q') && !request()->has('type') ? 'text-[#039652]' : '' }}">الرئيسية</a>
                 @php $kazyon = $headerRetailers->firstWhere('slug','kazyon'); @endphp
                 <a href="{{ $kazyon ? route('retailers.show', ['retailer' => $kazyon->slug]) : '#' }}" class="hover:text-[#039652] transition-colors">كازيون</a>
                 @php $carrefour = $headerRetailers->firstWhere('slug','carrefouregypt') ?? $headerRetailers->firstWhere('slug','carrefour'); @endphp
@@ -158,15 +200,15 @@
                 {{-- Interactive <button>, NOT a crawlable <a>: a global-header ?q=
                 search link on EVERY page floods GSC with internal-search
                 crawl-bloat URLs. Bots do not execute onclick handlers. --}}
-                <button type="button" onclick="window.location.href='{{ route('home', ['q' => 'اليوم الواحد']) }}'" class="cursor-pointer hover:text-[#039652] transition-colors">عروض اليوم الواحد</button>
+                <button type="button" onclick="window.location.href='{{ $homeUrl }}?q=اليوم الواحد'" class="cursor-pointer hover:text-[#039652] transition-colors">عروض اليوم الواحد</button>
                 {{-- Anchor to the in-page section — ?type=magazines is a pure
                 duplicate URL (HomeController never filters by type): it only
                 created duplicate cache keys and noindex bloat. --}}
-                <a href="{{ route('home') }}#latest-flyers" class="hover:text-[#039652] transition-colors">جميع المجلات</a>
+                <a href="{{ $homeUrl }}#latest-flyers" class="hover:text-[#039652] transition-colors">جميع المجلات</a>
             </nav>
 
             <!-- Desktop Search Bar (lg+) -->
-            <form action="{{ route('home') }}" method="GET" class="relative hidden lg:block w-72 xl:w-96 shrink-0">
+            <form action="{{ $homeUrl }}" method="GET" class="relative hidden lg:block w-72 xl:w-96 shrink-0">
                 <input
                     type="search"
                     name="q"
@@ -192,7 +234,7 @@
 
         <!-- Mobile Search Overlay (instant full-width) -->
         <div id="mobile-search" class="hidden border-t border-slate-200 bg-white px-4 py-3 lg:hidden">
-            <form action="{{ route('home') }}" method="GET" class="relative">
+            <form action="{{ $homeUrl }}" method="GET" class="relative">
                 <input
                     id="mobile-search-input"
                     type="search"
@@ -223,11 +265,11 @@
             </div>
             <div class="flex-1 overflow-y-auto px-2 py-3">
                 <nav class="space-y-1">
-                    <a href="{{ route('home') }}" class="flex items-center gap-2 rounded-xl px-3 py-2.5 text-sm font-bold text-[#023b55] hover:bg-[#039652]/10 hover:text-[#039652] transition">الرئيسية</a>
-                    <a href="{{ route('home') }}#latest-flyers" class="flex items-center gap-2 rounded-xl px-3 py-2.5 text-sm font-bold text-[#023b55] hover:bg-[#039652]/10 hover:text-[#039652] transition">جميع المجلات</a>
+                    <a href="{{ $homeUrl }}" class="flex items-center gap-2 rounded-xl px-3 py-2.5 text-sm font-bold text-[#023b55] hover:bg-[#039652]/10 hover:text-[#039652] transition">الرئيسية</a>
+                    <a href="{{ $homeUrl }}#latest-flyers" class="flex items-center gap-2 rounded-xl px-3 py-2.5 text-sm font-bold text-[#023b55] hover:bg-[#039652]/10 hover:text-[#039652] transition">جميع المجلات</a>
                     {{-- Interactive <button>, NOT a crawlable <a>: no ?q= URL leaks
                     into the crawl graph from the global drawer. --}}
-                    <button type="button" onclick="window.location.href='{{ route('home', ['q' => 'اليوم الواحد']) }}'" class="flex w-full cursor-pointer items-center gap-2 rounded-xl px-3 py-2.5 text-right text-sm font-bold text-[#023b55] hover:bg-[#039652]/10 hover:text-[#039652] transition">عروض اليوم الواحد</button>
+                    <button type="button" onclick="window.location.href='{{ $homeUrl }}?q=اليوم الواحد'" class="flex w-full cursor-pointer items-center gap-2 rounded-xl px-3 py-2.5 text-right text-sm font-bold text-[#023b55] hover:bg-[#039652]/10 hover:text-[#039652] transition">عروض اليوم الواحد</button>
                     <div class="my-2 border-t border-slate-100"></div>
                     <p class="px-3 py-1 text-xs font-black text-slate-600">المتاجر</p>
                     @foreach ($headerRetailers as $navRet)
@@ -270,7 +312,7 @@
 
     <!-- Mobile Floating Bottom Bar (Sticky Thumb Navigation) -->
     <nav class="fixed inset-x-0 bottom-0 z-30 flex items-center justify-around gap-1 border-t border-slate-200 bg-white/95 px-2 py-2 pb-[calc(0.5rem+env(safe-area-inset-bottom))] backdrop-blur shadow-[0_-2px_10px_rgba(0,0,0,0.06)] lg:hidden" aria-label="التنقل السريع">
-        <a href="{{ route('home') }}" class="flex flex-1 flex-col items-center gap-0.5 rounded-xl py-1 text-[11px] font-bold text-[#023b55] hover:bg-slate-50 hover:text-[#039652] transition">
+        <a href="{{ $homeUrl }}" class="flex flex-1 flex-col items-center gap-0.5 rounded-xl py-1 text-[11px] font-bold text-[#023b55] hover:bg-slate-50 hover:text-[#039652] transition">
             <svg class="h-5 w-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6"/></svg>
             <span>الرئيسية</span>
         </a>
@@ -282,7 +324,7 @@
             <svg class="h-5 w-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/></svg>
             <span>البحث</span>
         </button>
-        <a href="{{ request()->routeIs('home') ? '#hot-deals' : route('home').'#hot-deals' }}" class="flex flex-1 flex-col items-center gap-0.5 rounded-xl py-1 text-[11px] font-bold text-[#039652] hover:bg-[#039652]/10 transition">
+        <a href="{{ request()->routeIs('home') ? '#hot-deals' : $homeUrl.'#hot-deals' }}" class="flex flex-1 flex-col items-center gap-0.5 rounded-xl py-1 text-[11px] font-bold text-[#039652] hover:bg-[#039652]/10 transition">
             <svg class="h-5 w-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
             <span>أقوى الخصومات</span>
         </a>

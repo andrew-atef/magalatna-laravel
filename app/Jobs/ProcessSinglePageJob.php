@@ -11,6 +11,7 @@ use App\Models\FlyerItem;
 use App\Models\FlyerPage;
 use App\Services\GeminiVisionService;
 use App\Services\ImageOptimizerService;
+use App\Services\ProductDataNormalizer;
 use App\Support\ArabicNormalizer;
 use App\Support\PublicUrlGuard;
 use Illuminate\Bus\Batchable;
@@ -224,6 +225,35 @@ final class ProcessSinglePageJob implements ShouldQueue
 
             [$width, $height] = $this->pageDimensions($webpBinary);
 
+            // 3b. Cover-page thumbnail (page 1 ONLY): a lightweight 400px WebP
+            // (~15-22KB) feeds every grid card — homepage, retailer hub,
+            // cross-link widgets — so mobile LCP transfers kilobytes instead
+            // of the ~150KB 1200x1600 master. Both source branches feed this:
+            // image pages carry $webpBinary directly, the PDF branch re-reads
+            // the converted page from R2 into $webpBinary above.
+            // PROGRESSIVE ENHANCEMENT: a thumbnail failure must never fail the
+            // master-page pipeline — cards fall back to image_path.
+            $thumbKey = null;
+            $replacedOldThumbPath = null;
+
+            if ($this->pageNumber === 1 && is_string($webpBinary) && $webpBinary !== '') {
+                $thumbBinary = null;
+
+                try {
+                    $thumbBinary = $optimizer->generateThumbWebp($webpBinary);
+                    $thumbKey = $optimizer->storeThumbWebp($thumbBinary, 'flyers/'.$this->flyerId);
+                } catch (Throwable $e) {
+                    Log::warning('Cover thumbnail generation failed (non-fatal, cards fall back to master).', [
+                        'flyer_id' => $this->flyerId,
+                        'page_number' => $this->pageNumber,
+                        'error' => $e->getMessage(),
+                    ]);
+                } finally {
+                    unset($thumbBinary);
+                    gc_collect_cycles();
+                }
+            }
+
             // WebP bytes are on R2 — free the buffer before the OCR call so the
             // 128MB worker never holds raw + webp + response simultaneously.
             unset($webpBinary);
@@ -257,20 +287,40 @@ final class ProcessSinglePageJob implements ShouldQueue
             // 5. Insert FlyerPage and FlyerItems within transaction — WITHOUT cascade cache purge
             $replacedOldPath = null;
 
-            DB::transaction(function () use ($flyer, $r2Key, $items, $width, $height, &$replacedOldPath): void {
+            DB::transaction(function () use ($flyer, $r2Key, $items, $width, $height, $thumbKey, &$replacedOldPath, &$replacedOldThumbPath): void {
                 // Capture the pre-existing image path BEFORE the upsert: on a
                 // retry the page row may already point at a different R2 object
-                // which must be reaped after this commit (never leaked).
+                // which must be reaped after this commit (never leaked). The
+                // old thumb (cover retries) is captured the same way.
                 $previous = FlyerPage::query()
                     ->where('flyer_id', $flyer->id)
                     ->where('page_number', $this->pageNumber)
-                    ->first(['id', 'image_path']);
+                    ->first(['id', 'image_path', 'thumb_path']);
 
                 if ($previous !== null) {
                     $oldPath = trim((string) $previous->image_path);
                     if ($oldPath !== '' && $oldPath !== $r2Key) {
                         $replacedOldPath = $oldPath;
                     }
+
+                    $oldThumbPath = trim((string) $previous->thumb_path);
+                    if ($oldThumbPath !== '' && $oldThumbPath !== $thumbKey) {
+                        $replacedOldThumbPath = $oldThumbPath;
+                    }
+                }
+
+                $pageAttributes = [
+                    'image_path' => $r2Key,
+                    'width' => $width,
+                    'height' => $height,
+                ];
+
+                if ($this->pageNumber === 1) {
+                    // Cover only: persist the generated thumbnail key. When
+                    // generation failed ($thumbKey === null) the stale thumb is
+                    // cleared — the master changed, the old thumb no longer
+                    // matches, and it is reaped after commit below.
+                    $pageAttributes['thumb_path'] = $thumbKey;
                 }
 
                 // Upsert FlyerPage (unique flyer_id + page_number) — no observer, safe
@@ -279,11 +329,7 @@ final class ProcessSinglePageJob implements ShouldQueue
                         'flyer_id' => $flyer->id,
                         'page_number' => $this->pageNumber,
                     ],
-                    [
-                        'image_path' => $r2Key,
-                        'width' => $width,
-                        'height' => $height,
-                    ]
+                    $pageAttributes
                 );
 
                 Log::info('FlyerPage upserted.', [
@@ -295,6 +341,16 @@ final class ProcessSinglePageJob implements ShouldQueue
                 FlyerItem::withoutEvents(function () use ($flyer, $flyerPage, $items): void {
                     // Clear previous items for this specific page to ensure idempotency on retries
                     FlyerItem::where('flyer_page_id', $flyerPage->id)->delete();
+
+                    // Phase 1 smart dedup: load THIS flyer's existing items ONCE
+                    // (ordered by id — earlier reads win survivorship) so cover-vs-
+                    // inner-page double reads and intra-page dupes match in memory
+                    // via areSameProduct() instead of one exact-match query per row.
+                    $flyerItems = FlyerItem::query()
+                        ->where('flyer_id', $flyer->id)
+                        ->orderBy('id')
+                        ->get()
+                        ->all();
 
                     foreach ($items as $raw) {
                         try {
@@ -318,11 +374,24 @@ final class ProcessSinglePageJob implements ShouldQueue
 
                                 continue;
                             }
+
+                            // Phase 1 post-OCR normalization: digits, OCR
+                            // letter-for-digit unit errors (ا كجم → 1 كجم),
+                            // canonical typo corrections (دولتين → دولفين).
+                            $productName = ProductDataNormalizer::cleanProductName($productName) ?: $productName;
+
                             $oldPrice = isset($raw['old_price']) && $raw['old_price'] !== null ? (float) $raw['old_price'] : null;
                             $unit = $raw['unit'] ?? null;
                             $brandName = $raw['brand_name'] ?? null;
                             $bundleCondition = $raw['bundle_condition'] ?? null;
                             $extraAttributes = $raw['extra_attributes'] ?? null;
+
+                            // Phase 1 deterministic categorization — the keyword
+                            // classifier overrides the AI's own answer.
+                            $category = ProductDataNormalizer::inferCategory(
+                                $productName,
+                                is_string($raw['category'] ?? null) ? trim((string) $raw['category']) : null,
+                            );
 
                             // Calculate savings and discount percent if old_price present and valid
                             $savingsAmount = null;
@@ -353,11 +422,18 @@ final class ProcessSinglePageJob implements ShouldQueue
                                 $oldPrice = null;
                             }
 
-                            // Brand resolution
+                            // Phase 1 brand resolution: alias map + fuzzy snap
+                            // to an existing Brand + name-scan inference when
+                            // OCR printed no brand at all.
+                            $canonicalBrand = ProductDataNormalizer::canonicalBrandName(
+                                is_string($brandName) && trim($brandName) !== '' ? trim($brandName) : null,
+                                $productName,
+                            );
+
                             $brandId = null;
 
-                            if (is_string($brandName) && trim($brandName) !== '') {
-                                $brandNameTrim = trim($brandName);
+                            if (is_string($canonicalBrand) && trim($canonicalBrand) !== '') {
+                                $brandNameTrim = trim($canonicalBrand);
                                 $brandSlug = Str::slug($brandNameTrim);
 
                                 if ($brandSlug === '') {
@@ -413,23 +489,75 @@ final class ProcessSinglePageJob implements ShouldQueue
                             // so the item never joins the dedup '' bucket.
                             $normalizedName = ArabicNormalizer::normalize($productName) ?: $productName;
 
-                            // Check if identical item (same normalized name and exact sale price) already exists in THIS flyer
-                            $existingItem = FlyerItem::where('flyer_id', $flyer->id)
-                                ->where('normalized_name', $normalizedName)
-                                ->where('sale_price', $salePrice)
-                                ->first();
+                            // Phase 1 in-memory duplicate match across the WHOLE
+                            // flyer (not just this page): identical dedup key OR
+                            // equal price + ≥82% similar stems. A match ENRICHES
+                            // the existing row instead of discarding the new read.
+                            $candidate = new FlyerItem([
+                                'product_name' => $productName,
+                                'sale_price' => $salePrice,
+                            ]);
 
-                            if ($existingItem !== null) {
-                                Log::info('Skipping duplicate product within flyer.', [
+                            $matchItem = null;
+
+                            foreach ($flyerItems as $existingItem) {
+                                if (ProductDataNormalizer::areSameProduct($existingItem, $candidate)) {
+                                    $matchItem = $existingItem;
+
+                                    break;
+                                }
+                            }
+
+                            if ($matchItem !== null) {
+                                Log::info('Duplicate product matched within flyer, enriching existing row.', [
                                     'flyer_id' => $flyer->id,
+                                    'page_number' => $this->pageNumber,
                                     'product_name' => $productName,
                                     'sale_price' => $salePrice,
+                                    'matched_item_id' => $matchItem->id,
                                 ]);
+
+                                $enriched = false;
+
+                                // Missing old_price → adopt the new read and
+                                // recompute savings/discount (guards: old must
+                                // exceed sale; >90% is a superscript misread).
+                                if (($matchItem->old_price === null || (float) $matchItem->old_price <= 0)
+                                    && $oldPrice !== null && $oldPrice > $salePrice) {
+                                    $discount = round((($oldPrice - $salePrice) / $oldPrice) * 100, 2);
+
+                                    if ($discount <= 90) {
+                                        $matchItem->old_price = $oldPrice;
+                                        $matchItem->savings_amount = round($oldPrice - $salePrice, 2);
+                                        $matchItem->discount_percent = $discount;
+                                        $enriched = true;
+                                    }
+                                }
+
+                                if ($matchItem->brand_id === null && $brandId !== null) {
+                                    $matchItem->brand_id = $brandId;
+                                    $enriched = true;
+                                }
+
+                                if (trim((string) $matchItem->unit) === ''
+                                    && is_string($unit) && trim($unit) !== '') {
+                                    $matchItem->unit = trim($unit);
+                                    $enriched = true;
+                                }
+
+                                if (blank($matchItem->category) && $category !== null) {
+                                    $matchItem->category = $category;
+                                    $enriched = true;
+                                }
+
+                                if ($enriched) {
+                                    $matchItem->saveQuietly();
+                                }
 
                                 continue;
                             }
 
-                            FlyerItem::create([
+                            $newItem = FlyerItem::create([
                                 'flyer_id' => $flyer->id,
                                 'flyer_page_id' => $flyerPage->id,
                                 'brand_id' => $brandId,
@@ -441,10 +569,15 @@ final class ProcessSinglePageJob implements ShouldQueue
                                 'savings_amount' => $savingsAmount,
                                 'discount_percent' => $discountPercent,
                                 'unit' => is_string($unit) && trim($unit) !== '' ? trim($unit) : null,
+                                'category' => $category,
                                 'bundle_condition' => is_string($bundleCondition) && trim($bundleCondition) !== '' ? trim($bundleCondition) : null,
                                 'extra_attributes' => $extraJson,
                                 'is_featured' => false,
                             ]);
+
+                            // Register in the in-memory cache so duplicates INSIDE
+                            // the same page also match (areSameProduct sees them).
+                            $flyerItems[] = $newItem;
                         } catch (Throwable $e) {
                             Log::error('Failed to insert flyer_item.', [
                                 'flyer_id' => $flyer->id,
@@ -468,6 +601,23 @@ final class ProcessSinglePageJob implements ShouldQueue
                     } catch (Throwable $e) {
                         Log::warning('ProcessSinglePageJob: replaced image R2 delete failed.', [
                             'path' => $oldPath,
+                            'error' => $e->getMessage(),
+                        ]);
+                    }
+                })->afterCommit();
+            }
+
+            // Replaced/stale cover thumbnail (cover retry or failed thumb
+            // regeneration): reap the OLD thumb object the same way.
+            if (is_string($replacedOldThumbPath) && $replacedOldThumbPath !== '') {
+                $oldThumbPath = $replacedOldThumbPath;
+
+                dispatch(static function () use ($oldThumbPath): void {
+                    try {
+                        Storage::disk('r2')->delete($oldThumbPath);
+                    } catch (Throwable $e) {
+                        Log::warning('ProcessSinglePageJob: replaced thumb R2 delete failed.', [
+                            'path' => $oldThumbPath,
                             'error' => $e->getMessage(),
                         ]);
                     }

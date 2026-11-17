@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Support;
 
+use App\Models\FlyerPage;
 use Illuminate\Support\Str;
 
 final class R2Url
@@ -89,5 +90,33 @@ final class R2Url
         }
 
         return $base.'/cdn-cgi/image/width='.$width.',format='.$format.'/'.ltrim((string) $path, '/');
+    }
+
+    /**
+     * Lightweight cover-card URL for grid widgets: prefers the pre-generated
+     * 400px WebP thumbnail (~15-22KB) over the 1200x1600 master (~150KB) —
+     * page-inside cards never need the full-resolution scan.
+     *
+     * NEVER throws and NEVER returns a blank src: missing thumb → master
+     * image; missing page/master → local placeholder. A missing thumbnail
+     * must degrade the image, never the card.
+     */
+    public static function cardThumb(?FlyerPage $page): string
+    {
+        if ($page !== null) {
+            $thumbPath = trim((string) $page->thumb_path);
+
+            if ($thumbPath !== '') {
+                return (string) self::asset($thumbPath);
+            }
+
+            $masterPath = trim((string) $page->image_path);
+
+            if ($masterPath !== '') {
+                return (string) self::asset($masterPath);
+            }
+        }
+
+        return '/img/placeholder-flyer.png';
     }
 }

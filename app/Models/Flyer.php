@@ -125,6 +125,36 @@ class Flyer extends Model
      */
     public function getBlufSummaryAttribute(): string
     {
+        // EXPIRED ARCHIVE copy — a dead offer must NEVER read "سارٍ". This
+        // accessor is the single authority for both the HTML show view and
+        // the ?_fmt=md markdown view, so both stay truthful in one place.
+        if ($this->isExpired()) {
+            $titleForBluf = $this->attributes['title'] ?? 'العرض';
+            $retailerName = (string) ($this->retailer?->name ?? '');
+
+            $rawUntil = $this->attributes['valid_until'] ?? null;
+            $untilArabic = '';
+            if (is_string($rawUntil) && trim($rawUntil) !== '') {
+                try {
+                    $untilCarbon = Carbon::parse($rawUntil, 'Africa/Cairo');
+                    $untilArabic = $untilCarbon->locale('ar')->isoFormat('D MMMM YYYY');
+                    if (! preg_match('/[\x{0600}-\x{06FF}]/u', $untilArabic)) {
+                        $untilArabic = ArabicDateHelper::formatArabicDate($untilCarbon);
+                    }
+                } catch (\Throwable $e) {
+                    $untilArabic = (string) $rawUntil;
+                }
+            }
+
+            // Count from the loaded relation when available (O(1) for the show
+            // view); only fall back to a COUNT query for unhydrated callers.
+            $itemsCount = $this->relationLoaded('items')
+                ? $this->items->count()
+                : $this->items()->count();
+
+            return "انتهت فترة سريان {$titleForBluf} من {$retailerName} بتاريخ {$untilArabic}. الأسعار المذكورة أدناه ({$itemsCount} سلعة) محفوظة كأرشيف تاريخي لمقارنة الأسعار في مصر.";
+        }
+
         $raw = $this->attributes['bluf_summary'] ?? null;
 
         if (is_string($raw) && trim($raw) !== '') {
@@ -176,7 +206,10 @@ class Flyer extends Model
         $loadedItems = $this->relationLoaded('items') ? $this->items : collect();
         $maxDiscount = $loadedItems->max('discount_percent');
         $hasRealDiscount = $maxDiscount !== null && (float) $maxDiscount > 0;
-        $discount = rtrim(rtrim(number_format((float) ($maxDiscount ?? 0), 2, '.', ''), '0'), '.');
+        // Nearest-integer rounding: "بخصومات تصل إلى 25%" — fake-precision
+        // decimals (24.69%) read like machine output and get quoted by AI
+        // answer engines verbatim. Same rule as the Gatekeeper BLUF builders.
+        $discount = (string) round((float) ($maxDiscount ?? 0));
 
         // Never emit "بخصومات تصل إلى 0%." — a flyer with no loaded items or no
         // real discount still deserves credible, indexable copy.
@@ -224,7 +257,7 @@ class Flyer extends Model
             $loadedItems = $this->relationLoaded('items') ? $this->items : collect();
             $maxDiscount = $loadedItems->max('discount_percent');
             $hasRealDiscount = $maxDiscount !== null && (float) $maxDiscount > 0;
-            $discount = rtrim(rtrim(number_format((float) ($maxDiscount ?? 0), 2, '.', ''), '0'), '.');
+            $discount = (string) round((float) ($maxDiscount ?? 0));
             $discountPhrase = $hasRealDiscount ? "بخصومات {$discount}%" : 'بأسعار تنافسية مخفضة';
             $topItems = $loadedItems->take(4);
             if ($topItems->isEmpty()) {

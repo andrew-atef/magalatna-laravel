@@ -296,6 +296,98 @@ final class ImageOptimizerService
     }
 
     /**
+     * Generate a lightweight 400px cover thumbnail (~15-22KB) from an already
+     * optimized WebP binary. Grid cards (homepage / retailer hub / cross-link
+     * widgets) render inside small 3:4 slots — shipping the full 1200x1600
+     * master there wastes ~900KB per card and destroys mobile LCP.
+     *
+     * Memory hygiene mirrors optimizeImageBinary(): Intervention's rasterized
+     * image + encoded object are freed IMMEDIATELY (unset + gc) — the 128MB
+     * queue worker converts many images per batch and peak RSS must stay flat.
+     *
+     * @throws RuntimeException
+     */
+    public function generateThumbWebp(string $webpBinary, int $width = 400, int $quality = 75): string
+    {
+        try {
+            if (trim($webpBinary) === '') {
+                throw new RuntimeException('Cannot generate a thumbnail from an empty WebP binary.');
+            }
+
+            $manager = $this->imageManager();
+            $image = $manager->read($webpBinary);
+
+            // Only shrink, never upscale: a master narrower than the target
+            // width keeps its native size (a 320px-wide flyer stays 320px).
+            try {
+                if ($image->width() > $width) {
+                    $image->scaleDown(width: $width);
+                }
+            } catch (Throwable $e) {
+                Log::warning('Could not determine image width for thumbnail scaling.', [
+                    'error' => $e->getMessage(),
+                ]);
+            }
+
+            $encoded = $image->encode(new WebpEncoder(quality: $quality));
+            $thumbBinary = (string) $encoded;
+
+            // Free Intervention's rasterized image + encoded object NOW.
+            unset($image, $encoded, $manager);
+            gc_collect_cycles();
+
+            if ($thumbBinary === '') {
+                throw new RuntimeException('Thumbnail WebP encoding produced empty binary.');
+            }
+
+            return $thumbBinary;
+        } catch (RuntimeException $e) {
+            throw $e;
+        } catch (Throwable $e) {
+            Log::error('Thumbnail generation failed.', [
+                'error' => $e->getMessage(),
+            ]);
+
+            throw new RuntimeException('Thumbnail generation failed: '.$e->getMessage(), 0, $e);
+        }
+    }
+
+    /**
+     * Store a cover thumbnail on the given disk with the `thumb_` key prefix
+     * and immutable cache headers (R2): `flyers/{id}/thumb_{ulid}.webp`.
+     * Immutable headers are safe — a new master always produces a NEW ulid.
+     *
+     * @throws RuntimeException
+     */
+    public function storeThumbWebp(string $thumbBinary, string $directory, string $disk = 'r2'): string
+    {
+        try {
+            $normalizedDir = $this->normalizeDirectory($directory);
+            $filename = 'thumb_'.Str::ulid()->toString().'.webp';
+            $key = $normalizedDir !== '' ? $normalizedDir.'/'.$filename : $filename;
+
+            $options = [
+                'visibility' => 'public',
+                'ContentType' => 'image/webp',
+            ];
+
+            if ($disk === 'r2') {
+                $options['CacheControl'] = 'public, max-age=31536000, immutable';
+            }
+
+            Storage::disk($disk)->put($key, $thumbBinary, $options);
+
+            Log::info('Thumb WebP stored.', ['disk' => $disk, 'key' => $key, 'bytes' => strlen($thumbBinary)]);
+
+            return $key;
+        } catch (Throwable $e) {
+            Log::error('Thumb WebP store failed.', ['disk' => $disk, 'directory' => $directory, 'error' => $e->getMessage()]);
+
+            throw new RuntimeException('Failed to store thumbnail WebP: '.$e->getMessage(), 0, $e);
+        }
+    }
+
+    /**
      * Upload WebP binary to R2 with immutable cache headers.
      *
      * @throws RuntimeException

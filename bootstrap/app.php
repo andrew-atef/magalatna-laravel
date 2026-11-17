@@ -18,6 +18,14 @@ return Application::configure(basePath: dirname(__DIR__))
             'internal.api'   => InternalApiKeyMiddleware::class,
             'ingest.secret'  => VerifyIngestWebhookSecret::class,
         ]);
+        // GLOBAL (outermost) cookie stripper: StartSession and
+        // ValidateCsrfToken re-attach their cookies on the way BACK UP the
+        // middleware onion, so an inner (web-group) stripper would be
+        // re-populated. As a global wrapper it runs LAST on the response and
+        // cleanly removes Set-Cookie from anonymous stateless public GETs
+        // only — /admin, /livewire and any non-public route keep their
+        // full web session middleware.
+        $middleware->append(\App\Http\Middleware\StatelessPublicPages::class);
         $middleware->web(append: [
             // Canonical host protection FIRST: a www.magalatna.com request is
             // 301'd to the apex before any session/view work happens.

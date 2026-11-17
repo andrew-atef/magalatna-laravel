@@ -93,8 +93,9 @@ final class Phase2SeoSchemaTest extends TestCase
         $types = [];
         $itemList = null;
         $event = null;
-        $announcement = null;
+        $collectionPage = null;
         $organization = null;
+        $specialAnnouncement = null;
 
         foreach ($decoded['@graph'] as $node) {
             $types[] = $node['@type'];
@@ -107,8 +108,12 @@ final class Phase2SeoSchemaTest extends TestCase
                 $event = $node;
             }
 
+            if ($node['@type'] === 'CollectionPage') {
+                $collectionPage = $node;
+            }
+
             if ($node['@type'] === 'SpecialAnnouncement') {
-                $announcement = $node;
+                $specialAnnouncement = $node;
             }
 
             if ($node['@type'] === 'Organization') {
@@ -118,8 +123,10 @@ final class Phase2SeoSchemaTest extends TestCase
 
         $this->assertNotNull($itemList);
         $this->assertNotNull($event);
-        $this->assertNotNull($announcement);
+        $this->assertNotNull($collectionPage);
         $this->assertNotNull($organization);
+        // SpecialAnnouncement is RETIRED by Google — it must be gone entirely.
+        $this->assertNull($specialAnnouncement);
 
         // itemListElement MUST match numberOfItems — no take(50) truncation,
         // zero-priced items excluded.
@@ -153,10 +160,22 @@ final class Phase2SeoSchemaTest extends TestCase
             (string) $event['endDate'],
         );
 
-        // SpecialAnnouncement node + Organization sameAs hygiene:
+        // CollectionPage carries the full linkage web: isPartOf (#website),
+        // breadcrumb (#breadcrumb), publisher (#organization), mainEntity
+        // (#itemlist) and both publication timestamps.
+        $this->assertSame($collectionPage['isPartOf']['@id'], 'https://magalatna.com/#website');
+        $this->assertSame($collectionPage['breadcrumb']['@id'], 'https://magalatna.com/offers/schema-graph-offer#breadcrumb');
+        $this->assertSame($collectionPage['publisher']['@id'], $organization['@id']);
+        $this->assertSame($collectionPage['mainEntity']['@id'], 'https://magalatna.com/offers/schema-graph-offer#itemlist');
+        $this->assertNotEmpty($collectionPage['datePublished']);
+        $this->assertNotEmpty($collectionPage['dateModified']);
+
+        // SaleEvent organizer = the RETAILER running the sale (never the
+        // aggregator site), plus Organization sameAs hygiene:
         // empty social config → the sameAs key is OMITTED entirely
         // ("sameAs": [] is flagged as an invalid property by Rich Results).
-        $this->assertSame($event['endDate'], $announcement['expires']);
+        $this->assertSame($flyer->retailer->name, $event['organizer']['name']);
+        $this->assertStringStartsWith('https://magalatna.com/', $event['organizer']['url']);
         $this->assertArrayNotHasKey('sameAs', $organization);
     }
 

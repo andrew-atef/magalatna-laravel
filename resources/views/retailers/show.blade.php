@@ -3,10 +3,14 @@
     $r2DiskUrl = R2Url::base();
     $logoUrl = $retailer->logo_path ? R2Url::asset($retailer->logo_path) : null;
     // Canonical strictly from config('app.url') + relative route.
+    // Paginated hubs (?page=2+) carry their OWN self-canonical with ?page=N
+    // (noindex,follow robots is emitted below unchanged).
     $baseUrl = rtrim((string) config('app.url'), '/');
     $canonicalUrl = $canonical ?? ($baseUrl.route('retailers.show', ['retailer' => $retailer->slug], false));
-    // Paginated hubs (page > 1) are noindex,follow — the clean hub stays indexable.
     $isPaginated = (int) request('page', 1) > 1;
+    if ($isPaginated) {
+        $canonicalUrl .= '?page='.(int) request('page');
+    }
     $robotsMeta = $isPaginated ? 'noindex, follow' : 'index, follow, max-image-preview:large, max-snippet:-1, max-video-preview:-1';
     $year = \Carbon\Carbon::now('Africa/Cairo')->year;
     $metaTitle = $seoTitle ?? "عروض {$retailer->clean_name} في مصر اليوم {$year} | أحدث المجلات والتخفيضات";
@@ -54,11 +58,12 @@
                 'url' => $canonicalUrl,
                 'isPartOf' => ['@id' => $websiteId],
                 'breadcrumb' => ['@id' => $breadcrumbId],
+                'publisher' => ['@id' => $orgId],
                 'about' => [
                     '@type' => 'Organization',
                     'name' => $retailer->name,
                     'url' => $retailer->website_url ?: $baseUrl . '/',
-                    'logo' => $retailer->logo_path ? \App\Support\R2Url::asset($retailer->logo_path) : $baseUrl . '/favicon.svg',
+                    'logo' => $retailer->logo_path ? \App\Support\R2Url::asset($retailer->logo_path) : $baseUrl . '/logo.webp',
                 ],
             ];
             if ($schemaMainEntity !== null) {
@@ -74,7 +79,9 @@
                 'url' => $baseUrl . '/',
                 'logo' => [
                     '@type' => 'ImageObject',
-                    'url' => $baseUrl . '/favicon.svg',
+                    // The REAL 140x36 logo — favicon.svg is a square icon and
+                    // fails Google's Organization logo image guidelines.
+                    'url' => $baseUrl . '/logo.webp',
                     'width' => 140,
                     'height' => 36,
                 ],
@@ -165,7 +172,7 @@
                 @foreach ($activeFlyers as $flyer)
                     @php
                         $coverPage = $flyer->coverPage;
-                        $coverUrl = $coverPage ? R2Url::asset($coverPage->image_path) : '/img/placeholder-flyer.png';
+                        $coverUrl = R2Url::cardThumb($coverPage);
                     @endphp
                     @php
                             $today = \Carbon\Carbon::today('Africa/Cairo');
@@ -176,7 +183,7 @@
                         @endphp
                     <article class="group flex flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm transition hover:shadow-md">
                         <a href="{{ route('flyers.show', $flyer->slug) }}" class="relative aspect-[3/4] overflow-hidden bg-slate-100">
-                            <img src="{{ $coverUrl }}" alt="{{ $flyer->title }}" width="600" height="800" @if ($loop->first) loading="eager" fetchpriority="high" decoding="async" @else loading="lazy" decoding="async" @endif class="h-full w-full object-cover transition duration-300 group-hover:scale-105">
+                            <img src="{{ $coverUrl }}" alt="{{ $flyer->title }}" width="400" height="533" @if ($loop->first) loading="eager" fetchpriority="high" decoding="async" @else loading="lazy" decoding="async" @endif class="h-full w-full object-cover transition duration-300 group-hover:scale-105">
                             @if ($isFuture)
                                 <span class="absolute right-2 top-2 rounded-lg bg-[#fcc023] px-2 py-1 text-[11px] font-bold text-slate-900 shadow">يبدأ {{ $from->format('d/m') }}</span>
                             @elseif ($isPast)
@@ -224,13 +231,13 @@
                             @foreach($otherActiveFlyers as $altFlyer)
                                 @php
                                     $altCover = $altFlyer->coverPage;
-                                    $altCoverUrl = $altCover ? R2Url::asset($altCover->image_path) : '/img/placeholder-flyer.png';
+                                    $altCoverUrl = R2Url::cardThumb($altCover);
                                     $altFrom = \Carbon\Carbon::parse($altFlyer->valid_from, 'Africa/Cairo');
                                     $altUntil = \Carbon\Carbon::parse($altFlyer->valid_until, 'Africa/Cairo');
                                 @endphp
                                 <article class="group flex flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm transition hover:shadow-md">
                                     <a href="{{ route('flyers.show', $altFlyer->slug) }}" class="relative aspect-[3/4] overflow-hidden bg-slate-100">
-                                        <img src="{{ $altCoverUrl }}" alt="{{ $altFlyer->title }}" width="600" height="800" @if ($loop->first) loading="eager" fetchpriority="high" decoding="async" @else loading="lazy" decoding="async" @endif class="h-full w-full object-cover transition duration-300 group-hover:scale-105">
+                                        <img src="{{ $altCoverUrl }}" alt="{{ $altFlyer->title }}" width="400" height="533" @if ($loop->first) loading="eager" fetchpriority="high" decoding="async" @else loading="lazy" decoding="async" @endif class="h-full w-full object-cover transition duration-300 group-hover:scale-105">
                                         <span class="absolute right-2 top-2 rounded-lg bg-[#023b55]/90 px-2 py-1 text-[10px] font-bold text-white">{{ $altFlyer->retailer->name }}</span>
                                         <span class="absolute left-2 top-2 rounded-lg bg-slate-900/80 px-2 py-1 text-[11px] font-bold text-white backdrop-blur">{{ $altFlyer->pages_count ?? $altFlyer->total_pages }} صفحة</span>
                                     </a>
@@ -308,11 +315,11 @@
                 @foreach ($expiredFlyers as $flyer)
                     @php
                         $coverPage = $flyer->coverPage;
-                        $coverUrl = $coverPage ? R2Url::asset($coverPage->image_path) : '/img/placeholder-flyer.png';
+                        $coverUrl = R2Url::cardThumb($coverPage);
                     @endphp
                     <article class="flex flex-col overflow-hidden rounded-xl border border-slate-200 bg-slate-50 opacity-90">
                         <a href="{{ route('flyers.show', $flyer->slug) }}" class="relative aspect-[3/4] overflow-hidden bg-slate-100">
-                            <img src="{{ $coverUrl }}" alt="{{ $flyer->title }}" width="600" height="800" loading="lazy" class="h-full w-full object-cover grayscale">
+                            <img src="{{ $coverUrl }}" alt="{{ $flyer->title }}" width="400" height="533" loading="lazy" class="h-full w-full object-cover grayscale">
                             <span class="absolute inset-0 bg-slate-900/10"></span>
                             <span class="absolute right-2 top-2 rounded-lg bg-slate-700 px-2 py-1 text-[11px] font-bold text-white">منتهي {{ \Carbon\Carbon::parse($flyer->valid_until)->format('d/m') }}</span>                        </a>
                         <div class="p-3">
