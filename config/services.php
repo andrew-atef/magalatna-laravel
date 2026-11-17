@@ -38,9 +38,11 @@ return [
     'gemini' => [
         'key' => env('GEMINI_API_KEY'),
         'model' => env('GEMINI_MODEL', 'gemini-2.5-flash'),
-        // Audio synthesis (TTS) model — the generateContent endpoint requires
-        // a TTS-capable model for responseModalities: ["audio"].
-        'tts_model' => env('GEMINI_TTS_MODEL', 'gemini-2.5-flash-preview-tts'),
+        // Audio synthesis (TTS) model — speechMetadata + responseModalities:
+        // ["audio"] require a TTS-capable model on the streamGenerateContent
+        // endpoint. Non-TTS models answer 400 "Speech metadata is not
+        // supported for this model".
+        'tts_model' => env('GEMINI_TTS_MODEL', 'gemini-3.8-flash-tts'),
     ],
 
     // Vertical Reel/Short generation (Gemini TTS + low-memory ffmpeg + R2).

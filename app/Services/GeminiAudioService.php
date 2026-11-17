@@ -14,7 +14,10 @@ use Throwable;
  * Gemini Audio Synthesis — turns the reel script into a dynamic radio-ad
  * voiceover (prebuilt voice, default "Tavi").
  *
- * Endpoint: POST https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent
+ * Endpoint: POST https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent
+ * speechMetadata is ONLY supported by TTS models (e.g. gemini-3.8-flash-tts)
+ * — on non-TTS models the API answers 400 "Speech metadata is not supported
+ * for this model".
  * Auth travels in the `x-goog-api-key` header (never `?key=` in the query
  * string — same contract as GeminiVisionService).
  */
@@ -53,7 +56,7 @@ final class GeminiAudioService
             ? trim($voiceName)
             : trim((string) config('services.reels.voice_name', 'Tavi'));
 
-        $model = trim((string) config('services.gemini.tts_model', 'gemini-2.5-flash-preview-tts'));
+        $model = trim((string) config('services.gemini.tts_model', 'gemini-3.8-flash-tts'));
 
         $payload = [
             'contents' => [
@@ -71,6 +74,7 @@ final class GeminiAudioService
             ],
             'generationConfig' => [
                 'responseModalities' => ['audio'],
+                'temperature' => 1,
                 'speech_config' => [
                     'voice_config' => [
                         'prebuilt_voice_config' => [
@@ -81,7 +85,11 @@ final class GeminiAudioService
             ],
         ];
 
-        $url = self::BASE_URL.'/'.$model.':generateContent';
+        // streamGenerateContent — the endpoint the TTS models are driven
+        // through (matches the working cURL contract). The response body is
+        // a JSON ARRAY of GenerateContentResponse chunks whose inlineData
+        // parts are concatenated in order.
+        $url = self::BASE_URL.'/'.$model.':streamGenerateContent';
 
         $tempDir = rtrim((string) config('services.reels.temp_dir', sys_get_temp_dir()), '/\\');
         if (! is_dir($tempDir)) {
@@ -145,30 +153,45 @@ final class GeminiAudioService
     }
 
     /**
-     * Parse candidates[0].content.parts[*].inlineData.data. Streaming-style
-     * responses may split the audio across concatenated parts — all inline
-     * audio chunks are merged in order.
+     * Parse inline audio across a streamed response. streamGenerateContent
+     * returns a JSON ARRAY of response chunks:
+     *   [ {candidates:[{content:{parts:[{inlineData:{data:...}}]}}]}, {...} ]
+     * while plain generateContent returns a single object — both shapes are
+     * accepted and every inline audio chunk is merged in order.
      *
      * @param  array<string, mixed>  $decoded
      */
     private function extractAudioBase64(array $decoded): ?string
     {
-        $parts = $decoded['candidates'][0]['content']['parts'] ?? null;
+        $chunks = $decoded;
 
-        if (! is_array($parts)) {
-            return null;
+        if (! isset($decoded[0]) || ! is_array($decoded[0])) {
+            // Single-object response → treat as a one-element stream.
+            $chunks = [$decoded];
         }
 
-        $chunks = [];
+        $audioParts = [];
 
-        foreach ($parts as $part) {
-            $data = is_array($part) ? ($part['inlineData']['data'] ?? null) : null;
+        foreach ($chunks as $chunk) {
+            if (! is_array($chunk)) {
+                continue;
+            }
 
-            if (is_string($data) && $data !== '') {
-                $chunks[] = $data;
+            $parts = $chunk['candidates'][0]['content']['parts'] ?? null;
+
+            if (! is_array($parts)) {
+                continue;
+            }
+
+            foreach ($parts as $part) {
+                $data = is_array($part) ? ($part['inlineData']['data'] ?? null) : null;
+
+                if (is_string($data) && $data !== '') {
+                    $audioParts[] = $data;
+                }
             }
         }
 
-        return $chunks === [] ? null : implode('', $chunks);
+        return $audioParts === [] ? null : implode('', $audioParts);
     }
 }

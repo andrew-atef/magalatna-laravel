@@ -29,7 +29,7 @@ final class FlyerReelPipelineTest extends TestCase
         config([
             'services.gemini.key' => 'test-gemini-key',
             'services.gemini.model' => 'gemini-2.5-flash',
-            'services.gemini.tts_model' => 'gemini-2.5-flash-preview-tts',
+            'services.gemini.tts_model' => 'gemini-3.8-flash-tts',
             'services.reels.temp_dir' => storage_path('framework/testing/reels'),
             'services.cloudflare.api_token' => null,
             'services.cloudflare.zone_id' => null,
@@ -143,14 +143,31 @@ final class FlyerReelPipelineTest extends TestCase
                     ['content' => ['parts' => [['text' => $script]]]],
                 ],
             ], 200),
-            // TTS synthesis (TTS model returns inline audio)
-            '*/models/gemini-2.5-flash-preview-tts:generateContent' => Http::response([
-                'candidates' => [
-                    ['content' => ['parts' => [
-                        ['inlineData' => ['mimeType' => 'audio/wav', 'data' => base64_encode(self::FAKE_WAV)]],
-                    ]]],
-                ],
-            ], 200),
+            // TTS synthesis (streaming — audio split across 2 chunks to prove
+            // the concatenation logic; "Tavi" voice, temperature 1)
+            '*/models/gemini-3.8-flash-tts:streamGenerateContent' => (static function () {
+                // One continuous base64 stream, split mid-payload exactly like
+                // real streamGenerateContent chunks (padding only at the end).
+                $full = base64_encode(self::FAKE_WAV);
+                $half = intdiv(strlen($full), 2);
+
+                return Http::response([
+                    [
+                        'candidates' => [
+                            ['content' => ['parts' => [
+                                ['inlineData' => ['mimeType' => 'audio/wav', 'data' => substr($full, 0, $half)]],
+                            ]]],
+                        ],
+                    ],
+                    [
+                        'candidates' => [
+                            ['content' => ['parts' => [
+                                ['inlineData' => ['mimeType' => 'audio/wav', 'data' => substr($full, $half)]],
+                            ]]],
+                        ],
+                    ],
+                ], 200);
+            })(),
         ]);
     }
 
@@ -196,20 +213,28 @@ final class FlyerReelPipelineTest extends TestCase
         );
         $this->assertSame([], $leftovers, 'Temporary audio/video files must be unlinked.');
 
-        // TTS call carries the exact payload structure + header auth.
-        Http::assertSent(function ($request): bool {
-            if (! str_contains((string) $request->url(), 'gemini-2.5-flash-preview-tts:generateContent')) {
+        // TTS call carries the exact payload structure + header auth, and the
+        // streamed chunks are concatenated into one decoded WAV.
+        $ttsSeen = false;
+        Http::assertSent(function ($request) use (&$ttsSeen): bool {
+            if (! str_contains((string) $request->url(), 'gemini-3.8-flash-tts:streamGenerateContent')) {
                 return false;
             }
 
+            $ttsSeen = true;
             $this->assertSame('test-gemini-key', $request->header('x-goog-api-key')[0]);
             $this->assertSame(['audio'], $request['generationConfig']['responseModalities']);
+            $this->assertSame(1, $request['generationConfig']['temperature']);
             $this->assertSame('Tavi', $request['generationConfig']['speech_config']['voice_config']['prebuilt_voice_config']['voice_name']);
             $this->assertStringStartsWith('## Transcript:', (string) $request['contents'][0]['parts'][0]['text']);
             $this->assertArrayHasKey('speechMetadata', $request['contents'][0]['parts'][0]);
 
             return true;
         });
+
+        $this->assertTrue($ttsSeen, 'TTS request was never sent.');
+        $this->assertSame(strlen(self::FAKE_WAV), $composer->lastCall['audio_bytes'],
+            'Streamed audio chunks must concatenate back into the full WAV.');
     }
 
     public function test_command_skips_ready_reel_without_force(): void
