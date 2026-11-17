@@ -486,12 +486,13 @@
             </div>
         @endif
 
-        {{-- Pages 2..N: ONE per row on mobile (A4 pages need full width to
-        be legible on a phone), compact 2-column grid from sm: up — cuts
-        ~12,000px of vertical scroll on 25-page flyers while EVERY <img>
-        stays crawlable and opens the Lightbox on click. --}}
+        {{-- Pages 2..N: ONE per row on mobile AND small tablets (an A4 page
+        needs full width to be legible on anything under 768px), then a
+        2-column grid at md: up — never more than 2 per row. Cuts ~12,000px
+        of vertical scroll on 25-page flyers while EVERY <img> stays
+        crawlable and opens the Lightbox on click. --}}
         @if ($pages->count() > 1)
-            <div class="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2 sm:gap-4">
+            <div class="mt-4 grid grid-cols-1 gap-3 md:grid-cols-2 md:gap-4">
                 @foreach ($pages->slice(1) as $page)
                     @php
                         $pageIdx = $loop->iteration; // offset of featured page 1
@@ -509,7 +510,7 @@
                                 src="{{ $fullImageUrl }}"
                                 @if ($mobileOptimizedUrl && $mobileOptimizedUrl !== $fullImageUrl)
                                     srcset="{{ $fullImageUrl }} {{ $pageW }}w, {{ $mobileOptimizedUrl }} 600w"
-                                    sizes="(max-width: 640px) 100vw, 46vw"
+                                    sizes="(max-width: 767px) 100vw, 46vw"
                                 @endif
                                 alt="{{ $cleanTitle }} - صفحة {{ $page->page_number }}"
                                 width="{{ $pageW }}"

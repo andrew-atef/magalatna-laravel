@@ -94,8 +94,13 @@ final class DiscoverHeroRenderTest extends TestCase
         $this->assertStringContainsString('fetchpriority="high"', $coverImg);
     }
 
-    public function test_pages_grid_is_single_column_on_mobile(): void
+    public function test_pages_grid_is_single_column_on_mobile_and_small_tablets(): void
     {
+        // R2 image resizing ON so the srcset/sizes branch actually renders
+        // (with it off, resizedAsset() returns the master URL and no srcset
+        // is emitted at all).
+        config(['filesystems.disks.r2.image_resizing_enabled' => true]);
+
         $flyer = $this->createPublishedFlyer([], ['slug' => 'grid-cols-flyer']);
         $this->addPage($flyer, 'flyers/pages/p1.webp');
         $this->addPage($flyer, 'flyers/pages/p2.webp', 2);
@@ -103,7 +108,10 @@ final class DiscoverHeroRenderTest extends TestCase
 
         $content = (string) $this->get('/offers/grid-cols-flyer')->getContent();
 
-        // Mobile: ONE image per row; 2-column grid only from sm: up.
-        $this->assertStringContainsString('grid grid-cols-1 gap-3 sm:grid-cols-2', $content);
+        // ONE image per row on mobile AND small tablets (below md/768px);
+        // 2 columns MAX from md: up — never 3+.
+        $this->assertStringContainsString('grid grid-cols-1 gap-3 md:grid-cols-2', $content);
+        // The srcset hint matches: full width below md, half-ish above.
+        $this->assertStringContainsString('sizes="(max-width: 767px) 100vw, 46vw"', $content);
     }
 }
