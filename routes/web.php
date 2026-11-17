@@ -23,15 +23,11 @@ Route::get('/about-us', [PageController::class, 'about'])->name('pages.about');
 Route::get('/privacy-policy', [PageController::class, 'privacy'])->name('pages.privacy');
 Route::get('/terms-of-use', [PageController::class, 'terms'])->name('pages.terms');
 Route::get('/contact-us', [PageController::class, 'contact'])->name('pages.contact');
-// GSC 404 remediation: historic merged/deleted flyer slugs discovered in
-// Search Console -> permanent 301 to their surviving canonical targets.
-// MUST sit ABOVE /offers/{slug}: route matching is first-registration-wins,
-// so a redirect registered below the parameterized route would never match.
-Route::redirect('/offers/elfergany-10-20-september-2026-part-2', '/offers/elfergany-10-20-september-2026', 301);
-Route::redirect('/offers/kazyon-9-september-2026', '/kazyon', 301);
-Route::redirect('/offers/elfergany-7-14-september-2026', '/elfergany', 301);
-Route::redirect('/offers/kazyon-8-15-september-2026', '/kazyon', 301);
-
+// GSC 404 remediation is DYNAMIC: FlyerSlugRecoveryService (inside
+// FlyerController::show) resolves ANY deleted/merged/unpublished legacy
+// flyer slug to its surviving flyer or the retailer hub — for all past and
+// future cases, zero hardcoded URLs. /flyer + /flyers legacy prefixes below
+// remain essential (they predate the /offers scheme entirely).
 Route::get('/offers/{slug}', [FlyerController::class, 'show'])->name('flyers.show');
 
 // Redirect old URLs for SEO preservation

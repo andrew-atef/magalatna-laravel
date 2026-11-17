@@ -129,6 +129,7 @@ final class RetailerObserver
             Cache::forget('llms_txt_content');
             Cache::forget('layout:header_retailers');
             Cache::forget('auto_linker:retailers');
+            Cache::forget('flyer_recovery:retailer_prefixes');
         });
     }
 

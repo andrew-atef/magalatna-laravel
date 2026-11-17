@@ -6,14 +6,16 @@ namespace App\Http\Controllers;
 
 use App\Enums\FlyerStatus;
 use App\Models\Flyer;
+use App\Services\FlyerSlugRecoveryService;
 use Carbon\Carbon;
+use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\Http\Response;
 use Illuminate\View\View;
 
 final class FlyerController extends Controller
 {
-    public function show(Request $request, string $slug): View|Response
+    public function show(Request $request, string $slug): View|Response|RedirectResponse
     {
         // Public visibility guard: Draft/PendingReview must NEVER leak, and
         // flyers of deactivated retailers must 404 (SEO + content hygiene).
@@ -25,7 +27,26 @@ final class FlyerController extends Controller
             ->where('slug', $slug)
             ->whereIn('status', [FlyerStatus::Published, FlyerStatus::Expired])
             ->whereHas('retailer', fn ($q) => $q->where('is_active', true))
-            ->firstOrFail();
+            ->first();
+
+        if ($flyer === null) {
+            // Dynamic 301 recovery for legacy indexed slugs whose rows were
+            // deleted/merged/unpublished: resolve a surviving flyer of the
+            // same retailer or fall back to its canonical hub. Slugs that
+            // match no active retailer resolve to null and keep 404ing.
+            $recoveryUrl = app(FlyerSlugRecoveryService::class)->resolveRedirectUrl($slug);
+
+            if ($recoveryUrl !== null) {
+                // 301 + 1h client caching: the recovery target is data-driven
+                // and stable, but short-lived enough to re-point quickly if a
+                // better survivor appears later.
+                return redirect()
+                    ->away($recoveryUrl, 301)
+                    ->header('Cache-Control', 'public, max-age=3600');
+            }
+
+            abort(404);
+        }
 
         $cairoToday = Carbon::today('Africa/Cairo')->toDateString();
 
