@@ -115,27 +115,46 @@ final class HomeController extends Controller
 
             if ($isWordQuery) {
                 $word = $tokens[0];
-                $flyersQuery->where(function ($q) use ($escapedRaw, $word): void {
+                $flyersQuery->where(function ($q) use ($escapedRaw, $word, $isAutoQuery): void {
                     if ($escapedRaw !== '') {
                         $q->whereRaw("title LIKE ? ESCAPE '\\'", ["%{$escapedRaw}%"]);
                     }
 
-                    $q->orWhereHas('items', fn ($subQ) => $subQ->where(function ($w) use ($word): void {
-                        $w->whereRaw('normalized_name = ?', [$word])
-                            ->orWhereRaw("normalized_name LIKE ? ESCAPE '\\'", [$word.' %'])
-                            ->orWhereRaw("normalized_name LIKE ? ESCAPE '\\'", ['% '.$word.' %'])
-                            ->orWhereRaw("normalized_name LIKE ? ESCAPE '\\'", ['% '.$word]);
-                    }));
+                    // The flyer-level match must honour the SAME automotive
+                    // exclusion as the item grid: a "زيت" search must not
+                    // surface a flyer whose ONLY word-match is motor oil.
+                    $q->orWhereHas('items', function ($subQ) use ($word, $isAutoQuery): void {
+                        $subQ->where(function ($w) use ($word): void {
+                            $w->whereRaw('normalized_name = ?', [$word])
+                                ->orWhereRaw("normalized_name LIKE ? ESCAPE '\\'", [$word.' %'])
+                                ->orWhereRaw("normalized_name LIKE ? ESCAPE '\\'", ['% '.$word.' %'])
+                                ->orWhereRaw("normalized_name LIKE ? ESCAPE '\\'", ['% '.$word]);
+                        });
+
+                        if (! $isAutoQuery) {
+                            $subQ->where(function ($ex): void {
+                                // NULL-category legacy rows are never excluded.
+                                $ex->whereNull('category')->orWhere('category', '!=', 'automotive_tools');
+                            });
+                        }
+                    });
                 });
             } else {
-                $flyersQuery->where(function ($q) use ($escapedRaw, $escapedNormalized, $normalizedSearch): void {
+                $flyersQuery->where(function ($q) use ($escapedRaw, $escapedNormalized, $normalizedSearch, $isAutoQuery): void {
                     if ($escapedRaw !== '') {
                         $q->whereRaw("title LIKE ? ESCAPE '\\'", ["%{$escapedRaw}%"]);
                     }
 
                     if ($normalizedSearch !== '') {
-                        $q->orWhereHas('items', fn ($subQ) => $subQ
-                            ->whereRaw("normalized_name LIKE ? ESCAPE '\\'", ["%{$escapedNormalized}%"]));
+                        $q->orWhereHas('items', function ($subQ) use ($escapedNormalized, $isAutoQuery): void {
+                            $subQ->whereRaw("normalized_name LIKE ? ESCAPE '\\'", ["%{$escapedNormalized}%"]);
+
+                            if (! $isAutoQuery) {
+                                $subQ->where(function ($ex): void {
+                                    $ex->whereNull('category')->orWhere('category', '!=', 'automotive_tools');
+                                });
+                            }
+                        });
                     }
 
                     if ($escapedRaw === '' && $normalizedSearch === '') {
@@ -292,17 +311,18 @@ final class HomeController extends Controller
         });
 
         // Dedup pass: identical (flyer_id, normalized_name, sale_price) rows
-        // collapse onto their highest id.
-        $dedupIds = $this->applyAutoExclusion(
+        // collapse onto their highest id. The aggregate query is embedded as a
+        // SINGLE SQL subquery inside whereIn() — never plucked into PHP — so
+        // even 10k+ matching rows cannot approach SQLite's 999-parameter cap.
+        $dedupSubQuery = $this->applyAutoExclusion(
             $this->itemBaseQuery($cairoToday),
             $isAutoQuery,
         )->where($matchPatterns)
             ->selectRaw('MAX(id) as aggregate_id')
-            ->groupBy('flyer_id', 'normalized_name', 'sale_price')
-            ->pluck('aggregate_id');
+            ->groupBy('flyer_id', 'normalized_name', 'sale_price');
 
         return $this->applyAutoExclusion(
-            FlyerItem::query()->with('flyer.retailer')->whereIn('id', $dedupIds),
+            FlyerItem::query()->with('flyer.retailer')->whereIn('id', $dedupSubQuery),
             $isAutoQuery,
         )
             ->orderByRaw(self::WORD_RANK_SQL, [$word, $word.' %', '% '.$word.' %', '% '.$word])
@@ -317,16 +337,17 @@ final class HomeController extends Controller
         $matchPatterns = static fn (Builder $q): Builder => $q
             ->whereRaw("normalized_name LIKE ? ESCAPE '\\'", ["%{$escaped}%"]);
 
-        $dedupIds = $this->applyAutoExclusion(
+        // Same single-subquery dedup strategy as wordItemSearch() — see the
+        // comment above (SQLite 999-parameter bind cap).
+        $dedupSubQuery = $this->applyAutoExclusion(
             $this->itemBaseQuery($cairoToday),
             $isAutoQuery,
         )->where($matchPatterns)
             ->selectRaw('MAX(id) as aggregate_id')
-            ->groupBy('flyer_id', 'normalized_name', 'sale_price')
-            ->pluck('aggregate_id');
+            ->groupBy('flyer_id', 'normalized_name', 'sale_price');
 
         return $this->applyAutoExclusion(
-            FlyerItem::query()->with('flyer.retailer')->whereIn('id', $dedupIds),
+            FlyerItem::query()->with('flyer.retailer')->whereIn('id', $dedupSubQuery),
             $isAutoQuery,
         )
             ->orderByRaw(self::CATEGORY_RANK_SQL)

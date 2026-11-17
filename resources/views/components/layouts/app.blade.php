@@ -199,8 +199,10 @@
                 <a href="{{ $bim ? route('retailers.show', ['retailer' => $bim->slug]) : '#' }}" class="hover:text-[#039652] transition-colors">بيم</a>
                 {{-- Interactive <button>, NOT a crawlable <a>: a global-header ?q=
                 search link on EVERY page floods GSC with internal-search
-                crawl-bloat URLs. Bots do not execute onclick handlers. --}}
-                <button type="button" onclick="window.location.href='{{ $homeUrl }}?q=اليوم الواحد'" class="cursor-pointer hover:text-[#039652] transition-colors">عروض اليوم الواحد</button>
+                crawl-bloat URLs. Bots do not execute onclick handlers.
+                rawurlencode() keeps the Arabic query string + space valid
+                inside the JS onclick attribute. --}}
+                <button type="button" onclick="window.location.href='{{ $homeUrl }}?q={{ rawurlencode('اليوم الواحد') }}'" class="cursor-pointer hover:text-[#039652] transition-colors">عروض اليوم الواحد</button>
                 {{-- Anchor to the in-page section — ?type=magazines is a pure
                 duplicate URL (HomeController never filters by type): it only
                 created duplicate cache keys and noindex bloat. --}}
@@ -268,8 +270,9 @@
                     <a href="{{ $homeUrl }}" class="flex items-center gap-2 rounded-xl px-3 py-2.5 text-sm font-bold text-[#023b55] hover:bg-[#039652]/10 hover:text-[#039652] transition">الرئيسية</a>
                     <a href="{{ $homeUrl }}#latest-flyers" class="flex items-center gap-2 rounded-xl px-3 py-2.5 text-sm font-bold text-[#023b55] hover:bg-[#039652]/10 hover:text-[#039652] transition">جميع المجلات</a>
                     {{-- Interactive <button>, NOT a crawlable <a>: no ?q= URL leaks
-                    into the crawl graph from the global drawer. --}}
-                    <button type="button" onclick="window.location.href='{{ $homeUrl }}?q=اليوم الواحد'" class="flex w-full cursor-pointer items-center gap-2 rounded-xl px-3 py-2.5 text-right text-sm font-bold text-[#023b55] hover:bg-[#039652]/10 hover:text-[#039652] transition">عروض اليوم الواحد</button>
+                    into the crawl graph from the global drawer. rawurlencode()
+                    keeps the Arabic query string + space valid in JS. --}}
+                    <button type="button" onclick="window.location.href='{{ $homeUrl }}?q={{ rawurlencode('اليوم الواحد') }}'" class="flex w-full cursor-pointer items-center gap-2 rounded-xl px-3 py-2.5 text-right text-sm font-bold text-[#023b55] hover:bg-[#039652]/10 hover:text-[#039652] transition">عروض اليوم الواحد</button>
                     <div class="my-2 border-t border-slate-100"></div>
                     <p class="px-3 py-1 text-xs font-black text-slate-600">المتاجر</p>
                     @foreach ($headerRetailers as $navRet)

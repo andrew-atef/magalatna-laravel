@@ -48,7 +48,7 @@ final class ArabicDateHelper
     }
 
     /**
-     * Full Arabic date, e.g. الأحد 13 سبتمبر 2026.
+     * Arabic date, e.g. الأحد 13 سبتمبر 2026.
      */
     public static function formatArabicDate(CarbonInterface $date): string
     {
@@ -59,5 +59,30 @@ final class ArabicDateHelper
             self::monthName((int) $date->month),
             (int) $date->year
         );
+    }
+
+    /**
+     * Arabic grammatical number pluralization (تمييز العدد):
+     *   1 → "1 صفحة" · 2 → "صفحتان" · 3..10 → "3 صفحات" · 11+ → "25 صفحة"
+     *
+     * Arabic uses SINGULAR after 11 (seventeen page, not pages) — naive
+     * "X صفحات" for every count reads like machine translation and Google
+     * Discover/Translate both rank the grammatical phrasing better.
+     */
+    public static function pluralizeCount(int $count, string $singular, string $dual, string $plural, string $plural11Plus): string
+    {
+        if ($count === 1) {
+            return "{$count} {$singular}";
+        }
+
+        if ($count === 2) {
+            return $dual;
+        }
+
+        if ($count >= 3 && $count <= 10) {
+            return "{$count} {$plural}";
+        }
+
+        return "{$count} {$plural11Plus}";
     }
 }

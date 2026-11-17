@@ -17,10 +17,13 @@
 @forelse($activeFlyers as $flyer)
     @php
         // Nearest-integer discount (fake-precision decimals like 24.69% read
-        // like machine output) — same rule as BLUF/meta copy.
+        // like machine output) — same rule as BLUF/meta copy. The suffix is
+        // only emitted when a REAL discount exists: "أقوى خصم 0%" is worse
+        // than saying nothing.
         $maxDiscount = (int) round((float) ($flyer->items_max_discount_percent ?? 0));
+        $discountSuffix = $maxDiscount > 0 ? "، أقوى خصم {$maxDiscount}%" : '';
     @endphp
-- [{{ $flyer->retailer->name }} — {{ $flyer->title }}]({{ $baseUrl.route('flyers.show', ['slug' => $flyer->slug], false) }}): سارٍ من {{ $flyer->valid_from->format('Y-m-d') }} حتى {{ $flyer->valid_until->format('Y-m-d') }} (بتوقيت القاهرة)، {{ $flyer->items_count }} سلعة مُوثَّقة بجدول أسعار كامل، أقوى خصم {{ $maxDiscount }}%.
+- [{{ $flyer->retailer->name }} — {{ $flyer->title }}]({{ $baseUrl.route('flyers.show', ['slug' => $flyer->slug], false) }}): سارٍ من {{ $flyer->valid_from->format('Y-m-d') }} حتى {{ $flyer->valid_until->format('Y-m-d') }} (بتوقيت القاهرة)، {{ $flyer->items_count }} سلعة مُوثَّقة بجدول أسعار كامل{{ $discountSuffix }}.
 @empty
 - لا توجد عروض منشورة اليوم.
 @endforelse

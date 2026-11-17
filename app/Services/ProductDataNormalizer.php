@@ -61,8 +61,16 @@ final class ProductDataNormalizer
      * Ordered category rules — FIRST match wins, so the order encodes the
      * conflict resolutions:
      *  - automotive BEFORE oils: "زيت محرك"/"ليكوي مولي" are motor oil.
-     *  - personal_care BEFORE oils: "بديل زيت" is a HAIR product.
-     *  - beverages BEFORE dairy: the gum brand "جبنتي" contains "جبن".
+     *  - personal_care BEFORE oils: "بديل زيت"/"زيت شعر" are HAIR products.
+     *  - groceries ("زيتون" = table olives) keeps its keyword even though the
+     *    oils rule group runs earlier — there is deliberately NO bare "زيت"
+     *    keyword INSIDE this map, so "زيتون أخضر" can never be shadowed into
+     *    oils_ghee by a generic oil match ("زيت زيتون" still hits the explicit
+     *    olive-OIL keyword first and stays food).
+     *    The bare "زيت" generic-oil match lives in inferCategory() as a
+     *    POST-groceries FALLBACK: it runs only after groceries' "زيتون" has
+     *    already had its chance, so plain "زيت عباد" (no explicit keyword)
+     *    still lands in oils_ghee while "زيتون أخضر" stays a grocery.
      * Keywords are matched with str_contains on the normalized name.
      *
      * @return array<string, list<string>>
@@ -77,6 +85,8 @@ final class ProductDataNormalizer
             'personal_care' => [
                 'شامبو', 'بديل زيت', 'بلسم', 'سبراي', 'مزيل عرق', 'صابون',
                 'معجون أسنان', 'فوط صحية', 'حفاضات', 'مولفكس', 'سوفي', 'اولويز', 'الفيف', 'اكس',
+                // Cosmetic oils — must outrank oils_ghee ("زيت" is shared).
+                'زيت شعر', 'زيت اطفال', 'دابر', 'فاتيكا',
             ],
             'cleaning_laundry' => [
                 'مسحوق', 'برسيل', 'اريل', 'تايد', 'اوكسي', 'بريل', 'وفير', 'جنرال',
@@ -85,12 +95,17 @@ final class ProductDataNormalizer
             'oils_ghee' => [
                 'زيت خليط', 'زيت الخليط', 'زيت عباد', 'زيت عباد الشمس', 'زيت ذره', 'زيت الذره',
                 'زيت قلي', 'زيت القلي', 'زيت زيتون', 'زيت الزيتون', 'زيت سلطة', 'زيت طعام',
+                // Broader Egyptian cooking-oil brand/keyword coverage
+                // (post-OCR normalized forms: ة→ه, أ→ا).
+                'زيت عافيه', 'زيت هلا', 'زيت سلايت', 'زيت حلوه', 'زيت نباتي', 'زيوت',
                 'زبد', 'سمن', 'كريستال', 'الممتاز', 'شطاره',
             ],
             'beverages_snacks' => [
                 'عصير', 'بيبسي', 'كوكاكولا', 'سفن', 'ميرندا', 'مياه', 'شاي', 'قهوه',
                 'نسكافيه', 'بن ', 'بسكويت', 'شوكولاته', 'كيك', 'دونتس', 'شيبس',
-                'مربي', 'حلوه', 'جبنتي',
+                'مربي', 'حلوه',
+                // NOTE: "جبنتي" (Egyptian cheese brand, contains "جبن") is NOT
+                // here — it belongs to dairy_cheese below.
             ],
             'dairy_cheese' => [
                 'حليب', 'لبن', 'جبن', 'مثلثات', 'شيدر', 'موتزريلا', 'زبادي', 'رايب', 'قشطه',
@@ -101,6 +116,10 @@ final class ProductDataNormalizer
             ],
             'groceries' => [
                 'ارز', 'رز', 'سكر', 'دقيق', 'مكرونه', 'صلصه', 'عدس', 'فول', 'ملح',
+                // Table olives ("زيتون أخضر") — plain زيتون must classify as a
+                // grocery, and there is intentionally no bare "زيت" keyword
+                // anywhere above that could shadow it.
+                'زيتون',
             ],
             'home_appliances' => [
                 'طقم طهي', 'جرانيت', 'تيفال', 'شاشه', 'ثلاجه', 'غساله', 'خلاط',
@@ -242,6 +261,16 @@ final class ProductDataNormalizer
                         return $category;
                     }
                 }
+            }
+
+            // Bare "زيت" generic-oil FALLBACK — deliberately checked AFTER the
+            // ordered scan so groceries' "زيتون" (table olives) always wins:
+            // anything containing "زيتون" has already returned groceries above,
+            // and motor/hair oils hit their explicit rules even earlier. Only
+            // unclassified names like "زيت 1 لتر" or "زيت نباتي خليط" reach
+            // this fallback and land in oils_ghee.
+            if (str_contains($name, 'زيت')) {
+                return 'oils_ghee';
             }
         }
 

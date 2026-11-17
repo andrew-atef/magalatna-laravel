@@ -388,6 +388,210 @@ final class ImageOptimizerService
     }
 
     /**
+     * Google Discover 1280x720 (16:9) hero composite.
+     *
+     * Google Discover's card canvas is 16:9 — a raw 3:4 flyer cover gets
+     * center-cropped into a letterboxed sliver and loses >60% of its pixels.
+     * A purpose-built 1280x720 composite keeps the cover fully visible
+     * (product tiles legible) AND looks native in the Discover feed:
+     *
+     *   1. 1280x720 canvas with a vertical navy gradient (#012638 → #023b55)
+     *      — the site's brand palette, drawn as 720 one-pixel rectangles.
+     *   2. Optional blurred, darkened, low-opacity cover backdrop (depth).
+     *   3. Foreground: cover (and page 2, when supplied) scaled to fit and
+     *      placed on white-bordered "cards" with a soft drop shadow.
+     *   4. WebP q82 with a ≤70KB target (quality ladder down to q40).
+     *   5. Strict memory hygiene — every raster buffer unset + gc_collect_cycles
+     *      (the 128MB queue worker generates one of these per flyer).
+     *
+     * @throws RuntimeException
+     */
+    public function generateDiscoverComposite(string $coverBinary, ?string $page2Binary = null): string
+    {
+        try {
+            if (trim($coverBinary) === '') {
+                throw new RuntimeException('Cannot generate a Discover composite from an empty cover binary.');
+            }
+
+            $manager = $this->imageManager();
+
+            // --- 1. Canvas + vertical navy gradient (#012638 → #023b55) ---
+            $canvas = $manager->create(1280, 720);
+            $top = [0x01, 0x26, 0x38];
+            $bottom = [0x02, 0x3b, 0x55];
+            for ($y = 0; $y < 720; $y++) {
+                $t = $y / 719;
+                $r = (int) round($top[0] + ($bottom[0] - $top[0]) * $t);
+                $g = (int) round($top[1] + ($bottom[1] - $top[1]) * $t);
+                $b = (int) round($top[2] + ($bottom[2] - $top[2]) * $t);
+                $hex = sprintf('%02x%02x%02x', $r, $g, $b);
+                $canvas->drawRectangle(0, $y, static function ($draw) use ($hex): void {
+                    $draw->width(1280);
+                    $draw->height(1);
+                    $draw->background($hex);
+                });
+            }
+
+            // --- 2. Optional blurred + darkened cover backdrop (depth) ---
+            try {
+                $backdrop = $manager->read($coverBinary)
+                    ->cover(1280, 720)
+                    ->blur(15)
+                    ->brightness(-40);
+                $canvas->place($backdrop, 'top-left', 0, 0, 18);
+                unset($backdrop);
+                gc_collect_cycles();
+            } catch (Throwable $e) {
+                // Backdrop is decorative — a decode failure must never kill
+                // the composite; the gradient alone still looks on-brand.
+                Log::warning('Discover backdrop generation failed, using plain gradient.', [
+                    'error' => $e->getMessage(),
+                ]);
+            }
+
+            // --- 3. Foreground page cards ---
+            [$coverCard, $coverW, $coverH] = $this->buildDiscoverCard($manager, $coverBinary, 480, 640);
+
+            $page2Card = null;
+            $page2W = 0;
+            $page2H = 0;
+            $page2Placed = false;
+            if ($page2Binary !== null && trim($page2Binary) !== '') {
+                try {
+                    [$page2Card, $page2W, $page2H] = $this->buildDiscoverCard($manager, $page2Binary, 400, 533);
+                } catch (Throwable $e) {
+                    Log::warning('Discover page-2 card failed, falling back to cover-only composite.', [
+                        'error' => $e->getMessage(),
+                    ]);
+                    $page2Card = null;
+                }
+            }
+
+            if ($page2Card !== null) {
+                // Two-page overlap: page 2 sits slightly left + lower (behind),
+                // the cover sits right-of-center on top.
+                $page2X = max(0, (int) ((1280 - $page2W) / 2) - 230);
+                $page2Y = max(0, (int) ((720 - $page2H) / 2) + 20);
+                $this->placeWithShadow($canvas, $page2Card, $page2X, $page2Y, $page2W, $page2H);
+                unset($page2Card, $page2W, $page2H);
+                $page2Placed = true;
+            }
+
+            $coverX = max(0, (int) ((1280 - $coverW) / 2) + ($page2Placed ? 130 : 0));
+            $coverY = max(0, (int) ((720 - $coverH) / 2) - ($page2Placed ? 15 : 0));
+            $this->placeWithShadow($canvas, $coverCard, $coverX, $coverY, $coverW, $coverH);
+            unset($coverCard);
+            gc_collect_cycles();
+
+            // --- 4. WebP encode with a ≤70KB quality ladder (82 → 40) ---
+            $discoverBinary = '';
+            $quality = 82;
+            do {
+                $discoverBinary = (string) $canvas->toWebp(quality: $quality);
+                if (strlen($discoverBinary) <= 70 * 1024) {
+                    break;
+                }
+                $quality -= 12;
+            } while ($quality >= 40);
+
+            // --- 5. Free every raster buffer NOW ---
+            unset($canvas, $manager);
+            gc_collect_cycles();
+
+            if ($discoverBinary === '') {
+                throw new RuntimeException('Discover composite WebP encoding produced an empty binary.');
+            }
+
+            if (strlen($discoverBinary) > 70 * 1024) {
+                Log::warning('Discover composite exceeds 70KB target.', [
+                    'size_bytes' => strlen($discoverBinary),
+                ]);
+            }
+
+            return $discoverBinary;
+        } catch (RuntimeException $e) {
+            throw $e;
+        } catch (Throwable $e) {
+            Log::error('Discover composite generation failed.', [
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
+            ]);
+
+            throw new RuntimeException('Discover composite generation failed: '.$e->getMessage(), 0, $e);
+        }
+    }
+
+    /**
+     * White-bordered foreground "card": page image scaled to fit (never
+     * upscale) inside a 6px white frame. Returns [image, width, height].
+     *
+     * @return array{0: \Intervention\Image\Interfaces\ImageInterface, 1: int, 2: int}
+     */
+    private function buildDiscoverCard($manager, string $binary, int $maxW, int $maxH): array
+    {
+        $page = $manager->read($binary)->scaleDown(width: $maxW, height: $maxH);
+        $pageW = (int) $page->width();
+        $pageH = (int) $page->height();
+
+        $card = $manager->create($pageW + 12, $pageH + 12)->fill('#ffffff');
+        $card->place($page, 'top-left', 6, 6);
+        unset($page);
+        gc_collect_cycles();
+
+        return [$card, $pageW + 12, $pageH + 12];
+    }
+
+    /**
+     * Drop-shadow + card placement: a soft dark offset rectangle behind the
+     * card separates the white frame from the navy gradient.
+     */
+    private function placeWithShadow($canvas, $card, int $x, int $y, int $w, int $h): void
+    {
+        $canvas->drawRectangle($x + 8, $y + 10, static function ($draw) use ($w, $h): void {
+            $draw->width($w);
+            $draw->height($h);
+            $draw->background('rgba(0, 0, 0, 0.35)');
+        });
+        $canvas->place($card, 'top-left', $x, $y);
+    }
+
+    /**
+     * Store a Discover composite on the given disk with the `discover_` key
+     * prefix and immutable cache headers (R2): `flyers/{id}/discover_{ulid}.webp`.
+     * Immutable headers are safe — a regenerated composite always produces a
+     * NEW ulid.
+     *
+     * @throws RuntimeException
+     */
+    public function storeDiscoverWebp(string $webpBinary, string $directory, string $disk = 'r2'): string
+    {
+        try {
+            $normalizedDir = $this->normalizeDirectory($directory);
+            $filename = 'discover_'.Str::ulid()->toString().'.webp';
+            $key = $normalizedDir !== '' ? $normalizedDir.'/'.$filename : $filename;
+
+            $options = [
+                'visibility' => 'public',
+                'ContentType' => 'image/webp',
+            ];
+
+            if ($disk === 'r2') {
+                $options['CacheControl'] = 'public, max-age=31536000, immutable';
+            }
+
+            Storage::disk($disk)->put($key, $webpBinary, $options);
+
+            Log::info('Discover WebP stored.', ['disk' => $disk, 'key' => $key, 'bytes' => strlen($webpBinary)]);
+
+            return $key;
+        } catch (Throwable $e) {
+            Log::error('Discover WebP store failed.', ['disk' => $disk, 'directory' => $directory, 'error' => $e->getMessage()]);
+
+            throw new RuntimeException('Failed to store Discover composite WebP: '.$e->getMessage(), 0, $e);
+        }
+    }
+
+    /**
      * Upload WebP binary to R2 with immutable cache headers.
      *
      * @throws RuntimeException

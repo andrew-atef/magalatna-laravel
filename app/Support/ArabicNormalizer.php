@@ -39,6 +39,17 @@ final class ArabicNormalizer
         //    Requirement states (ة, ه -> ه) - we map ة to ه, ه stays.
         $text = str_replace('ة', 'ه', $text);
 
+        // 5. Separators → spaces: punctuation, brackets, slashes, dashes and
+        //    Arabic commas become word boundaries so compound OCR tokens are
+        //    addressable by the SQLite space-padded whole-word search:
+        //    "(عافيه)" → "عافيه", "زيت-محرك" → "زيت محرك".
+        //    The dot is handled separately — a dot flanked by digits on BOTH
+        //    sides is a decimal ("1.5") and must survive; any other dot is a
+        //    separator ("a." / ".5" / "1.k" → space). OR-semantics via two
+        //    alternatives: replace unless (digit before AND digit after).
+        $text = (string) preg_replace('/[^\p{L}\p{N}\s.]/u', ' ', $text);
+        $text = (string) preg_replace('/(?<!\d)\.|\.(?!\d)/u', ' ', $text);
+
         // Optional cleanup: normalize multiple spaces, keep search-friendly lowercasing for latin chars
         $text = (string) preg_replace('/\s+/u', ' ', $text);
         $text = trim($text);

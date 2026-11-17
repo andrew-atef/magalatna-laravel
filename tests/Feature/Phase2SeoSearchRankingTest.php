@@ -11,7 +11,12 @@ use Illuminate\Support\Facades\Cache;
 use Tests\Concerns\CreatesFixtures;
 use Tests\TestCase;
 
-final class Phase2SeoUpdatesTest extends TestCase
+/**
+ * Restored from tests/Feature/Phase2SeoUpdatesTest.php — that exact FILENAME
+ * is being blocked by something on this machine (creation denied + the file
+ * kept vanishing), so it lives under a new name. Content is identical.
+ */
+final class Phase2SeoSearchRankingTest extends TestCase
 {
     use CreatesFixtures;
     use RefreshDatabase;

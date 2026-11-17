@@ -36,6 +36,7 @@ class Flyer extends Model
         'total_pages',
         'bluf_summary',
         'editorial_overview',
+        'discover_image_path',
     ];
 
     protected static function booted(): void
@@ -128,9 +129,13 @@ class Flyer extends Model
         // EXPIRED ARCHIVE copy — a dead offer must NEVER read "سارٍ". This
         // accessor is the single authority for both the HTML show view and
         // the ?_fmt=md markdown view, so both stay truthful in one place.
+        // ZERO SQL: relations are consumed ONLY when the caller already
+        // eager-loaded them (an accessor must never trigger lazy loads).
         if ($this->isExpired()) {
             $titleForBluf = $this->attributes['title'] ?? 'العرض';
-            $retailerName = (string) ($this->retailer?->name ?? '');
+            $retailerName = $this->relationLoaded('retailer')
+                ? (string) ($this->retailer?->name ?? '')
+                : '';
 
             $rawUntil = $this->attributes['valid_until'] ?? null;
             $untilArabic = '';
@@ -146,13 +151,13 @@ class Flyer extends Model
                 }
             }
 
-            // Count from the loaded relation when available (O(1) for the show
-            // view); only fall back to a COUNT query for unhydrated callers.
-            $itemsCount = $this->relationLoaded('items')
-                ? $this->items->count()
-                : $this->items()->count();
+            if ($this->relationLoaded('items')) {
+                $itemsCount = $this->items->count();
 
-            return "انتهت فترة سريان {$titleForBluf} من {$retailerName} بتاريخ {$untilArabic}. الأسعار المذكورة أدناه ({$itemsCount} سلعة) محفوظة كأرشيف تاريخي لمقارنة الأسعار في مصر.";
+                return "انتهت فترة سريان {$titleForBluf} من {$retailerName} بتاريخ {$untilArabic}. الأسعار المذكورة أدناه ({$itemsCount} سلعة) محفوظة كأرشيف تاريخي لمقارنة الأسعار في مصر.";
+            }
+
+            return "انتهت فترة سريان {$titleForBluf} من {$retailerName} بتاريخ {$untilArabic}. الأسعار المذكورة أدناه محفوظة كأرشيف تاريخي لمقارنة الأسعار في مصر.";
         }
 
         $raw = $this->attributes['bluf_summary'] ?? null;
@@ -220,11 +225,66 @@ class Flyer extends Model
         $topProducts = $loadedItems->take(5)->pluck('product_name')->filter()->implode('، ');
         $topProducts = $topProducts !== '' ? $topProducts : 'سلع متنوعة';
 
+        // UPCOMING flyer (published before its start date): "الساري" is
+        // factually WRONG until valid_from. Same Cairo-day comparison as the
+        // Gatekeeper builders — a flyer starting tomorrow must never read
+        // "سارٍ" today.
+        $fromRaw = $this->attributes['valid_from'] ?? null;
+        $isUpcoming = false;
+        $fromText = '';
+        if ($fromRaw !== null) {
+            try {
+                $fromCarbon = $fromRaw instanceof Carbon
+                    ? $fromRaw->copy()
+                    : Carbon::parse((string) $fromRaw, 'Africa/Cairo');
+                $isUpcoming = now('Africa/Cairo')->startOfDay()->lt($fromCarbon->copy()->startOfDay());
+                if ($isUpcoming) {
+                    $fromText = $fromCarbon->locale('ar')->isoFormat('dddd D MMMM YYYY');
+                    if (! preg_match('/[\x{0600}-\x{06FF}]/u', $fromText)) {
+                        $fromText = ArabicDateHelper::formatArabicDate($fromCarbon);
+                    }
+                }
+            } catch (\Throwable $e) {
+                $isUpcoming = false;
+            }
+        }
+
+        if ($isUpcoming) {
+            return "تصفح {$titleForBluf} يبدأ في مصر يوم {$fromText} وحتى {$untilText}، {$discountSentence} يشمل العرض تخفيضات قوية على {$topProducts} بجميع الفروع وحتى نفاذ الكمية.";
+        }
+
         return "تصفح {$titleForBluf} الساري في مصر حتى {$untilText}، {$discountSentence} يشمل العرض تخفيضات قوية على {$topProducts} بجميع الفروع وحتى نفاذ الكمية.";
     }
 
     public function getEditorialOverviewAttribute(): ?string
     {
+        // EXPIRED GUARD: editorial copy (stored or generated) always speaks in
+        // the present tense ("عروضاً حصرية سارية في مصر") — a dead offer must
+        // never carry it. Zero SQL: only already-loaded relations/attributes.
+        if ($this->isExpired()) {
+            $retailerName = $this->relationLoaded('retailer') && $this->retailer
+                ? (string) $this->retailer->name
+                : 'المتجر';
+
+            $rawUntil = $this->attributes['valid_until'] ?? null;
+            $untilArabic = '';
+            if (is_string($rawUntil) && trim($rawUntil) !== '') {
+                try {
+                    $untilCarbon = $rawUntil instanceof Carbon
+                        ? $rawUntil->copy()
+                        : Carbon::parse((string) $rawUntil, 'Africa/Cairo');
+                    $untilArabic = $untilCarbon->locale('ar')->isoFormat('D MMMM YYYY');
+                    if (! preg_match('/[\x{0600}-\x{06FF}]/u', $untilArabic)) {
+                        $untilArabic = ArabicDateHelper::formatArabicDate($untilCarbon);
+                    }
+                } catch (\Throwable $e) {
+                    $untilArabic = (string) $rawUntil;
+                }
+            }
+
+            return "أرشيف عروض {$retailerName} (انتهى السريان بتاريخ {$untilArabic})";
+        }
+
         $raw = $this->attributes['editorial_overview'] ?? null;
 
         // Accept Arabic editorial copy that legitimately contains Latin brand
@@ -277,7 +337,27 @@ class Flyer extends Model
                 })->implode("\n");
             }
             $retailerName = $this->relationLoaded('retailer') && $this->retailer ? $this->retailer->name : 'المتجر';
-            $p1 = "تقدم مجلة {$title} من {$retailerName} عروضاً حصرية سارية في مصر من {$from} حتى {$until}، {$discountPhrase} على تشكيلة واسعة من السلع الغذائية والمستلزمات المنزلية.";
+
+            // UPCOMING phrasing: a flyer published before its start date must
+            // never read "سارية" — same Cairo-day comparison as the BLUF.
+            try {
+                $fromCarbonFull = $validFrom instanceof Carbon ? $validFrom->copy() : Carbon::parse((string) $validFrom, 'Africa/Cairo');
+                $isUpcoming = now('Africa/Cairo')->startOfDay()->lt($fromCarbonFull->copy()->startOfDay());
+            } catch (\Throwable $e) {
+                $fromCarbonFull = $validFrom instanceof Carbon ? $validFrom->copy() : Carbon::parse((string) $validFrom, 'Africa/Cairo');
+                $isUpcoming = false;
+            }
+            if ($isUpcoming) {
+                $fromDayName = $fromCarbonFull->locale('ar')->isoFormat('dddd');
+                if (! preg_match('/[\x{0600}-\x{06FF}]/u', $fromDayName)) {
+                    $fromDayName = ArabicDateHelper::dayName($fromCarbonFull);
+                }
+                $windowPhrase = "عروضاً حصرية تبدأ في مصر يوم {$fromDayName} {$from} وحتى {$until}";
+            } else {
+                $windowPhrase = "عروضاً حصرية سارية في مصر من {$from} حتى {$until}";
+            }
+
+            $p1 = "تقدم مجلة {$title} من {$retailerName} {$windowPhrase}، {$discountPhrase} على تشكيلة واسعة من السلع الغذائية والمستلزمات المنزلية.";
             $p2 = "أبرز الصفقات في هذا العدد:\n{$topBullets}";
             $text = $p1."\n\n".$p2;
             $text = (string) preg_replace('/(\d+)\.\s+(\d+%)/u', '$1.$2', $text);
@@ -311,5 +391,111 @@ class Flyer extends Model
         return Carbon::createFromFormat('Y-m-d', $dateStr, 'Africa/Cairo')
             ->endOfDay()
             ->isPast();
+    }
+
+    /**
+     * High-CTR meta description with REAL prices: Google rewrites ~70% of
+     * meta descriptions, but pages whose meta already carries exact item
+     * prices ("زيت كريستال بـ 219.95 ج.م") win the SERP answer-box because
+     * the snippet IS the answer — competitors ship vague "خصومات تصل إلى"
+     * copy instead.
+     *
+     * Length guard: 135–155 chars, word-boundary safe, NO trailing ellipsis
+     * (a cut "…" reads like machine output and Google truncates at its own
+     * pixel limit anyway).
+     *
+     * Zero extra SQL when the caller (show view) already eager-loaded items —
+     * the relationLoaded guard keeps list-style renders from N+1ing.
+     */
+    public function generateMetaDescription(): string
+    {
+        $retailerClean = $this->relationLoaded('retailer') && $this->retailer
+            ? (string) ($this->retailer->clean_name ?: $this->retailer->name)
+            : 'المتجر';
+
+        $items = $this->relationLoaded('items')
+            ? $this->items->filter(static fn ($item): bool => (float) $item->sale_price > 0 && trim((string) $item->product_name) !== '')
+            : $this->items()->where('sale_price', '>', 0)->whereNotNull('product_name')->get();
+
+        $sortedItems = $items->sortByDesc(static fn ($item): float => (float) $item->discount_percent)->values();
+
+        $formatted = $sortedItems->take(5)->map(static function ($item): string {
+            $price = rtrim(rtrim(number_format((float) $item->sale_price, 2, '.', ''), '0'), '.');
+            if ($price === '' || $price === '.') {
+                $price = '0';
+            }
+
+            return trim((string) $item->product_name).' بـ '.$price.' ج.م';
+        })->all();
+
+        $prefix = '';
+        $suffix = '';
+        if ($this->isExpired()) {
+            $rawUntil = $this->attributes['valid_until'] ?? null;
+            $untilAr = '';
+            try {
+                $untilCarbon = $rawUntil instanceof Carbon
+                    ? $rawUntil->copy()
+                    : Carbon::parse((string) $rawUntil, 'Africa/Cairo');
+                $untilAr = $untilCarbon->locale('ar')->isoFormat('D MMMM YYYY');
+                if (! preg_match('/[\x{0600}-\x{06FF}]/u', $untilAr)) {
+                    $untilAr = ArabicDateHelper::formatArabicDate($untilCarbon);
+                }
+            } catch (\Throwable $e) {
+                $untilAr = (string) $rawUntil;
+            }
+
+            $prefix = "أرشيف أسعار عروض {$retailerClean} (انتهى {$untilAr}): ";
+            $suffix = '. قارن تطور الأسعار في مصر عبر مجلاتنا.';
+        } else {
+            $rawFrom = $this->attributes['valid_from'] ?? null;
+            try {
+                $fromCarbon = $rawFrom instanceof Carbon
+                    ? $rawFrom->copy()
+                    : Carbon::parse((string) $rawFrom, 'Africa/Cairo');
+                $dayName = $fromCarbon->locale('ar')->isoFormat('dddd');
+                if (! preg_match('/[\x{0600}-\x{06FF}]/u', $dayName)) {
+                    $dayName = ArabicDateHelper::dayName($fromCarbon);
+                }
+                $dateAr = $fromCarbon->day.' '.ArabicDateHelper::monthName((int) $fromCarbon->month);
+            } catch (\Throwable $e) {
+                $dayName = '';
+                $dateAr = '';
+            }
+
+            $datePhrase = $dayName !== '' ? " {$dayName} {$dateAr}" : '';
+            $prefix = "أسعار عروض {$retailerClean}{$datePhrase}: ";
+            $suffix = '. تصفح المجلة والأسعار كاملة.';
+        }
+
+        $build = static function (int $count) use ($prefix, $suffix, $formatted): string {
+            $itemsString = $count > 0 ? implode('، ', array_slice($formatted, 0, $count)) : 'سلع متنوعة';
+
+            return $prefix.$itemsString.$suffix;
+        };
+
+        // Start with the top 3, then grow toward the 135-char floor while the
+        // result still fits under the 155 hard cap (max 5 — the meta is a
+        // highlight, not the table).
+        $count = min(3, count($formatted));
+        while ($count < count($formatted) && mb_strlen($build($count + 1)) <= 155) {
+            $count++;
+        }
+        $text = $build($count);
+
+        // 155-char hard cap: drop the LAST item first (the weakest discount
+        // signal), then a final word-boundary cut WITHOUT any ellipsis.
+        while ($count > 1 && mb_strlen($text) > 155) {
+            $count--;
+            $text = $build($count);
+        }
+
+        if (mb_strlen($text) > 155) {
+            $cut = mb_substr($text, 0, 155);
+            $space = mb_strrpos($cut, ' ');
+            $text = $space !== false && $space > 100 ? mb_substr($cut, 0, $space) : $cut;
+        }
+
+        return $text;
     }
 }

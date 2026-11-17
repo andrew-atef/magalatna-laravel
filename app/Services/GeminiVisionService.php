@@ -601,6 +601,10 @@ PROMPT;
         // demands, so callers passing raw Y-m-d strings get consistent output.
         $validFrom = $this->formatArabicDate($validFrom);
         $validUntil = $this->formatArabicDate($validUntil);
+        // Nearest-integer discount: Gemini echoes the number we give it — a
+        // "24.69%" input would be emitted verbatim and quoted by AI answer
+        // engines. Same rounding rule as the deterministic fallback builders.
+        $maxDiscount = (float) round($maxDiscount);
         $prompt = $this->blufPrompt($retailerName, $title, $validFrom, $validUntil, $topProducts, $maxDiscount, $occasion);
 
         $payload = [

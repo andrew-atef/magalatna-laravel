@@ -1,4 +1,5 @@
 @php
+    use App\Support\ArabicDateHelper;
     use App\Support\ProductDataNormalizer;
     use App\Support\R2Url;
     $r2DiskUrl = R2Url::base();
@@ -21,22 +22,71 @@
     // Active flyers target "عروض {متجر} {تواريخ}"; expired ones are prefixed
     // "[أرشيف]" so they can never cannibalize the live flyer in SERPs.
     $retailerClean = $flyer->retailer->clean_name;
+    // HIGH-CTR TITLE: parenthesized ENGLISH brand names "(Kazyon)" burn ~9
+    // characters of the 60-char budget and Google renders them as noise in
+    // Arabic SERPs — strip any parenthesized group containing Latin letters
+    // (Arabic-only parentheticals like "(انتهى السريان بتاريخ ...)" survive).
+    $retailerClean = trim((string) preg_replace('/\s*\([^()]*[A-Za-z][^()]*\)/u', '', $retailerClean));
     $fromDate = \Carbon\Carbon::parse($flyer->valid_from, 'Africa/Cairo');
     $untilDate = \Carbon\Carbon::parse($flyer->valid_until, 'Africa/Cairo');
+    // Deterministic Arabic month/day names via ArabicDateHelper —
+    // locale-dependent isoFormat('MMMM'/'dddd') silently falls back to
+    // ENGLISH names on hosts without the full ICU/intl data pack.
     $datesAr = $fromDate->isSameDay($untilDate)
-        ? $untilDate->locale('ar')->isoFormat('D MMMM')
+        ? $untilDate->day.' '.ArabicDateHelper::monthName((int) $untilDate->month)
         : ($fromDate->format('n') === $untilDate->format('n')
-            ? $fromDate->format('j').'–'.$untilDate->locale('ar')->isoFormat('D MMMM')
-            : $fromDate->locale('ar')->isoFormat('D M').'–'.$untilDate->locale('ar')->isoFormat('D MMMM'));
-    $seoTitle = ($isExpired ? '[أرشيف] ' : '').'عروض '.$retailerClean.' '.$datesAr;
-    if (mb_strlen($seoTitle) > 60) {
-        $cut = mb_substr($seoTitle, 0, 60);
-        $space = mb_strrpos($cut, ' ');
-        $seoTitle = $space !== false && $space > 30 ? mb_substr($cut, 0, $space) : $cut;
+            ? $fromDate->format('j').'–'.$untilDate->day.' '.ArabicDateHelper::monthName((int) $untilDate->month)
+            : $fromDate->format('j').' '.ArabicDateHelper::monthName((int) $fromDate->month)
+                .'–'.$untilDate->format('j').' '.ArabicDateHelper::monthName((int) $untilDate->month));
+    $dayNameAr = ArabicDateHelper::dayName($fromDate);
+    $untilDateAr = $untilDate->day.' '.ArabicDateHelper::monthName((int) $untilDate->month);
+
+    // Title CANDIDATES (long → short): the layout component APPENDS the
+    // " | مجلاتنا" site suffix to $metaTitle, so candidates carry only the
+    // page-specific part — pick the first whose FULL title (candidate +
+    // suffix) lands inside the 50–60 char Google-pixel-safe window;
+    // otherwise word-cut the last one WITHOUT an ellipsis.
+    $siteSuffix = ' | '.(string) config('app.name', 'مجلاتنا');
+    $titleCandidates = $isExpired
+        ? [
+            '[أرشيف] عروض '.$retailerClean.' '.$datesAr.' | أرشيف الأسعار',
+            '[أرشيف] عروض '.$retailerClean.' '.$datesAr,
+        ]
+        : ($fromDate->isSameDay($untilDate)
+            ? [
+                'عروض '.$retailerClean.' '.$dayNameAr.' '.$untilDateAr.' | عرض اليوم الواحد',
+                'عروض '.$retailerClean.' '.$dayNameAr.' '.$untilDateAr,
+                'عروض '.$retailerClean.' '.$untilDateAr,
+            ]
+            : [
+                'عروض '.$retailerClean.' '.$datesAr.' | مجلة العروض والتوفير',
+                'عروض '.$retailerClean.' '.$datesAr,
+            ]);
+    $seoTitle = '';
+    foreach ($titleCandidates as $titleCandidate) {
+        $fullLength = mb_strlen($titleCandidate) + mb_strlen($siteSuffix);
+        if ($fullLength <= 60 && $fullLength >= 50) {
+            $seoTitle = $titleCandidate;
+            break;
+        }
+    }
+    if ($seoTitle === '') {
+        // Word-safe cut at the last space BEFORE the 60-char FULL-title
+        // budget — NO trailing ellipsis (Google truncates at its own pixel
+        // limit anyway).
+        $fallbackTitle = end($titleCandidates);
+        $budget = 60 - mb_strlen($siteSuffix);
+        if (mb_strlen($fallbackTitle) > $budget) {
+            $cut = mb_substr($fallbackTitle, 0, $budget);
+            $space = mb_strrpos($cut, ' ');
+            $fallbackTitle = $space !== false && $space > 30 ? mb_substr($cut, 0, $space) : $cut;
+        }
+        $seoTitle = $fallbackTitle;
     }
 
-    // ── Meta description: crisp word-safe excerpt of the BLUF (<= 155 chars) ──
-    $metaDescription = ProductDataNormalizer::metaExcerpt($bluf, 155);
+    // ── Meta description: REAL item prices from the flyer (135–155 chars,
+    // word-safe, no ellipsis) — the snippet IS the answer in SERPs. ──
+    $metaDescription = $flyer->generateMetaDescription();
 
     // Quick Jump Bar target: in-page cross-link widgets when present, else
     // fall back to the retailer hub.
@@ -44,6 +94,37 @@
         || (isset($competitorFlyers) && $competitorFlyers->isNotEmpty())
         ? '#other-offers'
         : route('retailers.show', $flyer->retailer->slug);
+
+    // ── Arabic grammatical pluralization (تمييز العدد): 1 سلعة / سلعتان /
+    // 3..10 سلع / 11+ سلعة — naive "X سلعات" reads like machine translation.
+    $itemsCountAr = ArabicDateHelper::pluralizeCount($flyer->items->count(), 'سلعة', 'سلعتان', 'سلع', 'سلعة');
+    $pagesCountAr = ArabicDateHelper::pluralizeCount($pages->count(), 'صفحة', 'صفحتان', 'صفحات', 'صفحة');
+
+    // Discover card: the 1280x720 16:9 Google Discover composite when it
+    // exists (backfilled/generated by the Gatekeeper), else the cover.
+    $discoverImage = $flyer->discover_image_path ? R2Url::asset($flyer->discover_image_path) : $coverImage;
+
+    // ── Present filter buckets: the category bar renders ONLY the buckets
+    // that actually exist in THIS flyer — a 3-category flyer shows 3 buttons,
+    // never a dead filter (PHOTOS-FIRST UX pass).
+    $categoryLabels = [
+        'oil' => 'زيوت وسمن',
+        'dairy' => 'ألبان وأجبان',
+        'meat' => 'لحوم ومجمدات',
+        'grocery' => 'بقالة ومشروبات',
+        'clean' => 'منظفات وعناية',
+    ];
+    $presentCategories = $flyer->items
+        ->map(fn ($item) => match ($item->category ?: \App\Services\ProductDataNormalizer::inferCategory($item->product_name)) {
+            'oils_ghee' => 'oil',
+            'dairy_cheese' => 'dairy',
+            'meat_poultry' => 'meat',
+            'cleaning_laundry', 'personal_care' => 'clean',
+            default => 'grocery',
+        })
+        ->unique()
+        ->values()
+        ->all();
 @endphp
 
 <x-layouts.app
@@ -51,7 +132,7 @@
     :meta-description="$metaDescription"
     :og-title="$seoTitle"
     :og-description="$metaDescription"
-    :og-image="$coverImage"
+    :og-image="$discoverImage"
     og-type="article"
     :robots="$isExpired ? 'noindex, follow' : 'index, follow, max-image-preview:large, max-snippet:-1, max-video-preview:-1'"
 >
@@ -123,7 +204,9 @@
                 'isPartOf' => ['@id' => $websiteId],
                 'breadcrumb' => ['@id' => $breadcrumbId],
                 'publisher' => ['@id' => $organizationId],
-                'image' => [$coverImage],
+                // 1280x720 Google Discover composite (16:9) — the exact canvas
+                // Discover renders, never a letterboxed center-crop.
+                'image' => [$discoverImage],
                 // The priced ItemList IS the page's main entity.
                 'mainEntity' => ['@id' => $itemListId],
             ];
@@ -155,9 +238,10 @@
                     '@id' => $eventId,
                     'name' => $cleanTitle,
                     'description' => $bluf,
-                    // Cover image resolves the optional "image" notice in
-                    // Google Rich Results for Event structured data.
-                    'image' => [$coverImage],
+                    // 1280x720 Discover composite — covers the optional
+                    // "image" notice in Google Rich Results for Event data
+                    // AND matches the Discover 16:9 canvas.
+                    'image' => [$discoverImage],
                     'startDate' => $eventStart,
                     'endDate' => $eventEnd,
                     // Full schema.org URI — bare "EventScheduled" is not valid.
@@ -333,137 +417,13 @@
         </div>
     </article>
 
-    <!-- Quick Jump Bar - AEO/UX: prices & pages ONE tap away from the fold -->
-    <nav class="mb-8 flex flex-wrap items-center gap-2" aria-label="التنقل السريع داخل الصفحة">
-        <a href="#items-table" class="inline-flex items-center gap-1 rounded-full border border-[#039652]/25 bg-[#039652]/10 px-4 py-2 text-xs font-black text-[#027a42] hover:bg-[#039652] hover:text-white transition">
-            📊 جدول الأسعار ({{ $flyer->items->count() }} سلعة) ↓
-        </a>
-        <a href="#flyer-viewer" class="inline-flex items-center gap-1 rounded-full border border-[#023b55]/15 bg-[#023b55]/5 px-4 py-2 text-xs font-black text-[#023b55] hover:bg-[#023b55] hover:text-white transition">
-            🖼️ صفحات المجلة ({{ $pages->count() }} صفحة) ↓
-        </a>
-        <a href="{{ $otherOffersHref }}" class="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-white px-4 py-2 text-xs font-black text-[#023b55] hover:border-[#039652]/40 hover:text-[#039652] transition">
-            🏪 عروض أخرى ↓
-        </a>
-    </nav>
-
-    {{-- STALE COPY GUARD: editorial_overview was written for a LIVE flyer and
-    says "سارٍ" — skip it entirely once the offer expires (the archive BLUF
-    from the Flyer accessor already covers the page). --}}
-    @if (! $isExpired && !empty($flyer->editorial_overview))
-    <!-- Editorial Overview — ABOVE the images: text-first for crawlers & AI -->
-    <section class="mb-10 rounded-2xl border border-[#023b55]/10 bg-white p-5 sm:p-6 shadow-sm">
-        <h2 class="mb-3 text-lg font-black text-[#023b55]">نظرة سريعة على العرض</h2>
-        @php
-            $cleanEditorial = trim((string) $flyer->editorial_overview);
-            $cleanEditorial = (string) preg_replace("/[ \t]+\n/u", "\n", $cleanEditorial);
-            $cleanEditorial = (string) preg_replace("/\n{3,}/u", "\n\n", $cleanEditorial);
-            $cleanEditorial = (string) preg_replace("/:\n\n-/u", ":\n- ", $cleanEditorial);
-        @endphp
-        <div class="max-w-none text-[13px] leading-6 text-slate-700 prose prose-sm prose-headings:text-[#023b55] prose-strong:text-[#023b55] prose-a:text-[#039652] prose-a:font-bold">
-            {!! app(\App\Services\AutoInternalLinkerService::class)->linkifyEditorial($cleanEditorial, $flyer) !!}
-        </div>
-    </section>
-    @endif
-
-    <!-- جدول الأسعار والسلع (Structured Items Table) — ABOVE the 25-page gallery -->
-    <section id="items-table" class="mb-12 scroll-mt-20 rounded-2xl border border-[#e2e8f0] bg-white p-6 shadow-sm">
-        <h2 class="mb-2 text-lg font-black text-[#023b55]">جدول السلع والأسعار المفصلة في هذا العرض</h2>
-        <p class="mb-4 text-xs text-slate-500 flex flex-wrap items-center gap-2">
-            <span>تم استخراج وتدقيق هذه الأسعار تلقائياً عبر الذكاء الاصطناعي.</span>
-            <span class="inline-flex items-center gap-1 rounded-md bg-[#039652]/10 px-2 py-0.5 font-bold text-[#027a42]">
-                🕒 آخر رصد وتحديث للأسعار: {{ $flyer->updated_at?->timezone('Africa/Cairo')->format('Y/m/d h:i A') }} ({{ $flyer->updated_at?->timezone('Africa/Cairo')->diffForHumans() }})
-            </span>
-        </p>
-
-        <!-- Instant client-side filter bar (zero dependencies, < 1.5KB JS) -->
-        <div class="mb-4 flex flex-col gap-3">
-            <div id="items-filterbar" class="flex flex-wrap gap-2" role="group" aria-label="تصفية الجدول حسب التصنيف">
-                <button type="button" data-filter="all" class="items-filter-btn inline-flex items-center rounded-full border border-slate-200 bg-white px-3.5 py-1.5 text-xs font-black text-[#023b55] transition cursor-pointer hover:border-[#039652]/40">الكل</button>
-                <button type="button" data-filter="oil" class="items-filter-btn inline-flex items-center rounded-full border border-slate-200 bg-white px-3.5 py-1.5 text-xs font-black text-[#023b55] transition cursor-pointer hover:border-[#039652]/40">زيوت وسمن</button>
-                <button type="button" data-filter="dairy" class="items-filter-btn inline-flex items-center rounded-full border border-slate-200 bg-white px-3.5 py-1.5 text-xs font-black text-[#023b55] transition cursor-pointer hover:border-[#039652]/40">ألبان وأجبان</button>
-                <button type="button" data-filter="meat" class="items-filter-btn inline-flex items-center rounded-full border border-slate-200 bg-white px-3.5 py-1.5 text-xs font-black text-[#023b55] transition cursor-pointer hover:border-[#039652]/40">لحوم ومجمدات</button>
-                <button type="button" data-filter="grocery" class="items-filter-btn inline-flex items-center rounded-full border border-slate-200 bg-white px-3.5 py-1.5 text-xs font-black text-[#023b55] transition cursor-pointer hover:border-[#039652]/40">بقالة ومشروبات</button>
-                <button type="button" data-filter="clean" class="items-filter-btn inline-flex items-center rounded-full border border-slate-200 bg-white px-3.5 py-1.5 text-xs font-black text-[#023b55] transition cursor-pointer hover:border-[#039652]/40">منظفات وعناية</button>
-            </div>
-            <div class="flex flex-wrap items-center gap-3">
-                <input id="items-search" type="search" placeholder="ابحث في الجدول (اسم السلعة أو الماركة)..." aria-label="بحث فوري داخل جدول الأسعار" class="w-full max-w-xs rounded-xl border border-slate-200 bg-slate-50 px-4 py-2 text-xs font-medium text-[#023b55] placeholder:text-slate-400 focus:border-[#039652] focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#039652]/20">
-                <span id="items-count" class="text-xs font-bold text-slate-500">{{ $flyer->items->count() }} سلعة</span>
-            </div>
-        </div>
-
-        <div class="overflow-x-auto">
-            <table class="w-full text-right text-xs">
-                <thead class="border-b border-[#023b55]/10 bg-[#023b55]/5 text-[#023b55]">
-                    <tr>
-                        <th class="p-3 font-bold">اسم السلعة</th>
-                        <th class="p-3 font-bold">الماركة</th>
-                        <th class="p-3 font-bold">الوحدة</th>
-                        <th class="p-3 font-bold">سعر الوحدة</th>
-                        <th class="p-3 font-bold">سعر العرض</th>
-                        <th class="p-3 font-bold">السعر القديم</th>
-                        <th class="p-3 font-bold">نسبة التوفير</th>
-                    </tr>
-                </thead>
-                <tbody id="items-table-body" class="divide-y divide-slate-100 font-medium text-slate-800">
-                    @forelse ($flyer->items as $item)
-                        @php
-                            $cat = ProductDataNormalizer::classifyProduct($item->product_name);
-                            $unitPrice = ProductDataNormalizer::extractStandardUnitPrice($item);
-                        @endphp
-                        <tr id="item-{{ $item->id }}" data-cat="{{ $cat }}" class="hover:bg-[#039652]/5">
-                            <td class="p-3 font-bold text-[#023b55]">
-                                <div>{{ $item->product_name }}</div>
-                                @php $compareQuery = ProductDataNormalizer::searchQuery($item->product_name, $item->brand?->name); @endphp
-                                @if ($compareQuery !== '')
-                                    {{-- Interactive <button>, NOT a crawlable <a>: one ?q= search link per
-                                    item row flooded GSC with 152 internal-search crawl-bloat URLs. Bots do
-                                    not execute onclick, so this emits zero discoverable ?q= URLs. --}}
-                                    <button type="button" onclick="window.location.href='{{ route('home', ['q' => $compareQuery]) }}'" class="mt-1 inline-flex items-center gap-1 rounded-full border border-[#039652]/20 bg-[#039652]/10 px-2 py-0.5 text-[10px] font-bold text-[#027a42] hover:bg-[#039652] hover:text-white transition cursor-pointer">قارن الأسعار 🔍</button>
-                                @endif
-                            </td>
-                            <td class="p-3 text-slate-500">{{ $item->brand?->name ?: '—' }}</td>
-                            <td class="p-3 text-slate-500">{{ $item->unit ?: 'قطعة' }}</td>
-                            <td class="p-3 font-bold text-[#023b55]">
-                                @if ($unitPrice)
-                                    {{ number_format($unitPrice['amount'], 2) }} ج.م / {{ $unitPrice['unit'] }}
-                                @else
-                                    <span class="text-slate-400">—</span>
-                                @endif
-                            </td>
-                            <td class="p-3 text-sm font-black text-[#039652]">{{ number_format((float) $item->sale_price, 2) }} ج.م</td>
-                            <td class="p-3 text-slate-400">
-                                @if ($item->old_price)
-                                    <span class="line-through">{{ number_format((float) $item->old_price, 2) }} ج.م</span>
-                                @else
-                                    —
-                                @endif
-                            </td>
-                            <td class="p-3">
-                                @if ($item->discount_percent)
-                                    @php $isSuper = (float) $item->discount_percent > 30; @endphp
-                                    <span class="rounded px-2 py-0.5 text-[11px] font-bold {{ $isSuper ? 'bg-[#fcc023]/20 text-slate-900 border border-[#fcc023]/30' : 'bg-[#039652]/10 text-[#027a42]' }}">
-                                        خصم {{ round((float) $item->discount_percent) }}%
-                                    </span>
-                                @else
-                                    <span class="text-slate-400">—</span>
-                                @endif
-                            </td>
-                        </tr>
-                    @empty
-                        <tr>
-                            <td colspan="7" class="p-6 text-center text-slate-400">لا توجد سلع مسجلة لهذه المجلة بعد.</td>
-                        </tr>
-                    @endforelse
-                </tbody>
-            </table>
-        </div>
-        <p id="items-empty" class="hidden rounded-xl border border-dashed border-slate-300 bg-slate-50 p-6 text-center text-sm text-slate-500">لا توجد سلع مطابقة لهذه التصفية — جرب تصنيفاً آخر أو كلمة بحث أعم.</p>
-    </section>
-
+    {{-- PHOTOS FIRST (mobile UX + Google Discover): the flyer pages gallery
+    comes IMMEDIATELY after the header — users tap into the magazine they came
+    for before scrolling into any prose or table. --}}
     <!-- عارض المجلة مصورة (Flyer Viewer) - Page 1 featured + compact 2-col grid -->
-    <section id="flyer-viewer" class="mb-12 scroll-mt-20">
+    <section id="flyer-viewer" class="mb-10 scroll-mt-20">
         <div class="mb-4 flex items-center justify-between">
-            <h2 class="text-lg font-black text-[#023b55]">تصفح صفحات المجلة ({{ $pages->count() }} صفحة)</h2>
+            <h2 class="text-lg font-black text-[#023b55]">تصفح صفحات المجلة ({{ $pagesCountAr }})</h2>
             <span class="hidden text-xs text-slate-500 sm:inline">اضغط على أي صفحة للتكبير والتنقل</span>
         </div>
 
@@ -534,6 +494,143 @@
         @endif
     </section>
 
+    <!-- Quick Jump Bar (below the photos): prices & other offers ONE tap away -->
+    <nav class="mb-8 flex flex-wrap items-center gap-2" aria-label="التنقل السريع داخل الصفحة">
+        <a href="#items-table" class="inline-flex items-center gap-1 rounded-full border border-[#039652]/25 bg-[#039652]/10 px-4 py-2 text-xs font-black text-[#027a42] hover:bg-[#039652] hover:text-white transition">
+            📊 جدول الأسعار والسلع المفصلة ({{ $itemsCountAr }}) ↓
+        </a>
+        <a href="{{ $otherOffersHref }}" class="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-white px-4 py-2 text-xs font-black text-[#023b55] hover:border-[#039652]/40 hover:text-[#039652] transition">
+            🏪 عروض ومجلات أخرى ↓
+        </a>
+    </nav>
+
+    <!-- Editorial Overview — between the photos and the price table: the
+    photos stay first for users, the editorial text chunk feeds crawlers/AI. -->
+    @if (! $isExpired && !empty($flyer->editorial_overview))
+    <section class="mb-10 rounded-2xl border border-[#023b55]/10 bg-white p-5 sm:p-6 shadow-sm">
+        <h2 class="mb-3 text-lg font-black text-[#023b55]">نظرة سريعة على العرض</h2>
+        @php
+            $cleanEditorial = trim((string) $flyer->editorial_overview);
+            $cleanEditorial = (string) preg_replace("/[ \t]+\n/u", "\n", $cleanEditorial);
+            $cleanEditorial = (string) preg_replace("/\n{3,}/u", "\n\n", $cleanEditorial);
+            $cleanEditorial = (string) preg_replace("/:\n\n-/u", ":\n- ", $cleanEditorial);
+        @endphp
+        <div class="max-w-none text-[13px] leading-6 text-slate-700 prose prose-sm prose-headings:text-[#023b55] prose-strong:text-[#023b55] prose-a:text-[#039652] prose-a:font-bold">
+            {!! app(\App\Services\AutoInternalLinkerService::class)->linkifyEditorial($cleanEditorial, $flyer) !!}
+        </div>
+    </section>
+    @endif
+
+    <!-- جدول الأسعار والسلع (Structured Items Table) — BELOW the photos per
+    the PHOTOS-FIRST UX pass; the jump bar above deep-links here. -->
+    <section id="items-table" class="mb-12 scroll-mt-20 rounded-2xl border border-[#e2e8f0] bg-white p-6 shadow-sm">
+        <h2 class="mb-2 text-lg font-black text-[#023b55]">جدول السلع والأسعار المفصلة في هذا العرض</h2>
+        <p class="mb-4 text-xs text-slate-500 flex flex-wrap items-center gap-2">
+            <span>تم استخراج وتدقيق هذه الأسعار تلقائياً عبر الذكاء الاصطناعي.</span>
+            <span class="inline-flex items-center gap-1 rounded-md bg-[#039652]/10 px-2 py-0.5 font-bold text-[#027a42]">
+                🕒 آخر رصد وتحديث للأسعار: {{ $flyer->updated_at?->timezone('Africa/Cairo')->format('Y/m/d h:i A') }} ({{ $flyer->updated_at?->timezone('Africa/Cairo')->diffForHumans() }})
+            </span>
+        </p>
+
+        <!-- Instant client-side filter bar (zero dependencies, < 1.5KB JS) -->
+        {{-- Only the buckets that ACTUALLY exist in this flyer are rendered:
+        a 3-category flyer shows 3 buttons, never a dead filter. --}}
+        <div class="mb-4 flex flex-col gap-3">
+            <div id="items-filterbar" class="flex flex-wrap gap-2" role="group" aria-label="تصفية الجدول حسب التصنيف">
+                <button type="button" data-filter="all" class="items-filter-btn is-active inline-flex items-center rounded-full border border-slate-200 bg-white px-3.5 py-1.5 text-xs font-black text-[#023b55] transition cursor-pointer hover:border-[#039652]/40">الكل</button>
+                @foreach ($categoryLabels as $bucketKey => $bucketLabel)
+                    @if (in_array($bucketKey, $presentCategories, true))
+                        <button type="button" data-filter="{{ $bucketKey }}" class="items-filter-btn inline-flex items-center rounded-full border border-slate-200 bg-white px-3.5 py-1.5 text-xs font-black text-[#023b55] transition cursor-pointer hover:border-[#039652]/40">{{ $bucketLabel }}</button>
+                    @endif
+                @endforeach
+            </div>
+            <div class="flex flex-wrap items-center gap-3">
+                <input id="items-search" type="search" placeholder="ابحث في الجدول (اسم السلعة أو الماركة)..." aria-label="بحث فوري داخل جدول الأسعار" class="w-full max-w-xs rounded-xl border border-slate-200 bg-slate-50 px-4 py-2 text-xs font-medium text-[#023b55] placeholder:text-slate-400 focus:border-[#039652] focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#039652]/20">
+                <span id="items-count" class="text-xs font-bold text-slate-500">{{ $itemsCountAr }}</span>
+            </div>
+        </div>
+
+        <div class="overflow-x-auto">
+            <table class="w-full text-right text-xs">
+                <thead class="border-b border-[#023b55]/10 bg-[#023b55]/5 text-[#023b55]">
+                    <tr>
+                        <th class="p-3 font-bold">اسم السلعة</th>
+                        <th class="p-3 font-bold">الماركة</th>
+                        <th class="p-3 font-bold">الوحدة</th>
+                        <th class="p-3 font-bold">سعر الوحدة</th>
+                        <th class="p-3 font-bold">سعر العرض</th>
+                        <th class="p-3 font-bold">السعر القديم</th>
+                        <th class="p-3 font-bold">نسبة التوفير</th>
+                    </tr>
+                </thead>
+                <tbody id="items-table-body" class="divide-y divide-slate-100 font-medium text-slate-800">
+                    @forelse ($flyer->items as $item)
+                        @php
+                            // UI filter buckets come from the STORED 10-value
+                            // category (falling back to the deterministic
+                            // classifier) — NOT classifyProduct(), whose
+                            // keyword buckets misfile "بديل زيت" under oil and
+                            // motor oil under "oil". automotive_tools has no
+                            // UI bucket and folds into grocery.
+                            $cat = match ($item->category ?: \App\Services\ProductDataNormalizer::inferCategory($item->product_name)) {
+                                'oils_ghee' => 'oil',
+                                'dairy_cheese' => 'dairy',
+                                'meat_poultry' => 'meat',
+                                'cleaning_laundry', 'personal_care' => 'clean',
+                                default => 'grocery',
+                            };
+                            $unitPrice = ProductDataNormalizer::extractStandardUnitPrice($item);
+                        @endphp
+                        <tr id="item-{{ $item->id }}" data-cat="{{ $cat }}" class="hover:bg-[#039652]/5">
+                            <td class="p-3 font-bold text-[#023b55]">
+                                <div>{{ $item->product_name }}</div>
+                                @php $compareQuery = ProductDataNormalizer::searchQuery($item->product_name, $item->brand?->name); @endphp
+                                @if ($compareQuery !== '')
+                                    {{-- Interactive <button>, NOT a crawlable <a>: one ?q= search link per
+                                    item row flooded GSC with 152 internal-search crawl-bloat URLs. Bots do
+                                    not execute onclick, so this emits zero discoverable ?q= URLs. --}}
+                                    <button type="button" onclick="window.location.href='{{ route('home', ['q' => $compareQuery]) }}'" class="mt-1 inline-flex items-center gap-1 rounded-full border border-[#039652]/20 bg-[#039652]/10 px-2 py-0.5 text-[10px] font-bold text-[#027a42] hover:bg-[#039652] hover:text-white transition cursor-pointer">قارن الأسعار 🔍</button>
+                                @endif
+                            </td>
+                            <td class="p-3 text-slate-500">{{ $item->brand?->name ?: '—' }}</td>
+                            <td class="p-3 text-slate-500">{{ $item->unit ?: 'قطعة' }}</td>
+                            <td class="p-3 font-bold text-[#023b55]">
+                                @if ($unitPrice)
+                                    {{ number_format($unitPrice['amount'], 2) }} ج.م / {{ $unitPrice['unit'] }}
+                                @else
+                                    <span class="text-slate-400">—</span>
+                                @endif
+                            </td>
+                            <td class="p-3 text-sm font-black text-[#039652]">{{ number_format((float) $item->sale_price, 2) }} ج.م</td>
+                            <td class="p-3 text-slate-400">
+                                @if ($item->old_price)
+                                    <span class="line-through">{{ number_format((float) $item->old_price, 2) }} ج.م</span>
+                                @else
+                                    —
+                                @endif
+                            </td>
+                            <td class="p-3">
+                                @if ($item->discount_percent)
+                                    @php $isSuper = (float) $item->discount_percent > 30; @endphp
+                                    <span class="rounded px-2 py-0.5 text-[11px] font-bold {{ $isSuper ? 'bg-[#fcc023]/20 text-slate-900 border border-[#fcc023]/30' : 'bg-[#039652]/10 text-[#027a42]' }}">
+                                        خصم {{ round((float) $item->discount_percent) }}%
+                                    </span>
+                                @else
+                                    <span class="text-slate-400">—</span>
+                                @endif
+                            </td>
+                        </tr>
+                    @empty
+                        <tr>
+                            <td colspan="7" class="p-6 text-center text-slate-400">لا توجد سلع مسجلة لهذه المجلة بعد.</td>
+                        </tr>
+                    @endforelse
+                </tbody>
+            </table>
+        </div>
+        <p id="items-empty" class="hidden rounded-xl border border-dashed border-slate-300 bg-slate-50 p-6 text-center text-sm text-slate-500">لا توجد سلع مطابقة لهذه التصفية — جرب تصنيفاً آخر أو كلمة بحث أعم.</p>
+    </section>
+
     <!-- Lightbox Modal - Pure JS, Zero CDN - Navy/Green theme -->
     <div id="flyer-lightbox" class="fixed inset-0 z-50 hidden items-center justify-center bg-[#023b55]/90 p-4 backdrop-blur-sm" role="dialog" aria-modal="true" aria-label="عارض الصفحات">
         <div class="relative flex h-full w-full max-w-5xl flex-col">
@@ -577,6 +674,14 @@
         var countEl = document.getElementById('items-count');
         var emptyEl = document.getElementById('items-empty');
         function norm(s){ return (s||'').replace(/[أإآ]/g,'ا').replace(/ة/g,'ه').replace(/ى/g,'ي').toLowerCase(); }
+        // Mirror of ArabicDateHelper::pluralizeCount() — the live filter count
+        // must read grammatical Arabic too (1 سلعة / سلعتان / 3..10 سلع / 11+ سلعة).
+        function pluralizeAr(n){
+            if(n === 1) return '1 سلعة';
+            if(n === 2) return 'سلعتان';
+            if(n >= 3 && n <= 10) return n + ' سلع';
+            return n + ' سلعة';
+        }
         function apply(){
             var q = norm((document.getElementById('items-search')||{}).value || '').trim();
             var shown = 0;
@@ -586,7 +691,7 @@
                 r.style.display = ok ? '' : 'none';
                 if(ok) shown++;
             });
-            if(countEl) countEl.textContent = shown + ' سلعة';
+            if(countEl) countEl.textContent = pluralizeAr(shown);
             if(emptyEl) emptyEl.classList.toggle('hidden', shown > 0);
         }
         document.querySelectorAll('#items-filterbar [data-filter]').forEach(function(btn){

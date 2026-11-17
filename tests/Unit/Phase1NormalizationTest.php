@@ -100,11 +100,14 @@ final class Phase1NormalizationTest extends TestCase
         $this->assertSame('personal_care', ProductDataNormalizer::inferCategory('مزيل عرق أكس'));
     }
 
-    public function test_infer_category_gum_brand_never_hits_dairy(): void
+    public function test_infer_category_cheese_brand_is_dairy_not_gum(): void
     {
-        // 'جبنتي' contains 'جبن' — beverages must be checked BEFORE dairy.
-        $this->assertSame('beverages_snacks', ProductDataNormalizer::inferCategory('عصير جبنتي'));
-        $this->assertSame('beverages_snacks', ProductDataNormalizer::inferCategory('جبنتي علكة'));
+        // جبنتي is an EGYPTIAN CHEESE brand (contains "جبن") — it must land
+        // in dairy_cheese, never in the old gum-in-beverages rule. A leading
+        // beverage keyword ("عصير") still wins the ordered scan by design.
+        $this->assertSame('dairy_cheese', ProductDataNormalizer::inferCategory('جبنتي علكة'));
+        $this->assertSame('dairy_cheese', ProductDataNormalizer::inferCategory('جبنة رومي 1 كجم'));
+        $this->assertSame('beverages_snacks', ProductDataNormalizer::inferCategory('عصير برتقال'));
     }
 
     public function test_infer_category_all_major_groups(): void

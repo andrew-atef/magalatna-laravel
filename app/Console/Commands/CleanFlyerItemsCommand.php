@@ -176,6 +176,13 @@ final class CleanFlyerItemsCommand extends Command
 
                     // --- 5. Rebuild BLUF + editorial (deterministic fallback) ---
                     if ($flyerChanged && ! $dryRun) {
+                        // The in-memory `items` collection is now STALE: the
+                        // dedup step just deleted rows the collection still
+                        // holds. Drop the relation so every rebuild access
+                        // ($flyer->items()) hits the DB fresh and the new
+                        // copy never quotes deleted/merged duplicates.
+                        $flyer->unsetRelation('items');
+
                         // Blank the Gemini key: generateBlufSummary()/Editorial()
                         // throw immediately in apiKey(), the Gatekeeper builders
                         // catch it, and the DETERMINISTIC fallback copy is built —
@@ -201,6 +208,11 @@ final class CleanFlyerItemsCommand extends Command
             // Memory hygiene: release the hydrated chunk before the next one.
             unset($flyers);
             gc_collect_cycles();
+        }
+
+        // --- 5b. Prune obsolete non-canonical Brand rows (real writes only) ---
+        if (! $dryRun) {
+            $this->pruneObsoleteBrands();
         }
 
         // --- 6. Cache invalidation + CDN purge (only when really writing) -------
@@ -261,6 +273,63 @@ final class CleanFlyerItemsCommand extends Command
         Log::info('CleanFlyerItemsCommand finished.', $stats + ['dry_run' => $dryRun]);
 
         return self::SUCCESS;
+    }
+
+    /**
+     * Delete alias-spelling Brand rows that canonicalization orphaned:
+     * a Brand whose name is a NON-canonical alias key in
+     * config('ocr_aliases.brand_aliases') (e.g. "دولتين" → canonical
+     * "دولفين") and that now has ZERO flyerItems is an OCR-misread
+     * spelling, not a real brand. Identity mappings ("كريستال" →
+     * "كريستال") are canonical and never pruned. Name comparison is done
+     * on Arabic-normalized lowercase keys — the brands table is small, so
+     * a chunked scan with in-memory normalization is the pragmatic check.
+     */
+    private function pruneObsoleteBrands(): void
+    {
+        $normalizeKey = static fn (string $value): string => mb_strtolower(
+            trim(ArabicNormalizer::normalize(ArabicNormalizer::toWesternDigits($value))),
+        );
+
+        /** @var array<string, true> $nonCanonicalKeys normalized alias keys that map to a DIFFERENT canonical name */
+        $nonCanonicalKeys = [];
+        foreach ((array) config('ocr_aliases.brand_aliases', []) as $raw => $canonical) {
+            $rawKey = $normalizeKey((string) $raw);
+            $canonicalKey = $normalizeKey((string) $canonical);
+
+            if ($rawKey !== '' && $rawKey !== $canonicalKey) {
+                $nonCanonicalKeys[$rawKey] = true;
+            }
+        }
+
+        if ($nonCanonicalKeys === []) {
+            return;
+        }
+
+        $pruned = 0;
+
+        Brand::query()
+            ->doesntHave('flyerItems')
+            ->select(['id', 'name'])
+            ->chunkById(200, static function ($brands) use ($nonCanonicalKeys, $normalizeKey, &$pruned): void {
+                foreach ($brands as $brand) {
+                    if (isset($nonCanonicalKeys[$normalizeKey((string) $brand->name)])) {
+                        $brand->delete();
+                        $pruned++;
+                    }
+                }
+            });
+
+        // BrandObserver already invalidates the auto-linker map on delete,
+        // but this explicit forget guarantees a clean rebuild even if a
+        // future refactor drops the observer.
+        Cache::forget('auto_linker:brands');
+
+        if ($pruned > 0) {
+            $this->info("تم حذف {$pruned} براند قديم (تهجئة غير قياسية بدون سلع).");
+        }
+
+        Log::info('CleanFlyerItemsCommand: obsolete alias brands pruned.', ['pruned' => $pruned]);
     }
 
     /**

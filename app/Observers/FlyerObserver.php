@@ -89,8 +89,9 @@ final class FlyerObserver
     {
         // Capture R2 paths BEFORE the delete: flyer_pages.flyer_id has
         // ON DELETE CASCADE, so by the time deleted() runs the rows are gone.
-        // BOTH the master images AND the cover thumbnails are separate R2
-        // objects that must never outlive their flyer.
+        // BOTH the master images, the cover thumbnails AND the flyer-level
+        // Google Discover composite are separate R2 objects that must never
+        // outlive their flyer.
         $imagePaths = $flyer->pages()
             ->whereNotNull('image_path')
             ->pluck('image_path');
@@ -99,8 +100,11 @@ final class FlyerObserver
             ->whereNotNull('thumb_path')
             ->pluck('thumb_path');
 
+        $discoverPath = trim((string) ($flyer->discover_image_path ?? ''));
+
         self::$pendingR2Paths[(int) $flyer->id] = $imagePaths
             ->merge($thumbPaths)
+            ->when($discoverPath !== '', static fn ($collection) => $collection->push($discoverPath))
             ->map(static fn (mixed $path): string => trim((string) $path))
             ->filter()
             ->unique()

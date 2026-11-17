@@ -260,7 +260,10 @@
     </section>
 
     <!-- Top Active Deals (item-level price highlights) - GEO for AI crawlers -->
-    @if ($topRetailerItems->isNotEmpty())
+    {{-- null-safe: the controller may omit $topRetailerItems (e.g. a retailer
+    with no active flyers) — an undefined-variable Blade error here would 500
+    the whole hub page. --}}
+    @if (($topRetailerItems ?? collect())->isNotEmpty())
         <section class="mb-12">
             <div class="mb-4 flex items-center justify-between">
                 <h2 class="text-lg font-black text-[#023b55] sm:text-xl">أبرز أسعار وعروض {{ $retailer->clean_name }} السارية اليوم</h2>

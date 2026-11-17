@@ -161,7 +161,7 @@
         <div class="mb-6 flex flex-col gap-2 rounded-xl border border-[#039652]/20 bg-[#039652]/10 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
             <p class="text-xs font-bold text-[#023b55] sm:text-sm">
                 نتائج البحث عن: <span class="font-black text-[#039652]">"{{ $searchQuery }}"</span>
-                — تم العثور على <span class="font-black">{{ $matchingItems?->total() ?? 0 }}</span> منتج و <span class="font-black">{{ $flyers->total() }}</span> مجلة.
+                — تم العثور على <span class="font-black">{{ \App\Support\ArabicDateHelper::pluralizeCount($matchingItems?->total() ?? 0, 'منتج', 'منتجان', 'منتجات', 'منتج') }}</span> و <span class="font-black">{{ \App\Support\ArabicDateHelper::pluralizeCount($flyers->total(), 'مجلة', 'مجلتان', 'مجلات', 'مجلة') }}</span>.
             </p>
             <a href="{{ $homeUrl }}" class="inline-flex shrink-0 items-center gap-1 rounded-full bg-[#023b55] px-3 py-1 text-xs font-black text-white hover:bg-[#039652] transition">
                 إلغاء البحث ✕
@@ -227,7 +227,7 @@
     <section id="latest-flyers" class="mb-12 scroll-mt-20">
         <div class="mb-4 flex items-center justify-between">
             <h2 class="text-lg font-black text-[#023b55] sm:text-xl">أحدث مجلات العروض السارية</h2>
-            <span class="text-xs font-semibold text-slate-500">{{ $flyers->total() }} مجلة سارية</span>
+            <span class="text-xs font-semibold text-slate-500">{{ \App\Support\ArabicDateHelper::pluralizeCount($flyers->total(), 'مجلة', 'مجلتان', 'مجلات', 'مجلة') }} سارية</span>
         </div>
 
         <div class="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4">

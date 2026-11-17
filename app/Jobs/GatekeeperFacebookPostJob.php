@@ -11,6 +11,7 @@ use App\Models\RawFacebookPost;
 use App\Models\Retailer;
 use App\Services\FlyerSlugService;
 use App\Services\GeminiVisionService;
+use App\Services\ImageOptimizerService;
 use App\Services\ProductDataNormalizer;
 use App\Support\ArabicDateHelper;
 use App\Support\FacebookMediaHelper;
@@ -685,6 +686,12 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
             $flyer->bluf_summary = self::buildBlufSummary($flyer);
             $flyer->editorial_overview = self::buildEditorialOverview($flyer);
 
+            // === 4b. Google Discover 1280x720 hero composite ===
+            // Generated BEFORE the audited save: the discover_image_path rides
+            // the same save() (one observer purge, one IndexNow ping) and the
+            // CDN edge never caches the page without its final og:image.
+            self::ensureDiscoverImage($flyer);
+
             // === 5. Auditable save (NOT saveQuietly): FlyerObserver is the
             // SINGLE authority for the Cloudflare purge + sitemap/llms cache
             // forget + IndexNow ping on publish/refresh. It fires once,
@@ -705,6 +712,65 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
                 'flyer_id' => $flyerId,
                 'error' => $e->getMessage(),
                 'trace' => $e->getTraceAsString(),
+            ]);
+        }
+    }
+
+    /**
+     * Google Discover hero composite — generated ONCE per flyer (idempotent:
+     * a flyer that already carries discover_image_path is skipped, so retries
+     * and rebuild batches never re-encode). Non-fatal: any R2/Intervention
+     * failure just logs and leaves the flyer's meta fallback to the cover.
+     */
+    private static function ensureDiscoverImage(Flyer $flyer): void
+    {
+        if (trim((string) $flyer->discover_image_path) !== '') {
+            return;
+        }
+
+        try {
+            $pages = $flyer->pages()
+                ->whereIn('page_number', [1, 2])
+                ->orderBy('page_number')
+                ->get(['id', 'image_path', 'page_number']);
+
+            $coverPage = $pages->firstWhere('page_number', 1) ?? $pages->first();
+
+            if ($coverPage === null || trim((string) $coverPage->image_path) === '') {
+                return;
+            }
+
+            $page2 = $pages->firstWhere('page_number', 2);
+
+            $optimizer = app(ImageOptimizerService::class);
+
+            $coverBinary = Storage::disk('r2')->get((string) $coverPage->image_path);
+            $page2Binary = null;
+            if ($page2 !== null && trim((string) $page2->image_path) !== '') {
+                try {
+                    $page2Binary = Storage::disk('r2')->get((string) $page2->image_path);
+                } catch (Throwable $e) {
+                    Log::warning('Discover page-2 fetch failed, generating cover-only composite.', [
+                        'flyer_id' => $flyer->id,
+                        'error' => $e->getMessage(),
+                    ]);
+                }
+            }
+
+            $discoverBinary = $optimizer->generateDiscoverComposite((string) $coverBinary, $page2Binary);
+            $flyer->discover_image_path = $optimizer->storeDiscoverWebp($discoverBinary, 'flyers/'.$flyer->id);
+
+            unset($coverBinary, $page2Binary, $discoverBinary);
+            gc_collect_cycles();
+
+            Log::info('Discover composite generated.', [
+                'flyer_id' => $flyer->id,
+                'discover_image_path' => $flyer->discover_image_path,
+            ]);
+        } catch (Throwable $e) {
+            Log::warning('Discover composite generation failed (non-fatal, page falls back to cover).', [
+                'flyer_id' => $flyer->id,
+                'error' => $e->getMessage(),
             ]);
         }
     }
@@ -914,6 +980,33 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
             $topProducts = $flyer->items()->limit(5)->pluck('product_name')->filter()->implode('، ');
             $topProducts = $topProducts !== '' ? $topProducts : 'سلع متنوعة';
 
+            // UPCOMING flyer (published before its start date): "الساري" is
+            // factually WRONG until valid_from — Cairo-day comparison, same
+            // rule as the Flyer accessors.
+            $isUpcoming = false;
+            $fromText = '';
+            try {
+                $fromRawForUpcoming = $flyer->valid_from;
+                if ($fromRawForUpcoming instanceof Carbon || (is_string($fromRawForUpcoming) && trim((string) $fromRawForUpcoming) !== '')) {
+                    $fromCarbonForUpcoming = $fromRawForUpcoming instanceof Carbon
+                        ? $fromRawForUpcoming->copy()->setTimezone('Africa/Cairo')
+                        : Carbon::parse(trim((string) $fromRawForUpcoming), 'Africa/Cairo');
+                    $isUpcoming = now('Africa/Cairo')->startOfDay()->lt($fromCarbonForUpcoming->copy()->startOfDay());
+                    if ($isUpcoming) {
+                        $fromText = $fromCarbonForUpcoming->locale('ar')->isoFormat('dddd D MMMM YYYY');
+                        if (! preg_match('/[\x{0600}-\x{06FF}]/u', $fromText)) {
+                            $fromText = ArabicDateHelper::formatArabicDate($fromCarbonForUpcoming);
+                        }
+                    }
+                }
+            } catch (Throwable $e) {
+                $isUpcoming = false;
+            }
+
+            if ($isUpcoming) {
+                return "تصفح {$titleForBluf} يبدأ في مصر يوم {$fromText} وحتى {$untilText}، {$discountPhrase}. يشمل العرض تخفيضات قوية على {$topProducts} بجميع الفروع وحتى نفاذ الكمية.";
+            }
+
             return "تصفح {$titleForBluf} الساري في مصر حتى {$untilText}، {$discountPhrase}. يشمل العرض تخفيضات قوية على {$topProducts} بجميع الفروع وحتى نفاذ الكمية.";
         } catch (Throwable $e) {
             Log::warning('Failed to generate BLUF summary, using ultimate fallback.', [
@@ -975,6 +1068,29 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
             } catch (Throwable $e) {
             }
 
+            // UPCOMING flyer (published before its start date): "سارية" is
+            // factually WRONG until valid_from — Cairo-day comparison, same
+            // rule as the Flyer accessors and the BLUF builder.
+            $isUpcoming = false;
+            $fromDayName = '';
+            try {
+                $fromRawForUpcoming = $flyer->valid_from;
+                if ($fromRawForUpcoming instanceof Carbon || (is_string($fromRawForUpcoming) && trim((string) $fromRawForUpcoming) !== '')) {
+                    $fromCarbonForUpcoming = $fromRawForUpcoming instanceof Carbon
+                        ? $fromRawForUpcoming->copy()->setTimezone('Africa/Cairo')
+                        : Carbon::parse(trim((string) $fromRawForUpcoming), 'Africa/Cairo');
+                    $isUpcoming = now('Africa/Cairo')->startOfDay()->lt($fromCarbonForUpcoming->copy()->startOfDay());
+                    if ($isUpcoming) {
+                        $fromDayName = $fromCarbonForUpcoming->locale('ar')->isoFormat('dddd');
+                        if (! preg_match('/[\x{0600}-\x{06FF}]/u', $fromDayName)) {
+                            $fromDayName = ArabicDateHelper::dayName($fromCarbonForUpcoming);
+                        }
+                    }
+                }
+            } catch (Throwable $e) {
+                $isUpcoming = false;
+            }
+
             $maxDiscount = round((float) ($flyer->items()->max('discount_percent') ?? 0));
             // Trim ".00" BEFORE appending the unit — rtrim() on the finished
             // string hits the Arabic "ج.م" suffix and is a no-op.
@@ -997,7 +1113,11 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
                 $heroText = 'سلع متنوعة بأسعار مخفضة';
             }
 
-            $para1 = "تقدم مجلة {$title} من {$retailerName} عروضاً حصرية سارية في مصر من {$from} حتى {$until}، بخصومات {$discountRange} على تشكيلة واسعة من السلع الغذائية والمستلزمات المنزلية.";
+            $windowPhrase = $isUpcoming && $fromDayName !== ''
+                ? "عروضاً حصرية تبدأ في مصر يوم {$fromDayName} {$from} وحتى {$until}"
+                : "عروضاً حصرية سارية في مصر من {$from} حتى {$until}";
+
+            $para1 = "تقدم مجلة {$title} من {$retailerName} {$windowPhrase}، بخصومات {$discountRange} على تشكيلة واسعة من السلع الغذائية والمستلزمات المنزلية.";
             if ($heroDeals->isNotEmpty()) {
                 $bullets = $heroDeals->map(function ($item): string {
                     $sale = self::formatEgp((float) $item->sale_price);
