@@ -30,13 +30,29 @@ use Throwable;
 final class CleanFlyerItemsCommand extends Command
 {
     protected $signature = 'flyers:clean-items
-        {--dry-run : عرض التغييرات المقترحة دون حفظ أي بيانات}';
+        {--dry-run : عرض التغييرات المقترحة دون حفظ أي بيانات}
+        {--brands-only : تشغيل إصلاح البراندات المخالفة فقط (إيليت/إلفيف/دولتين/بيبيسي) ثم الخروج}
+        {--repair-titles : إصلاح عناوين المجلات المقصوصة وسط الكلمة (| تخفيضا، | مه) ثم الخروج}';
 
     protected $description = 'تنظيف وتوحيد بيانات سلع المجلات: تصحيح أسماء المنتجات والبراندات، التصنيف التلقائي، وإزالة التكرار (أغنى صف يفوز) مع إعادة بناء النصوص الترويجية';
 
     public function handle(): int
     {
         $dryRun = (bool) $this->option('dry-run');
+
+        // One-time legacy brand-cleanup run: fix the historical OCR
+        // misassignments (Gillette→إيليت, L'Oréal/إفيف→إلفيف, دولتين→دولفين,
+        // بيبيسي→بيبسي) WITHOUT re-running the whole per-flyer pipeline.
+        if ((bool) $this->option('brands-only')) {
+            return $this->cleanMismatchedBrands($dryRun);
+        }
+
+        // One-time legacy title repair: rebuild titles the OLD 65-char
+        // cutter chopped MID-WORD (sitemap image:title shows "| تخفيضا",
+        // "| مه") BEFORE the word-boundary truncation shipped.
+        if ((bool) $this->option('repair-titles')) {
+            return $this->repairTruncatedTitles($dryRun);
+        }
 
         $flyerIds = Flyer::query()
             ->whereHas('items')
@@ -271,6 +287,273 @@ final class CleanFlyerItemsCommand extends Command
         ]);
 
         Log::info('CleanFlyerItemsCommand finished.', $stats + ['dry_run' => $dryRun]);
+
+        return self::SUCCESS;
+    }
+
+    /**
+     * One-time legacy brand mismatch cleanup (معظمها من مجلات قبل خط
+     * التطبيع): item rows whose PRODUCT NAME clearly names a brand while
+     * their brand_id still points at the OCR-misread one.
+     *
+     *  - 'إيليت' (Elite) items mislabeled 'جيليت'/'Gillette' → إيليت
+     *    (Gillette products never print "إيليت" — it is the Elite/Chewing
+     *    gum… no, Elite is the chocolate/gum brand; the OCR read "إيليت"
+     *    as "جيليت" and the auto-linker followed).
+     *  - 'إلفيف'/'إفيف' (L'Oréal Elvive) items → إلفيف (never جيليت).
+     *  - remaining 'دولتين' items → دولفين.
+     *  - remaining 'بيبيسي' items → بيبسي.
+     *
+     * Runs as bulk UPDATEs (brand_id only — names/normalized_name untouched,
+     * so FlyerItemObserver re-runs are unnecessary) and invalidates the
+     * public caches afterwards.
+     */
+    public function cleanMismatchedBrands(bool $dryRun = false): int
+    {
+        // Canonical Brand rows (firstOrCreate so a missing canonical row is
+        // materialized before any item is re-pointed at it).
+        $brandIds = [];
+        foreach (['إلفيف', 'إيليت', 'دولفين', 'بيبسي'] as $canonicalName) {
+            $brandIds[$canonicalName] = $this->resolveBrandId($canonicalName);
+        }
+
+        // Wrong-source brand ids, resolved by NAME (never by item scan):
+        $wrongGilletteIds = Brand::query()
+            ->whereIn('name', ['جيليت', 'Gillette', 'gillette'])
+            ->pluck('id');
+
+        $fixes = [
+            [
+                'label' => 'إيليت (كان يشير إلى جيليت/Gillette)',
+                'names' => ['%إيليت%'],
+                'wrongIds' => $wrongGilletteIds,
+                'target' => 'إيليت',
+            ],
+            [
+                'label' => 'إلفيف/إفيف (أي براند آخر أو بدون براند) → إلفيف',
+                'names' => ['%إلفيف%', '%إفيف%'],
+                // ANY current brand (or none) other than إلفيف itself is a
+                // legacy misassignment for items explicitly named إلفيف/إفيف.
+                'wrongIds' => null,
+                'target' => 'إلفيف',
+            ],
+            [
+                'label' => 'دولتين → دولفين',
+                'names' => ['%دولتين%'],
+                'wrongIds' => null, // ANY current brand (incl. null) is wrong
+                'target' => 'دولفين',
+            ],
+            [
+                'label' => 'بيبيسي → بيبسي',
+                'names' => ['%بيبيسي%'],
+                'wrongIds' => null,
+                'target' => 'بيبسي',
+            ],
+        ];
+
+        $stats = [];
+
+        foreach ($fixes as $fix) {
+            $targetId = $brandIds[$fix['target']];
+
+            if ($targetId === null) {
+                $this->warn("تعذر إنشاء براند قياسي «{$fix['target']}» — تم التخطي.");
+
+                continue;
+            }
+
+            $query = FlyerItem::query()
+                ->where(static function ($q) use ($fix): void {
+                    foreach ($fix['names'] as $needle) {
+                        $q->orWhere('product_name', 'like', $needle);
+                    }
+                })
+                ->where(static function ($q) use ($fix, $targetId): void {
+                    if ($fix['wrongIds'] === null) {
+                        // Any brand that is not already the canonical target.
+                        $q->whereNull('brand_id')->orWhere('brand_id', '!=', $targetId);
+                    } elseif ($fix['wrongIds']->isNotEmpty()) {
+                        $q->whereIn('brand_id', $fix['wrongIds']->all());
+                    } else {
+                        $q->whereRaw('1 = 0'); // no wrong brands exist — no-op
+                    }
+                });
+
+            $count = $query->count();
+            $stats[$fix['label']] = $count;
+
+            if ($count > 0 && ! $dryRun) {
+                $query->update(['brand_id' => $targetId]);
+                $this->info("تم تصحيح {$count} سلعة: {$fix['label']}.");
+            } elseif ($count > 0) {
+                $this->line("(تجريبي) {$count} سلعة ستُصحح: {$fix['label']}.");
+            }
+        }
+
+        if (! $dryRun && array_sum($stats) > 0) {
+            // Brand rows re-pointed → auto-linker map + sitemap caches stale.
+            Cache::forget('auto_linker:brands');
+            Cache::forget('sitemap_xml_content');
+            Cache::forget('llms_txt_content');
+
+            Log::info('CleanFlyerItemsCommand: mismatched brands re-pointed.', $stats);
+        }
+
+        $mode = $dryRun ? '(تجريبي — لم يُحفظ شيء)' : '';
+        $this->info('انتهى إصلاح البراندات المخالفة '.$mode);
+
+        return self::SUCCESS;
+    }
+
+    /**
+     * One-time truncated-title repair (عناوين قُصّت وسط الكلمة بـ 65 حرفاً
+     * قبل وصول القصّ عند حدود الكلمة): a title segment after its LAST "|"
+     * shorter than 8 Arabic chars (or a strict prefix of a known theme)
+     * is a broken theme fragment — rebuild it word-safe:
+     *  - snap the fragment to the FULL known theme when it is its prefix
+     *    ("الجمعة البي" → "الجمعة البيضاء");
+     *  - otherwise fall back to the canonical default theme
+     *    "مجلة العروض والتوفير";
+     *  - strip the Latin "(El Fergany)" parenthetical from the retailer
+     *    name so full Arabic words keep their room;
+     *  - the date segment before the "|" is UNTOUCHED (it was never cut).
+     */
+    public function repairTruncatedTitles(bool $dryRun = false): int
+    {
+        $knownThemes = [
+            'مجلة العروض والتوفير',
+            'العودة للمدارس',
+            'الجمعة البيضاء',
+            'رمضان',
+            'العيد',
+            'الصيف',
+            'الشتاء',
+        ];
+
+        /** @var \Illuminate\Support\Collection<int, Flyer> $flyers */
+        $flyers = Flyer::query()->with('retailer:id,name')->orderBy('id')->get(['id', 'retailer_id', 'title']);
+
+        $stats = ['checked' => $flyers->count(), 'repaired' => 0];
+        $changedFlyerIds = [];
+
+        foreach ($flyers as $flyer) {
+            $title = trim((string) $flyer->title);
+
+            $pipePos = mb_strrpos($title, '|');
+            if ($pipePos === false) {
+                continue; // no theme segment — the old cut never hit it
+            }
+
+            $fragment = trim(mb_substr($title, $pipePos + 1));
+            if ($fragment === '') {
+                continue;
+            }
+
+            // Fragment recovery: complete known theme → untouched. A SHORT
+            // fragment (< 8 chars) is mid-word debris ("تخفيضا", "مه"):
+            // snap it to the FULL known theme it prefixes, else the
+            // canonical default theme. Longer fragments (≥ 8) may be
+            // perfectly valid short themes ("مجلة العروض") — never touched,
+            // rewriting a plausible complete theme is worse than leaving
+            // rare debris behind.
+            $isComplete = false;
+            foreach ($knownThemes as $theme) {
+                if ($fragment === $theme) {
+                    $isComplete = true;
+
+                    break;
+                }
+            }
+
+            if ($isComplete || mb_strlen($fragment) >= 8) {
+                continue;
+            }
+
+            $fixedTheme = 'مجلة العروض والتوفير';
+            foreach ($knownThemes as $theme) {
+                if (str_starts_with($theme, $fragment)) {
+                    $fixedTheme = $theme;
+
+                    break;
+                }
+            }
+
+            $prefix = trim(mb_substr($title, 0, $pipePos));
+            $retailerName = (string) ($flyer->retailer?->name ?? '');
+
+            // Same cap the live builder applies (Latin parenthetical out
+            // first, word-boundary cut as the last resort). When the FULL
+            // theme no longer fits under 65 even without the Latin name,
+            // fall back to a SHORT truthful theme instead of letting the
+            // cap chop the theme tail word-by-word.
+            $newTitle = null;
+            foreach (array_unique([$fixedTheme, 'مجلة العروض والتوفير', 'تخفيضات']) as $themeCandidate) {
+                $candidate = GatekeeperFacebookPostJob::applyTitleLengthCap($prefix.' | '.$themeCandidate, $retailerName);
+
+                if (mb_strlen($candidate) <= 65) {
+                    $newTitle = $candidate;
+
+                    break;
+                }
+
+                $newTitle = $candidate; // word-boundary-cut fallback
+            }
+
+            if ($newTitle === $title) {
+                continue;
+            }
+
+            $stats['repaired']++;
+            $changedFlyerIds[] = (int) $flyer->id;
+
+            if ($dryRun) {
+                $this->line("(تجريبي) #{$flyer->id}: «{$title}» → «{$newTitle}».");
+            } else {
+                $flyer->title = $newTitle;
+                $flyer->saveQuietly();
+                $this->info("تم إصلاح #{$flyer->id}: «{$newTitle}».");
+            }
+        }
+
+        if (! $dryRun && $stats['repaired'] > 0) {
+            // Titles are public content: sitemap image:title, <title> tags,
+            // and llms.txt all read the stored column.
+            Cache::forget('sitemap_xml_content');
+            Cache::forget('llms_txt_content');
+
+            $base = rtrim((string) config('app.url'), '/');
+            $allUrls = [$base.'/sitemap.xml'];
+
+            $published = Flyer::query()
+                ->with('retailer')
+                ->whereIn('id', $changedFlyerIds)
+                ->where('status', \App\Enums\FlyerStatus::Published->value)
+                ->get();
+
+            foreach ($published as $flyer) {
+                $allUrls[] = $base.route('flyers.show', ['slug' => (string) $flyer->slug], false);
+
+                if ($flyer->retailer !== null && (string) $flyer->retailer->slug !== '') {
+                    $allUrls[] = $base.route('retailers.show', ['retailer' => (string) $flyer->retailer->slug], false);
+                }
+            }
+
+            foreach (array_chunk(array_values(array_unique(array_filter($allUrls))), 30) as $index => $chunk) {
+                try {
+                    PurgeCloudflareCacheJob::dispatch($chunk);
+                } catch (Throwable $e) {
+                    Log::error('CleanFlyerItemsCommand: title-repair purge dispatch failed.', [
+                        'chunk' => $index,
+                        'error' => $e->getMessage(),
+                    ]);
+                }
+            }
+
+            Log::info('CleanFlyerItemsCommand: truncated titles repaired.', $stats);
+        }
+
+        $mode = $dryRun ? '(تجريبي — لم يُحفظ شيء)' : '';
+        $this->info("فحص {$stats['checked']} عنوان — إصلاح {$stats['repaired']} {$mode}");
 
         return self::SUCCESS;
     }

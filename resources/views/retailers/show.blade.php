@@ -2,9 +2,15 @@
     use App\Support\R2Url;
     $r2DiskUrl = R2Url::base();
     $logoUrl = $retailer->logo_path ? R2Url::asset($retailer->logo_path) : null;
-    // og:image resolved by the controller: latest active flyer's Discover
-    // composite (1280x720) → cover master → logo → site fallback.
+    // og:image resolved by the controller: LONGEST-LIVING active flyer's
+    // Discover composite (1280x720) → cover master → logo → site fallback.
     $ogImage = $ogImage ?? $logoUrl ?: url('/img/og-cover.png');
+    // The Discover composite is a native 1280x720 canvas — declare the exact
+    // dimensions so crawlers size the preview without fetching the image.
+    $ogImageIsDiscover = (bool) ($ogImageIsDiscover ?? false);
+    // Single Cairo "today" string — the ONLY date boundary used everywhere
+    // below (badges, card states) so a tz drift can never split states.
+    $cairoToday = \Carbon\Carbon::today('Africa/Cairo')->toDateString();
     // Canonical strictly from config('app.url') + relative route.
     // Paginated hubs (?page=2+) carry their OWN self-canonical with ?page=N
     // (noindex,follow robots is emitted below unchanged).
@@ -24,6 +30,7 @@
     $faqsList = $retailer->faqs_list;
     $effectiveLastmod = $retailer->effective_lastmod;
     $upcomingCount = (int) ($upcomingCount ?? 0);
+    $activeTodayCount = (int) ($activeTodayCount ?? $activeCount ?? 0);
 @endphp
 
 <x-layouts.app
@@ -32,6 +39,8 @@
     :og-title="$metaTitle"
     :og-description="$metaDesc"
     :og-image="$ogImage"
+    :og-image-width="$ogImageIsDiscover ? 1280 : null"
+    :og-image-height="$ogImageIsDiscover ? 720 : null"
     og-type="website"
     :robots="$robotsMeta"
     :canonical="$canonicalUrl"
@@ -172,7 +181,7 @@
                 <div class="mt-4 flex flex-wrap gap-2">
                     <span class="inline-flex items-center gap-1.5 rounded-full bg-[#039652]/10 px-3 py-1 text-xs font-bold text-[#027a42] border border-[#039652]/20">
                         <span class="h-2 w-2 rounded-full bg-[#039652]"></span>
-                        {{ \App\Support\ArabicDateHelper::pluralizeCount($activeCount, 'مجلة سارية اليوم', 'مجلتان ساريتان اليوم', 'مجلات سارية اليوم', 'مجلة سارية اليوم') }}
+                        {{ \App\Support\ArabicDateHelper::pluralizeCount($activeTodayCount, 'مجلة سارية اليوم', 'مجلتان ساريتان اليوم', 'مجلات سارية اليوم', 'مجلة سارية اليوم') }}
                     </span>
                     @if ($upcomingCount > 0)
                         <span class="inline-flex items-center gap-1.5 rounded-full bg-[#fcc023]/15 px-3 py-1 text-xs font-bold text-slate-900 border border-[#fcc023]/40">
@@ -221,11 +230,14 @@
                         $coverUrl = R2Url::cardThumb($coverPage);
                     @endphp
                     @php
-                            $today = \Carbon\Carbon::today('Africa/Cairo');
                             $from = \Carbon\Carbon::parse($flyer->valid_from, 'Africa/Cairo');
                             $until = \Carbon\Carbon::parse($flyer->valid_until, 'Africa/Cairo');
-                            $isFuture = $from->isFuture();
+                            // String-date comparison in Africa/Cairo: a flyer
+                            // starting TODAY is NEVER "future" — only one
+                            // strictly after today is.
+                            $isFuture = $from->toDateString() > $cairoToday;
                             $isPast = $flyer->isExpired();
+                            $isActiveToday = ! $isFuture && ! $isPast;
                         @endphp
                     <article class="group flex flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm transition hover:shadow-md">
                         <a href="{{ route('flyers.show', $flyer->slug) }}" class="relative aspect-[3/4] overflow-hidden bg-slate-100">
@@ -237,7 +249,7 @@
                             @else
                                 <span class="absolute right-2 top-2 rounded-lg bg-[#039652] px-2 py-1 text-[11px] font-bold text-white shadow">سارٍ حتى {{ $until->format('d/m') }}</span>
                             @endif
-                            <span class="absolute left-2 top-2 rounded-lg bg-slate-900/80 px-2 py-1 text-[11px] font-bold text-white backdrop-blur">{{ $flyer->pages_count ?? $flyer->total_pages }} صفحة</span>
+                            <span class="absolute left-2 top-2 rounded-lg bg-slate-900/80 px-2 py-1 text-[11px] font-bold text-white backdrop-blur">{{ \App\Support\ArabicDateHelper::pluralizeCount((int) ($flyer->pages_count ?? $flyer->total_pages), 'صفحة', 'صفحتان', 'صفحات', 'صفحة') }}</span>
                         </a>
                         <div class="flex flex-1 flex-col p-4">
                             <h3 class="line-clamp-2 text-sm font-bold text-[#023b55] group-hover:text-[#039652]">
@@ -249,7 +261,7 @@
                                     <span class="rounded bg-[#fcc023]/20 px-2 py-0.5 text-[10px] font-bold text-slate-900">يبدأ قريباً {{ $from->format('d/m') }}</span>
                                 @elseif ($isPast)
                                     <span class="rounded bg-slate-100 px-2 py-0.5 text-[10px] font-bold text-slate-500">منتهي</span>
-                                @else
+                                @elseif ($isActiveToday)
                                     <span class="rounded bg-[#039652]/10 px-2 py-0.5 font-bold text-[#027a42]">سارٍ الآن</span>
                                 @endif
                             </div>
@@ -285,7 +297,7 @@
                                     <a href="{{ route('flyers.show', $altFlyer->slug) }}" class="relative aspect-[3/4] overflow-hidden bg-slate-100">
                                         <img src="{{ $altCoverUrl }}" alt="{{ $altFlyer->title }}" width="400" height="533" @if ($loop->first) loading="eager" fetchpriority="high" decoding="async" @else loading="lazy" decoding="async" @endif class="h-full w-full object-cover transition duration-300 group-hover:scale-105">
                                         <span class="absolute right-2 top-2 rounded-lg bg-[#023b55]/90 px-2 py-1 text-[10px] font-bold text-white">{{ $altFlyer->retailer->name }}</span>
-                                        <span class="absolute left-2 top-2 rounded-lg bg-slate-900/80 px-2 py-1 text-[11px] font-bold text-white backdrop-blur">{{ $altFlyer->pages_count ?? $altFlyer->total_pages }} صفحة</span>
+                                        <span class="absolute left-2 top-2 rounded-lg bg-slate-900/80 px-2 py-1 text-[11px] font-bold text-white backdrop-blur">{{ \App\Support\ArabicDateHelper::pluralizeCount((int) ($altFlyer->pages_count ?? $altFlyer->total_pages), 'صفحة', 'صفحتان', 'صفحات', 'صفحة') }}</span>
                                     </a>
                                     <div class="flex flex-1 flex-col p-4">
                                         <h3 class="line-clamp-2 text-sm font-bold text-[#023b55] group-hover:text-[#039652]">
@@ -372,7 +384,7 @@
         <section class="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
             <div class="mb-4 flex items-center justify-between">
                 <h2 class="text-lg font-black text-[#023b55]">مجلات منتهية حديثاً — أرشيف أسعار {{ $retailer->name }} (آخر 30 يوم)</h2>
-                <span class="text-xs font-semibold text-slate-500">{{ $expiredFlyers->count() }} مجلة</span>
+                <span class="text-xs font-semibold text-slate-500">{{ \App\Support\ArabicDateHelper::pluralizeCount($expiredFlyers->count(), 'مجلة', 'مجلتان', 'مجلات', 'مجلة') }} للسجل السعري</span>
             </div>
             <p class="mb-4 text-xs text-slate-500">للمقارنة ومعرفة تاريخ الأسعار قبل الشراء.</p>
             <div class="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4">
@@ -404,6 +416,16 @@
                 <h2 class="text-lg font-black text-[#023b55] sm:text-xl">نبذة عن {{ $retailer->name }}</h2>
                 <div class="prose-sm mt-3 max-w-none text-sm leading-relaxed text-slate-700 [&_ol_li]:list-decimal [&_ol]:list-decimal [&_ul_li]:list-disc [&_ul]:list-disc [&_ul]:ps-5">
                     {!! $retailer->about_text !!}
+                </div>
+            @else
+                {{-- Smart fallback: an empty about_text must NEVER leave a
+                thin hub — this E-E-A-T card fills the gap right above the FAQ
+                (no empty whitespace between the archive and the FAQ). --}}
+                <div class="mb-10 rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
+                    <h2 class="text-lg font-black text-[#023b55] mb-2">عن عروض وفروع {{ $retailer->clean_name }} في مصر</h2>
+                    <p class="text-sm leading-relaxed text-slate-600">
+                        تعتبر سلسلة {{ $retailer->name }} من كبرى سلاسل التجزئة في جمهورية مصر العربية{{ $retailer->branches_count ? " بشبكة فروع تتجاوز {$retailer->branches_count} فرعاً" : "" }}. وتتميز بإصدار مجلات وتخفيضات دورية تغطي السلع الغذائية الأساسية والمنظفات والأجهزة المنزلية. نوثق في «مجلاتنا» كل مجلة فور صدورها رسمياً مع تفريغ آلي لأسعار وسعر الوحدة لكل سلعة لتسهيل المقارنة والتوفير الذكي.
+                    </p>
                 </div>
             @endif
 

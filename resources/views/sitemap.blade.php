@@ -25,14 +25,11 @@
     <!-- Canonical Retailer Hubs -->
     @foreach ($retailers as $retailer)
         @php
-            // lastmod = max(retailer.updated_at, latest PUBLISHED flyer
-            // updated_at). Both are 'Y-m-d H:i:s' strings, so a string max()
-            // is chronological-safe. A retailer with no published flyers
-            // falls back to its own updated_at ('' loses the max()).
-            $retailerLastmod = max(
-                (string) ($retailer->getRawOriginal('updated_at') ?? $retailer->updated_at),
-                (string) ($retailer->latest_flyer_updated_at ?? ''),
-            );
+            // lastmod from the Retailer::effective_lastmod accessor:
+            // max(retailer.updated_at, latest PUBLISHED flyer updated_at).
+            // A hub whose flyer was re-ingested an hour ago carries TODAY's
+            // lastmod — never a frozen historical date.
+            $retailerLastmod = $retailer->effective_lastmod;
         @endphp
         <url>
             <loc>{{ $baseUrl.route('retailers.show', ['retailer' => $retailer->slug], false) }}</loc>

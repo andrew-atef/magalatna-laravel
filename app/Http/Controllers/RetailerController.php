@@ -37,27 +37,29 @@ final class RetailerController extends Controller
             ->paginate(12, ['*'], 'page')
             ->withQueryString();
 
-        // EVERGREEN HUB accuracy split:
-        //  - activeTodayFlyers: valid_from <= today <= valid_until ("سارية الآن")
-        //  - upcomingFlyers: published BEFORE their start date ("تبدأ قريباً")
-        // A flyer starting tomorrow must never be counted as live today.
-        $activeTodayFlyers = $retailer->flyers()
+        // EVERGREEN HUB accuracy split — both boundaries evaluated in
+        // Africa/Cairo so a flyer printed "today" can NEVER be misfiled as
+        // upcoming (or vice versa):
+        //  - activeTodayCount: valid_from <= today <= valid_until ("سارية الآن")
+        //  - upcomingCount: published BEFORE their start date ("تبدأ قريباً")
+        // whereDate is REQUIRED for valid_from: the date cast persists
+        // DATETIME strings ('2026-11-17 00:00:00') but $cairoToday is a bare
+        // 'Y-m-d' — a raw string compare on SQLite reads "today 00:00:00"
+        // as GREATER than today (misclassifying every live-today flyer as
+        // upcoming). MySQL coerces, SQLite does not.
+        $activeTodayCount = $retailer->flyers()
             ->where('status', FlyerStatus::Published)
-            ->where('valid_from', '<=', $cairoToday)
+            ->whereDate('valid_from', '<=', $cairoToday)
             ->where('valid_until', '>=', $cairoToday)
-            ->orderByDesc('valid_from')
-            ->orderByDesc('id')
-            ->get(['id', 'slug', 'title', 'valid_from', 'valid_until', 'discover_image_path']);
+            ->count();
 
-        $upcomingFlyers = $retailer->flyers()
+        $upcomingCount = $retailer->flyers()
             ->where('status', FlyerStatus::Published)
-            ->where('valid_from', '>', $cairoToday)
-            ->orderBy('valid_from')
-            ->orderBy('id')
-            ->get(['id', 'slug', 'title', 'valid_from', 'valid_until']);
+            ->whereDate('valid_from', '>', $cairoToday)
+            ->where('valid_until', '>=', $cairoToday)
+            ->count();
 
-        $activeCount = $activeTodayFlyers->count();
-        $upcomingCount = $upcomingFlyers->count();
+        $activeCount = $activeTodayCount;
 
         // Recently expired flyers (last 30 days) for price history tab/section.
         //  - Status=Expired: manually expired flyers may still have
@@ -86,18 +88,41 @@ final class RetailerController extends Controller
             ->limit(6)
             ->get();
 
-        // GEO / AI-crawler item-level price highlights — DIVERSIFIED: up to 3
-        // live-today flyers contribute their top-4 discounted items EACH
-        // (max 15 rows total), then a round-robin across categories keeps the
-        // table from being 15 cooking-oil rows. Every item carries its OWN
-        // hydrated flyer (id/slug/title/valid_until) so deep links and the
+        // GEO / AI-crawler item-level price highlights — DIVERSIFIED: up to 4
+        // flyers contribute their top-4 discounted items EACH (max 16 rows
+        // total), then a round-robin across categories keeps the table from
+        // being 16 cooking-oil rows. Every item carries its OWN hydrated
+        // flyer (id/slug/title/valid_until) so deep links and the
         // "المجلة / العرض" column are always accurate. Skipped entirely when
         // no flyer is live today (gate runs BEFORE any query executes).
         $topRetailerItems = collect();
-        if ($activeCount > 0) {
+        if ($activeTodayCount > 0) {
+            // Eligible flyers: published + not yet expired, ACTIVE-TODAY
+            // flyers FIRST (CASE bucket), longest validity next — so the
+            // expiring-tomorrow weekly and the fresh weekly both feed the
+            // table instead of only the newest-started one. date() on the
+            // raw CASE too: bare 'Y-m-d' vs DATETIME strings misranks
+            // same-day flyers on SQLite (see activeTodayCount above).
+            $eligibleFlyerIds = $retailer->flyers()
+                ->where('status', FlyerStatus::Published)
+                ->where('valid_until', '>=', $cairoToday)
+                ->orderByRaw('CASE WHEN date(valid_from) <= ? THEN 0 ELSE 1 END ASC, valid_until DESC', [$cairoToday])
+                ->pluck('id');
+
             $merged = collect();
 
-            foreach ($activeTodayFlyers->take(3) as $dealFlyer) {
+            foreach ($eligibleFlyerIds->take(4) as $dealFlyerId) {
+                // A flyer that has not STARTED yet must never feed a table
+                // titled "السارية اليوم" — skip it (it sorts last anyway).
+                $dealFlyer = Flyer::query()
+                    ->where('id', $dealFlyerId)
+                    ->whereDate('valid_from', '<=', $cairoToday)
+                    ->first(['id', 'slug', 'title', 'valid_from', 'valid_until', 'discover_image_path']);
+
+                if ($dealFlyer === null) {
+                    continue;
+                }
+
                 $items = FlyerItem::query()
                     ->where('flyer_id', $dealFlyer->id)
                     ->where('sale_price', '>', 0)
@@ -112,13 +137,30 @@ final class RetailerController extends Controller
                 $merged = $merged->merge($items);
             }
 
-            $topRetailerItems = self::diversifyByCategory($merged, 15);
+            $topRetailerItems = self::diversifyByCategory($merged, 16);
         }
 
-        // og:image: the 1280x720 Google Discover composite of the LATEST
-        // active flyer wins (native 16:9 canvas), else its cover master,
-        // else the retailer logo, else the site fallback.
-        $ogImage = self::resolveHubOgImage($retailer, $activeTodayFlyers->first());
+        // og:image: the 1280x720 Google Discover composite of the ACTIVE
+        // (already live) flyer with the LONGEST remaining validity wins
+        // (native 16:9 canvas — the weekly that stays live the longest is
+        // the evergreen hub face), else its cover master, else the retailer
+        // logo, else the site fallback. A flyer that has not STARTED yet
+        // must never front a "عروض اليوم" hub. $ogImageIsDiscover lets the
+        // view declare the exact 1280x720 og:image dimensions.
+        $bestFlyer = $retailer->flyers()
+            ->where('status', FlyerStatus::Published)
+            ->where('valid_until', '>=', $cairoToday)
+            ->whereDate('valid_from', '<=', $cairoToday)
+            ->orderByDesc('valid_until')
+            ->orderByDesc('id')
+            ->first();
+
+        $ogImage = $bestFlyer?->discover_image_path
+            ? R2Url::asset($bestFlyer->discover_image_path)
+            : ($bestFlyer?->coverPage?->image_path
+                ? R2Url::asset($bestFlyer->coverPage->image_path)
+                : ($retailer->logo_path ? R2Url::asset($retailer->logo_path) : url('/img/og-cover.png')));
+        $ogImageIsDiscover = (bool) $bestFlyer?->discover_image_path;
 
         // SEO metadata: canonical = /{retailer:slug}; targeted Arabic title
         // kept inside Google's ~56-char pixel-safe window (the layout appends
@@ -167,14 +209,14 @@ final class RetailerController extends Controller
         $viewData = [
             'retailer' => $retailer,
             'activeFlyers' => $activeFlyers,
-            'activeTodayFlyers' => $activeTodayFlyers,
-            'upcomingFlyers' => $upcomingFlyers,
             'upcomingCount' => $upcomingCount,
             'expiredFlyers' => $expiredFlyers,
             'otherActiveFlyers' => $otherActiveFlyers,
             'activeCount' => $activeCount,
+            'activeTodayCount' => $activeTodayCount,
             'topRetailerItems' => $topRetailerItems,
             'ogImage' => $ogImage,
+            'ogImageIsDiscover' => $ogImageIsDiscover,
             'seoTitle' => $seoTitle,
             'seoDescription' => $seoDescription,
             'canonical' => $canonical,
@@ -242,29 +284,5 @@ final class RetailerController extends Controller
         }
 
         return $diversified->values();
-    }
-
-    /**
-     * Hub og:image: the 1280x720 Discover composite of the latest active
-     * flyer (exact 16:9 social canvas), else that flyer's cover master,
-     * else the retailer logo, else the site fallback.
-     */
-    private static function resolveHubOgImage(Retailer $retailer, ?Flyer $latestFlyer): string
-    {
-        if ($latestFlyer !== null) {
-            $discover = trim((string) ($latestFlyer->discover_image_path ?? ''));
-            if ($discover !== '') {
-                return R2Url::asset($discover);
-            }
-
-            $cover = $latestFlyer->coverPage()->first(['image_path']);
-            if ($cover !== null && trim((string) $cover->image_path) !== '') {
-                return R2Url::asset((string) $cover->image_path);
-            }
-        }
-
-        return $retailer->logo_path
-            ? R2Url::asset($retailer->logo_path)
-            : url('/img/og-cover.png');
     }
 }

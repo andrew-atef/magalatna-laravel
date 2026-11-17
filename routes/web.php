@@ -51,13 +51,10 @@ Route::get('/sitemap.xml', function () {
         $baseUrl = rtrim((string) config('app.url'), '/');
 
         $retailers = Retailer::where('is_active', true)
-            // Retailer-hub <lastmod> must MOVE when a new flyer publishes (or
-            // when the hub row itself is edited) — never frozen at the
-            // retailer's own updated_at. withMax computes the max
-            // updated_at of PUBLISHED flyers per retailer in ONE query.
-            // NOTE: withMax adds its own select, so ->get() must be plain
-            // (a column-restricted get() would clobber/drop the aggregate).
-            ->withMax(['flyers as latest_flyer_updated_at' => static fn ($q) => $q->where('status', FlyerStatus::Published)], 'updated_at')
+            // Retailer-hub <lastmod> comes from the Retailer::effective_lastmod
+            // accessor (max of the retailer row and its latest PUBLISHED
+            // flyer's updated_at) — it MOVES when a new flyer publishes or
+            // when the hub row itself is edited, never frozen.
             ->get();
 
         $activeFlyers = Flyer::where('status', FlyerStatus::Published)

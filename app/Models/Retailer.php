@@ -207,7 +207,14 @@ class Retailer extends Model
             return $this->updated_at ?? $this->created_at ?? Carbon::now('Africa/Cairo');
         }
 
-        $flyerCarbon = Carbon::parse((string) $latestFlyerUpdate, 'UTC');
+        // Raw DB datetime strings carry NO offset: they are written in the
+        // application timezone (Africa/Cairo) — parsing them as UTC would
+        // double-shift the instant (same rule as CairoTime::toIso8601).
+        $appTz = trim((string) config('app.timezone', 'Africa/Cairo'));
+        $flyerCarbon = Carbon::parse(
+            (string) $latestFlyerUpdate,
+            $appTz !== '' ? $appTz : 'Africa/Cairo',
+        );
         $retailerCarbon = $this->updated_at instanceof Carbon
             ? $this->updated_at
             : Carbon::parse((string) $this->updated_at, 'UTC');

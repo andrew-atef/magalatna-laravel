@@ -878,10 +878,32 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
             }
         }
 
+        return self::applyTitleLengthCap($title, $retailerName);
+    }
+
+    /**
+     * 65-char title cap with MINIMAL information loss, in order of
+     * preference:
+     *  1. Strip English parentheticals "(El Fergany)" from the retailer
+     *     name — Latin noise wastes ~12 chars that FULL Arabic words need
+     *     in SERPs/sitemap titles;
+     *  2. Only if still too long, cut at the LAST SPACE before the cap
+     *     (mb_strrpos) so Arabic words are never chopped mid-word
+     *     ("| مه", "| تخفيضا");
+     *  3. Trim dangling separators/whitespace left by the cut.
+     */
+    public static function applyTitleLengthCap(string $title, string $retailerName): string
+    {
+        if (mb_strlen($title) <= 65) {
+            return $title;
+        }
+
+        $latinlessName = trim((string) preg_replace('/\s*\([^()]*[A-Za-z][^()]*\)/u', '', $retailerName));
+        if ($latinlessName !== '' && $latinlessName !== $retailerName) {
+            $title = (string) str_replace($retailerName, $latinlessName, $title);
+        }
+
         if (mb_strlen($title) > 65) {
-            // Word-boundary truncation: cut at the LAST SPACE before the 65-char
-            // cap so Arabic words are never chopped mid-word ("| مه", "| تخفيضا"),
-            // then trim dangling separators/whitespace left by the cut.
             $title = mb_substr($title, 0, 65);
             $lastSpace = mb_strrpos($title, ' ');
             if ($lastSpace !== false && $lastSpace > 20) {
