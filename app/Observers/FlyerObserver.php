@@ -102,9 +102,14 @@ final class FlyerObserver
 
         $discoverPath = trim((string) ($flyer->discover_image_path ?? ''));
 
+        // The reel video is a flyer-owned R2 object too — flyer_reels rows
+        // cascade-delete, so the path MUST be captured here (deleting()).
+        $reelPath = trim((string) ($flyer->reel()->value('video_path') ?? ''));
+
         self::$pendingR2Paths[(int) $flyer->id] = $imagePaths
             ->merge($thumbPaths)
             ->when($discoverPath !== '', static fn ($collection) => $collection->push($discoverPath))
+            ->when($reelPath !== '', static fn ($collection) => $collection->push($reelPath))
             ->map(static fn (mixed $path): string => trim((string) $path))
             ->filter()
             ->unique()

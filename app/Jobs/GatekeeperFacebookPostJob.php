@@ -707,6 +707,15 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
                 'batch_id' => $batch->id,
                 'status' => $flyer->status->value,
             ]);
+
+            // === 7. Vertical Reel/Short auto-generation ===
+            // Dispatched ONLY for verified, priced items (the kill-switch
+            // above already returned otherwise) and after the audited save
+            // commits. Heavy ffmpeg/Gemini-TTS work lives in its own job so
+            // the batch callback stays O(fast).
+            if ((bool) config('services.reels.auto_generate', true)) {
+                GenerateFlyerReelJob::dispatch($flyer->id)->afterCommit();
+            }
         } catch (Throwable $e) {
             Log::error('Failed in batch then() for flyer.', [
                 'flyer_id' => $flyerId,

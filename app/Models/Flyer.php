@@ -118,6 +118,17 @@ class Flyer extends Model
     }
 
     /**
+     * Vertical Reel/Short video (one per flyer) — hasOne keeps history-free
+     * regeneration: the job always updates the single row in place.
+     *
+     * @return HasOne<FlyerReel, $this>
+     */
+    public function reel(): HasOne
+    {
+        return $this->hasOne(FlyerReel::class);
+    }
+
+    /**
      * Bulletproof Arabic Fallback Generator — يقبل أسماء البراندات اللاتينية
      * داخل نص عربي سليم، ويصلح HTML Entities وأخطاء عد الجمل العشرية.
      *

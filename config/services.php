@@ -38,6 +38,18 @@ return [
     'gemini' => [
         'key' => env('GEMINI_API_KEY'),
         'model' => env('GEMINI_MODEL', 'gemini-2.5-flash'),
+        // Audio synthesis (TTS) model — the generateContent endpoint requires
+        // a TTS-capable model for responseModalities: ["audio"].
+        'tts_model' => env('GEMINI_TTS_MODEL', 'gemini-2.5-flash-preview-tts'),
+    ],
+
+    // Vertical Reel/Short generation (Gemini TTS + low-memory ffmpeg + R2).
+    'reels' => [
+        'auto_generate' => env('REELS_AUTO_GENERATE', true),
+        'voice_name' => env('REELS_VOICE_NAME', 'Tavi'),
+        'ffmpeg_bin' => env('FFMPEG_BIN', 'ffmpeg'),
+        'ffprobe_bin' => env('FFPROBE_BIN', 'ffprobe'),
+        'temp_dir' => env('REELS_TEMP_DIR', sys_get_temp_dir()),
     ],
 
     'facebook_proxy' => [
