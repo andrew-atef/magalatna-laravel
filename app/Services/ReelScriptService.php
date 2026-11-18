@@ -24,7 +24,12 @@ final class ReelScriptService
 {
     private const MIN_WORDS = 45;
 
-    private const MAX_WORDS = 65;
+    /**
+     * Hard ceiling (≈35s of speech). Gemini is asked for 45–65 words, but
+     * slight overshoots used to throw and waste a perfectly good script —
+     * anything above this is trimmed at a sentence boundary instead.
+     */
+    private const MAX_WORDS = 90;
 
     private const TIMEOUT_SECONDS = 60;
 
@@ -44,7 +49,7 @@ final class ReelScriptService
         try {
             $script = $this->viaGemini($flyer, $items, $retailerName);
         } catch (Throwable $e) {
-            Log::warning('ReelScriptService: Gemini script failed, using deterministic fallback.', [
+            $this->warn('ReelScriptService: Gemini script failed, using deterministic fallback.', [
                 'flyer_id' => $flyer->id,
                 'error' => $e->getMessage(),
             ]);
@@ -59,7 +64,7 @@ final class ReelScriptService
         try {
             $caption = $this->viaGeminiCaption($flyer, $script, $retailerName);
         } catch (Throwable $e) {
-            Log::warning('ReelScriptService: Gemini caption failed, using deterministic fallback.', [
+            $this->warn('ReelScriptService: Gemini caption failed, using deterministic fallback.', [
                 'flyer_id' => $flyer->id,
                 'error' => $e->getMessage(),
             ]);
@@ -68,6 +73,21 @@ final class ReelScriptService
         }
 
         return ['script' => $script, 'caption' => $caption, 'source' => 'gemini'];
+    }
+
+    /**
+     * Logging must never break reel generation: a read-only or mis-owned
+     * log file should degrade to a silent skip, not abort the job.
+     *
+     * @param  array<string, mixed>  $context
+     */
+    private function warn(string $message, array $context): void
+    {
+        try {
+            Log::warning($message, $context);
+        } catch (Throwable) {
+            // Logging unavailable (permissions/disk full) — carry on.
+        }
     }
 
     /**
@@ -241,10 +261,16 @@ PROMPT;
             throw new RuntimeException('Gemini script is empty or not Arabic.');
         }
 
-        $wordCount = count(preg_split('/\s+/u', $text, -1, PREG_SPLIT_NO_EMPTY) ?: []);
+        $wordCount = self::wordCount($text);
 
-        if ($wordCount < self::MIN_WORDS || $wordCount > self::MAX_WORDS) {
-            throw new RuntimeException('Gemini script word count out of range: '.$wordCount);
+        if ($wordCount < self::MIN_WORDS) {
+            throw new RuntimeException('Gemini script too short: '.$wordCount.' words.');
+        }
+
+        // Slight overshoot is normal from an LLM — trim it at a sentence
+        // boundary instead of throwing away an otherwise usable script.
+        if ($wordCount > self::MAX_WORDS) {
+            $text = $this->trimToSentenceBudget($text, self::MAX_WORDS);
         }
 
         return $text;

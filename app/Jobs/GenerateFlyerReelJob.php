@@ -53,19 +53,19 @@ final class GenerateFlyerReelJob implements ShouldQueue
             ->find($this->flyerId);
 
         if ($flyer === null) {
-            Log::warning('GenerateFlyerReelJob: flyer not found, skipping.', ['flyer_id' => $this->flyerId]);
+            $this->logSafely('warning', 'GenerateFlyerReelJob: flyer not found, skipping.', ['flyer_id' => $this->flyerId]);
 
             return;
         }
 
         if ($flyer->items->isEmpty()) {
-            Log::warning('GenerateFlyerReelJob: flyer has no items, skipping.', ['flyer_id' => $flyer->id]);
+            $this->logSafely('warning', 'GenerateFlyerReelJob: flyer has no items, skipping.', ['flyer_id' => $flyer->id]);
 
             return;
         }
 
         if ($flyer->status !== FlyerStatus::Published) {
-            Log::info('GenerateFlyerReelJob: flyer is not published, skipping.', [
+            $this->logSafely('info', 'GenerateFlyerReelJob: flyer is not published, skipping.', [
                 'flyer_id' => $flyer->id,
                 'status' => $flyer->status->value,
             ]);
@@ -127,7 +127,7 @@ final class GenerateFlyerReelJob implements ShouldQueue
             // 5. Persist success BEFORE releasing the R2 path variable.
             $reel->markReady($r2Path, $durations['audio_duration'], $durations['video_duration']);
 
-            Log::info('GenerateFlyerReelJob: reel ready.', [
+            $this->logSafely('info', 'GenerateFlyerReelJob: reel ready.', [
                 'flyer_id' => $flyer->id,
                 'r2_path' => $r2Path,
                 'audio_duration' => $durations['audio_duration'],
@@ -138,7 +138,7 @@ final class GenerateFlyerReelJob implements ShouldQueue
         } catch (Throwable $e) {
             $reel->markFailed($e->getMessage());
 
-            Log::error('GenerateFlyerReelJob failed.', [
+            $this->logSafely('error', 'GenerateFlyerReelJob failed.', [
                 'flyer_id' => $flyer->id,
                 'attempt' => $this->attempts(),
                 'error' => $e->getMessage(),
@@ -188,7 +188,7 @@ final class GenerateFlyerReelJob implements ShouldQueue
                         break;
                     }
                 } catch (Throwable $e) {
-                    Log::warning('GenerateFlyerReelJob: page image fetch failed.', [
+                    $this->logSafely('warning', 'GenerateFlyerReelJob: page image fetch failed.', [
                         'flyer_id' => $flyer->id,
                         'path' => $path,
                         'error' => $e->getMessage(),
@@ -202,5 +202,20 @@ final class GenerateFlyerReelJob implements ShouldQueue
         }
 
         return $binaries;
+    }
+
+    /**
+     * Logging must never break the reel pipeline — a broken/read-only log
+     * file should degrade to a silent skip instead of masking the real work.
+     *
+     * @param  array<string, mixed>  $context
+     */
+    private function logSafely(string $level, string $message, array $context = []): void
+    {
+        try {
+            Log::log($level, $message, $context);
+        } catch (Throwable) {
+            // Logging unavailable (permissions/disk full) — carry on.
+        }
     }
 }

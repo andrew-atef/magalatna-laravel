@@ -121,9 +121,13 @@ class LowMemoryReelComposerService
                     throw $e;
                 }
 
-                Log::warning('ReelComposer: captioned render failed, retrying without burned-in captions.', [
-                    'error' => substr($e->getMessage(), 0, 400),
-                ]);
+                try {
+                    Log::warning('ReelComposer: captioned render failed, retrying without burned-in captions.', [
+                        'error' => substr($e->getMessage(), 0, 400),
+                    ]);
+                } catch (Throwable) {
+                    // Logging must never block the graceful fallback.
+                }
 
                 $this->runFfmpeg($foregroundPaths, $audioPath, $outputPath, $totalDuration, null);
             }

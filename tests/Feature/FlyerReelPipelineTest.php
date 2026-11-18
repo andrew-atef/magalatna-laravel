@@ -14,6 +14,7 @@ use App\Services\GeminiAudioService;
 use App\Services\LowMemoryReelComposerService;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 use Tests\TestCase;
 
@@ -294,7 +295,7 @@ final class FlyerReelPipelineTest extends TestCase
         $this->assertMatchesRegularExpression('/العرض (ليوم واحد بس|لمدة \d+ أيام) والكمية بتطير!/u', $spoken);
         $this->assertStringEndsWith('شوف باقي الأسعار والمجلات على منصة مجلاتنا.. الرابط في أول كومنت والبايو.', $spoken);
         $this->assertSame(1, substr_count($spoken, 'الرابط في أول كومنت'), 'The CTA must not be duplicated.');
-        $this->assertLessThanOrEqual(65, count(preg_split('/\s+/u', $spoken, -1, PREG_SPLIT_NO_EMPTY) ?: []));
+        $this->assertLessThanOrEqual(90, count(preg_split('/\s+/u', $spoken, -1, PREG_SPLIT_NO_EMPTY) ?: []));
 
         // Captions burn in exactly the spoken text.
         $this->assertSame(mb_strlen($spoken), $composer->lastCall['captions_chars']);
@@ -312,6 +313,57 @@ final class FlyerReelPipelineTest extends TestCase
         });
 
         $this->assertSame("## Transcript:\n".$spoken, $ttsText);
+    }
+
+    public function test_overlong_gemini_script_is_trimmed_not_discarded(): void
+    {
+        $flyer = $this->seedFlyer();
+        $composer = $this->fakeComposer();
+
+        // ~100 words: over the hard ceiling, must be trimmed at a sentence
+        // boundary — NOT thrown away in favour of the robotic fallback.
+        $this->fakeGemini(
+            'عروض كازيون الجديدة وصلت النهارده وفيها توفير تقيل على كل حاجة محتاجها في البيت، من الزيت والمكرونة للسكر والشاي والمساحيق. '
+            .'زيت عافية بـ 219 جنيه بدل 244، ومكرونة رومي بـ 12.5 بس بدل 16، وسكر بـ 41.95 جنيه، وكمان شاي العروسة عليه خصم جامد جدًا. '
+            .'العروض دي متوفرة في كل فروع كازيون على مستوى الجمهورية، والكميات محدودة جدًا وممكن تخلص في نفس اليوم. '
+            .'كل الأسعار اللي شوفتها دي موجودة بالتفصيل في مجلة العروض الجديدة اللي نزلت النهارده الصبح على موقعنا.');
+
+        $this->artisan('flyers:generate-reel', ['flyer_id' => $flyer->id])->assertSuccessful();
+
+        $reel = FlyerReel::query()->where('flyer_id', $flyer->id)->firstOrFail();
+        $spoken = (string) $reel->script_text;
+
+        // Gemini's copy survived (not the numbered fallback script).
+        $this->assertStringContainsString('زيت عافية', $spoken);
+        $this->assertStringNotContainsString('رقم 1:', $spoken);
+        $this->assertLessThanOrEqual(90, count(preg_split('/\s+/u', $spoken, -1, PREG_SPLIT_NO_EMPTY) ?: []));
+
+        // …and the enforced closing CTA is still intact.
+        $this->assertStringContainsString('والكمية بتطير!', $spoken);
+        $this->assertStringEndsWith('الرابط في أول كومنت والبايو.', $spoken);
+        $this->assertSame(mb_strlen($spoken), $composer->lastCall['captions_chars']);
+    }
+
+    public function test_broken_log_file_never_breaks_reel_generation(): void
+    {
+        $flyer = $this->seedFlyer();
+        $this->fakeComposer();
+        $this->fakeGemini();
+
+        // The VPS scenario: storage/logs is not writable → every Log call
+        // throws. The pipeline must still finish successfully.
+        Log::shouldReceive('log')->andThrow(new \UnexpectedValueException('Failed to open stream: Permission denied'));
+        Log::shouldReceive('warning')->andThrow(new \UnexpectedValueException('Failed to open stream: Permission denied'));
+        Log::shouldReceive('info')->andThrow(new \UnexpectedValueException('Failed to open stream: Permission denied'));
+        Log::shouldReceive('error')->andThrow(new \UnexpectedValueException('Failed to open stream: Permission denied'));
+
+        $exitCode = $this->artisan('flyers:generate-reel', ['flyer_id' => $flyer->id])->run();
+
+        $reel = FlyerReel::query()->where('flyer_id', $flyer->id)->firstOrFail();
+
+        $this->assertSame(0, $exitCode, 'Reel error: '.$reel->error_message);
+        $this->assertSame(FlyerReel::STATUS_READY, $reel->status);
+        $this->assertNotNull($reel->caption);
     }
 
     public function test_captions_are_synced_and_end_with_a_big_cta_card(): void

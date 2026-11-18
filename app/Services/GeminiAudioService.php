@@ -141,11 +141,15 @@ final class GeminiAudioService
                 throw new RuntimeException('Failed to write temporary audio file: '.$audioPath);
             }
 
-            Log::info('GeminiAudioService: voiceover synthesized.', [
-                'voice' => $voiceName,
-                'bytes' => strlen($binary),
-                'path' => $audioPath,
-            ]);
+            try {
+                Log::info('GeminiAudioService: voiceover synthesized.', [
+                    'voice' => $voiceName,
+                    'bytes' => strlen($binary),
+                    'path' => $audioPath,
+                ]);
+            } catch (Throwable) {
+                // A broken log file must never discard a synthesized voiceover.
+            }
 
             return ['path' => $audioPath, 'bytes' => strlen($binary)];
         } catch (RuntimeException $e) {

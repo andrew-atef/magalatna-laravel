@@ -52,10 +52,14 @@ final class GenerateFlyerReelCommand extends Command
         } catch (Throwable $e) {
             $this->error('فشل توليد الريل: '.$e->getMessage());
 
-            Log::error('GenerateFlyerReelCommand failed.', [
-                'flyer_id' => $flyerId,
-                'error' => $e->getMessage(),
-            ]);
+            try {
+                Log::error('GenerateFlyerReelCommand failed.', [
+                    'flyer_id' => $flyerId,
+                    'error' => $e->getMessage(),
+                ]);
+            } catch (Throwable) {
+                // A broken log file must not mask the real failure above.
+            }
 
             return self::FAILURE;
         }
