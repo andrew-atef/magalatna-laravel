@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services;
 
+use Illuminate\Support\Facades\Log;
 use Symfony\Component\Process\Process;
 use Throwable;
 
@@ -30,18 +31,18 @@ class LowMemoryReelComposerService
 
     private const HEIGHT = 1280;
 
-    /** Foreground crisp layer max box (inside 720x1280 with breathing room). */
-    private const FG_MAX_WIDTH = 560;
+    /** Foreground crisp layer max box — fills most of the 720x1280 frame. */
+    private const FG_MAX_WIDTH = 680;
 
-    private const FG_MAX_HEIGHT = 1040;
+    private const FG_MAX_HEIGHT = 1150;
 
     private const CORNER_RADIUS = 28;
 
-    private const SHADOW_OFFSET_X = 8;
+    private const SHADOW_OFFSET_X = 6;
 
-    private const SHADOW_OFFSET_Y = 10;
+    private const SHADOW_OFFSET_Y = 8;
 
-    private const CANVAS_PADDING = 22;
+    private const CANVAS_PADDING = 18;
 
     private const TRAIL_SECONDS = 2.5;
 
@@ -49,15 +50,37 @@ class LowMemoryReelComposerService
 
     private const ENCODE_TIMEOUT_SECONDS = 270;
 
+    /** Burned-in caption styling (ASS, PlayRes 720x1280). */
+    private const CAPTION_FONT_SIZE = 54;
+
+    private const CAPTION_OUTLINE = 4;
+
+    private const CAPTION_SHADOW = 2;
+
+    private const CAPTION_MARGIN_V = 150;
+
+    private const CAPTION_MARGIN_H = 36;
+
+    private const CAPTION_MAX_WORDS = 5;
+
+    /** End-card styling: last 2.5s, big centered CTA, fades in. */
+    private const END_CARD_FONT_SIZE = 62;
+
+    private const END_CARD_MAX_WORDS = 28;
+
+    private const END_CARD_FADE_MS = 300;
+
     /**
      * @param  list<string>  $pageImageBinaries  Raw image bytes, priority order (cover first).
      * @param  string  $audioPath  Temporary voiceover file (wav/mp3).
      * @param  string  $outputPath  Temporary MP4 output path (caller unlinks it).
+     * @param  string  $captionsText  Optional script text burned in as big
+     *   white bold captions timed across the voiceover (ASS subtitles).
      * @return array{audio_duration: float, video_duration: float}
      *
      * @throws \RuntimeException
      */
-    public function compose(array $pageImageBinaries, string $audioPath, string $outputPath): array
+    public function compose(array $pageImageBinaries, string $audioPath, string $outputPath, string $captionsText = ''): array
     {
         if ($pageImageBinaries === []) {
             throw new \RuntimeException('Compose requires at least one flyer page image.');
@@ -78,13 +101,32 @@ class LowMemoryReelComposerService
 
         $ulid = uniqid('reelfg_', false);
         $foregroundPaths = [];
+        $captionsPath = $tempDir.'/'.$ulid.'_captions.ass';
 
         try {
             foreach (array_slice($pageImageBinaries, 0, self::MAX_PAGES) as $index => $binary) {
                 $foregroundPaths[] = $this->prepareForeground($binary, $tempDir.'/'.$ulid.'_'.$index.'.png');
             }
 
-            $this->runFfmpeg($foregroundPaths, $audioPath, $outputPath, $totalDuration);
+            $assFile = trim($captionsText) !== ''
+                ? $this->writeCaptionsAss($captionsText, $audioDuration, $totalDuration, $captionsPath)
+                : null;
+
+            try {
+                $this->runFfmpeg($foregroundPaths, $audioPath, $outputPath, $totalDuration, $assFile);
+            } catch (\RuntimeException $e) {
+                // libass/ASS filter unavailable or font missing on this box —
+                // the reel is still worth shipping: retry WITHOUT captions.
+                if ($assFile === null) {
+                    throw $e;
+                }
+
+                Log::warning('ReelComposer: captioned render failed, retrying without burned-in captions.', [
+                    'error' => substr($e->getMessage(), 0, 400),
+                ]);
+
+                $this->runFfmpeg($foregroundPaths, $audioPath, $outputPath, $totalDuration, null);
+            }
 
             if (! is_file($outputPath) || filesize($outputPath) === 0) {
                 throw new \RuntimeException('ffmpeg produced no output video.');
@@ -96,6 +138,7 @@ class LowMemoryReelComposerService
             foreach ($foregroundPaths as $path) {
                 @unlink($path);
             }
+            @unlink($captionsPath);
         }
     }
 
@@ -128,11 +171,14 @@ class LowMemoryReelComposerService
     /**
      * Single-pass ffmpeg render. Filter graph:
      *   per page: split → [fill+crop+boxblur+darken (bg)] overlay [crisp fg] → segment
-     *   all segments → concat → time-animated slow zoom/pan crop → 720x1280
+     *   all segments → concat → time-animated slow zoom/pan crop → ASS captions → 720x1280
+     *
+     * The Process runs with cwd = temp dir so the ASS filter can reference
+     * the captions file by bare relative filename (no path-escaping traps).
      *
      * @param  list<string>  $foregroundPaths
      */
-    private function runFfmpeg(array $foregroundPaths, string $audioPath, string $outputPath, float $totalDuration): void
+    private function runFfmpeg(array $foregroundPaths, string $audioPath, string $outputPath, float $totalDuration, ?string $assFile): void
     {
         $bin = (string) config('services.reels.ffmpeg_bin', 'ffmpeg');
         $count = count($foregroundPaths);
@@ -169,9 +215,22 @@ class LowMemoryReelComposerService
 
         // Subtle slow zoom + pan: crop 93% of the frame and drift toward the
         // bottom-right corner across the WHOLE duration, then restore size.
-        $filters[] = '[vc]crop='.(self::WIDTH - 48).':'.(self::HEIGHT - 64)
+        $tailChain = '[vc]crop='.(self::WIDTH - 48).':'.(self::HEIGHT - 64)
             .":x='(iw-ow)*t/{$totalDuration}':y='(ih-oh)*t/{$totalDuration}'"
-            .',scale='.self::WIDTH.':'.self::HEIGHT.',setsar=1,format=yuv420p[vout]';
+            .',scale='.self::WIDTH.':'.self::HEIGHT.',setsar=1';
+
+        if ($assFile !== null) {
+            // Note: NO fontsdir option — several libass builds mis-parse it
+            // and kill the whole track. libass resolves Fontname through the
+            // system font provider instead (fontconfig on Linux VPS,
+            // directwrite on Windows), so install the Arabic font system-wide
+            // (e.g. `apt install fonts-noto-core`) and set REELS_CAPTION_FONT_NAME.
+            $tailChain .= ',ass='.basename($assFile);
+        }
+
+        $tailChain .= ',format=yuv420p[vout]';
+
+        $filters[] = $tailChain;
 
         $args[] = '-filter_complex';
         $args[] = implode(';', $filters);
@@ -196,12 +255,164 @@ class LowMemoryReelComposerService
             $outputPath,
         ]);
 
-        $process = new Process($args, timeout: self::ENCODE_TIMEOUT_SECONDS);
+        $process = new Process($args, cwd: dirname($outputPath), timeout: self::ENCODE_TIMEOUT_SECONDS);
         $process->run();
 
         if (! $process->isSuccessful()) {
-            throw new \RuntimeException('ffmpeg render failed: '.substr($process->getErrorOutput(), 0, 800));
+            throw new \RuntimeException('ffmpeg render failed: '.substr($process->getErrorOutput(), 0, 1500));
         }
+    }
+
+    /**
+     * Writes an .ass subtitle file that syncs the script to the voiceover.
+     *
+     * Timing has no word-level timestamps available, so each caption chunk
+     * is allotted a slice of the audio duration PROPORTIONAL TO ITS WORD
+     * COUNT — the standard karaoke-free approximation for TTS narration.
+     *
+     * Style: big white bold text, heavy black outline + soft shadow,
+     * bottom-center (below the flyer frame), Arabic-safe encoding=1.
+     */
+    private function writeCaptionsAss(string $scriptText, float $audioDuration, float $totalDuration, string $path): string
+    {
+        $segments = $this->buildCaptionSegments($scriptText);
+
+        if ($segments === []) {
+            throw new \RuntimeException('Caption text produced no segments.');
+        }
+
+        $fontName = trim((string) config('services.reels.caption_font_name', 'DejaVu Sans'));
+        $fontSize = max(24, (int) config('services.reels.caption_font_size', self::CAPTION_FONT_SIZE));
+        $endCardSize = max(28, (int) config('services.reels.endcard_font_size', self::END_CARD_FONT_SIZE));
+
+        // Total speech weight (words) → per-segment proportional time slice.
+        $weights = array_map(static fn (string $s): int => count(preg_split('/\s+/u', $s, -1, PREG_SPLIT_NO_EMPTY) ?: []), $segments);
+        $totalWeight = array_sum($weights) ?: 1;
+
+        $events = '';
+        $cursor = 0.0;
+
+        foreach ($segments as $index => $text) {
+            $duration = ($weights[$index] / $totalWeight) * $audioDuration;
+            $start = $cursor;
+            $cursor = min($audioDuration, $cursor + $duration);
+
+            $events .= 'Dialogue: 0,'.self::assTime($start).','.self::assTime($cursor).',Caption,,0,0,0,,'.self::assEscape($text)."\n";
+        }
+
+        // END CARD: while the voiceover is over (the 2.5s tail) the CTA is
+        // shown big and centered, so viewers read where to find the prices.
+        $endCard = $this->buildEndCardText($scriptText);
+
+        if ($endCard !== '' && $totalDuration > $audioDuration) {
+            $events .= 'Dialogue: 0,'.self::assTime($audioDuration).','.self::assTime($totalDuration)
+                .',EndCard,,0,0,0,,{\\fad('.self::END_CARD_FADE_MS.',0)}'.self::assEscape($endCard)."\n";
+        }
+
+        $ass = "[Script Info]\n"
+            ."; Auto-generated by LowMemoryReelComposerService\n"
+            ."ScriptType: v4.00+\n"
+            ."PlayResX: ".self::WIDTH."\n"
+            ."PlayResY: ".self::HEIGHT."\n"
+            ."WrapStyle: 0\n"
+            ."ScaledBorderAndShadow: yes\n\n"
+            ."[V4+ Styles]\n"
+            ."Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
+            ."Style: Caption,".$fontName.",".$fontSize
+            .",&H00FFFFFF,&H00FFFFFF,&H00000000,&H96000000"   // white text, black outline, soft shadow
+            .",1,0,0,0,100,100,0,0,1,".self::CAPTION_OUTLINE.",".self::CAPTION_SHADOW
+            .",2,".self::CAPTION_MARGIN_H.",".self::CAPTION_MARGIN_H.",".self::CAPTION_MARGIN_V.",1\n"
+            ."Style: EndCard,".$fontName.",".$endCardSize
+            .",&H00FFFFFF,&H00FFFFFF,&H00000000,&H96000000"
+            .",1,0,0,0,100,100,0,0,1,5,2"
+            .",5,".self::CAPTION_MARGIN_H.",".self::CAPTION_MARGIN_H.",0,1\n\n"
+            ."[Events]\n"
+            ."Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+            .$events;
+
+        if (file_put_contents($path, $ass) === false || filesize($path) === 0) {
+            throw new \RuntimeException('Failed to write ASS captions file: '.$path);
+        }
+
+        return $path;
+    }
+
+    /**
+     * End card copy: the script's last sentences (the closing hook +
+     * "شوف باقي الأسعار… الرابط في أول كومنت والبايو"), capped so it always
+     * fits the frame at END_CARD_FONT_SIZE.
+     */
+    private function buildEndCardText(string $scriptText): string
+    {
+        $text = trim((string) preg_replace('/\s+/u', ' ', $scriptText));
+
+        if ($text === '') {
+            return '';
+        }
+
+        $sentences = array_values(array_filter(array_map(
+            'trim',
+            preg_split('/(?<=[.!؟])\s+/u', $text) ?: [$text]
+        ), static fn (string $s): bool => $s !== ''));
+
+        $closing = implode(' ', array_slice($sentences === [] ? [$text] : $sentences, -3));
+        $words = preg_split('/\s+/u', $closing, -1, PREG_SPLIT_NO_EMPTY) ?: [];
+
+        if (count($words) > self::END_CARD_MAX_WORDS) {
+            $words = array_slice($words, -self::END_CARD_MAX_WORDS);
+        }
+
+        return trim(implode(' ', $words));
+    }
+
+    /**
+     * Split the script into readable caption chunks: sentence boundaries
+     * first, then groups of ≤ CAPTION_MAX_WORDS.
+     *
+     * @return list<string>
+     */
+    private function buildCaptionSegments(string $text): array
+    {
+        $text = trim((string) preg_replace('/\s+/u', ' ', $text));
+
+        if ($text === '') {
+            return [];
+        }
+
+        $sentences = preg_split('/(?<=[.!؟])\s+/u', $text) ?: [$text];
+        $segments = [];
+
+        foreach ($sentences as $sentence) {
+            $words = preg_split('/\s+/u', trim($sentence), -1, PREG_SPLIT_NO_EMPTY) ?: [];
+
+            foreach (array_chunk($words, self::CAPTION_MAX_WORDS) as $chunk) {
+                $segments[] = implode(' ', $chunk);
+            }
+        }
+
+        return array_values(array_filter(array_map('trim', $segments)));
+    }
+
+    /**
+     * ASS timestamp: H:MM:SS.cc (centiseconds).
+     */
+    private static function assTime(float $seconds): string
+    {
+        $seconds = max(0.0, $seconds);
+        $h = (int) floor($seconds / 3600);
+        $m = (int) floor(($seconds % 3600) / 60);
+        $s = fmod($seconds, 60);
+
+        return sprintf('%d:%02d:%05.2f', $h, $m, $s);
+    }
+
+    /**
+     * ASS Dialogue text field: braces are override tags and line breaks
+     * would end the event — flatten both.
+     */
+    private static function assEscape(string $text): string
+    {
+        return str_replace(['{', '}', "\r", "\n"], ['(', ')', '', ' '], trim($text));
     }
 
     /**

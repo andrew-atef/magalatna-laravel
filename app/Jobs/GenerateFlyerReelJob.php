@@ -86,15 +86,18 @@ final class GenerateFlyerReelJob implements ShouldQueue
         $videoPath = null;
 
         try {
-            // 1. Script — natural Egyptian radio-ad copy.
+            // 1. Script + TikTok caption — natural Egyptian radio-ad copy.
             $script = $scriptService->generate($flyer);
-            $reel->forceFill(['script_text' => $script['script']])->saveQuietly();
+            $reel->forceFill([
+                'script_text' => $script['script'],
+                'caption' => $script['caption'],
+            ])->saveQuietly();
 
             // 2. Voiceover — Gemini Audio synthesis (voice "Tavi").
             $audio = $audioService->synthesize($script['script'], $reel->voice_name);
             $audioPath = $audio['path'];
 
-            // 3. Render — 720x1280, threads=1, veryfast.
+            // 3. Render — 720x1280, threads=1, veryfast, burned-in captions.
             $pageBinaries = $this->pageBinaries($flyer);
             $tempDir = rtrim((string) config('services.reels.temp_dir', sys_get_temp_dir()), '/\\');
             if (! is_dir($tempDir)) {
@@ -102,7 +105,7 @@ final class GenerateFlyerReelJob implements ShouldQueue
             }
             $videoPath = $tempDir.'/reel_'.(string) Str::ulid().'.mp4';
 
-            $durations = $composer->compose($pageBinaries, $audioPath, $videoPath);
+            $durations = $composer->compose($pageBinaries, $audioPath, $videoPath, $script['script']);
 
             // 4. Upload to R2 with a NEW ulid per attempt — immutable objects.
             $r2Path = 'flyers/'.$flyer->id.'/reels/reel_'.(string) Str::ulid().'.mp4';

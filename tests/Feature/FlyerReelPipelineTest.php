@@ -108,7 +108,7 @@ final class FlyerReelPipelineTest extends TestCase
         {
             public ?array $lastCall = null;
 
-            public function compose(array $pageImageBinaries, string $audioPath, string $outputPath): array
+            public function compose(array $pageImageBinaries, string $audioPath, string $outputPath, string $captionsText = ''): array
             {
                 if (! is_file($audioPath)) {
                     throw new \RuntimeException('composer double received a missing audio path');
@@ -118,6 +118,7 @@ final class FlyerReelPipelineTest extends TestCase
                     'pages' => count($pageImageBinaries),
                     'audio_bytes' => filesize($audioPath),
                     'output' => $outputPath,
+                    'captions_chars' => mb_strlen(trim($captionsText)),
                 ];
 
                 file_put_contents($outputPath, 'FAKE_MP4_BYTES');
@@ -131,23 +132,28 @@ final class FlyerReelPipelineTest extends TestCase
         return $composer;
     }
 
-    private function fakeGemini(): void
+    private function fakeGemini(?string $scriptOverride = null): void
     {
-        $script = 'عرض عرض اليوم الواحد من كازيون نزل رسمي النهارده، وفيه توفير تقيل! زيت عافية بـ 219 جنيه بدل 244، بتوفير 25 جنيه في الباكت. '
+        $script = $scriptOverride ?? ('عرض عرض اليوم الواحد من كازيون نزل رسمي النهارده، وفيه توفير تقيل! زيت عافية بـ 219 جنيه بدل 244، بتوفير 25 جنيه في الباكت. '
             .'مكرونة رومي بـ 12.5 بس بدل 16، بتوفير 3.5 جنيه. سكر بـ 41.95 بس. '
-            .'العرض ليوم واحد بس والكمية بتطير! شوف باقي الأسعار والمجلات على منصة مجلاتنا.. الرابط في أول كومنت والبايو.';
+            .'العرض ليوم واحد بس والكمية بتطير! شوف باقي الأسعار والمجلات على منصة مجلاتنا.. الرابط في أول كومنت والبايو.');
 
-        Http::fake([
-            // Script generation (default gemini model)
-            '*/models/gemini-2.5-flash:generateContent' => Http::response([
-                'candidates' => [
-                    ['content' => ['parts' => [['text' => $script]]]],
-                ],
-            ], 200),
+        $caption = "عرض كازيون النهارده توفير تقيل بجد\n"
+            ."كل الأسعار كاملة على منصة مجلاتنا — الرابط في أول كومنت والبايو 👇\n"
+            .'#عروض_مصر #عروض_اليوم #مجلاتنا #كازيون';
+
+        Http::fake(function ($request) use ($script, $caption) {
+            $url = (string) $request->url();
+
+            // Laravel JSON-encodes request bodies with escaped Unicode, so
+            // Arabic markers must be matched on the DECODED payload.
+            $decoded = json_decode($request->body() ?: '[]', true);
+            $promptText = is_array($decoded) ? (string) ($decoded['contents'][0]['parts'][0]['text'] ?? '') : '';
+
             // TTS synthesis (streaming — audio split across 2 chunks to prove
             // the concatenation logic; "Tavi" voice, temperature 1). The
             // mimeType is the REAL Gemini TTS payload: raw PCM, headerless.
-            '*/models/gemini-3.8-flash-tts:streamGenerateContent' => (static function () {
+            if (str_contains($url, 'gemini-3.8-flash-tts:streamGenerateContent')) {
                 // One continuous base64 stream, split mid-payload exactly like
                 // real streamGenerateContent chunks (padding only at the end).
                 $full = base64_encode(self::FAKE_WAV);
@@ -169,8 +175,24 @@ final class FlyerReelPipelineTest extends TestCase
                         ],
                     ],
                 ], 200);
-            })(),
-        ]);
+            }
+
+            // TikTok caption call (prompt carries the hashtag instructions).
+            if (str_contains($promptText, 'هاشتاج')) {
+                return Http::response([
+                    'candidates' => [
+                        ['content' => ['parts' => [['text' => $caption]]]],
+                    ],
+                ], 200);
+            }
+
+            // Script generation (default gemini model)
+            return Http::response([
+                'candidates' => [
+                    ['content' => ['parts' => [['text' => $script]]]],
+                ],
+            ], 200);
+        });
     }
 
     public function test_full_pipeline_generates_ready_reel_and_cleans_temp_files(): void
@@ -198,15 +220,24 @@ final class FlyerReelPipelineTest extends TestCase
         $this->assertStringContainsString('219', $reel->script_text);
         $this->assertStringContainsString('مجلاتنا', $reel->script_text);
 
+        // TikTok caption generated alongside the video (hook + CTA + hashtags).
+        $this->assertNotNull($reel->caption);
+        $this->assertStringContainsString('مجلاتنا', $reel->caption);
+        $this->assertStringContainsString('#عروض_مصر', $reel->caption);
+        $this->assertStringContainsString('#كازيون', $reel->caption);
+
         // Video stored on R2 under flyers/{id}/reels/reel_{ulid}.mp4.
         $this->assertMatchesRegularExpression('#^flyers/'.$flyer->id.'/reels/reel_[A-Z0-9]+\.mp4$#', (string) $reel->video_path);
         $this->assertTrue(Storage::disk('r2')->exists((string) $reel->video_path));
         $this->assertSame('FAKE_MP4_BYTES', Storage::disk('r2')->get((string) $reel->video_path));
 
         // Composer got BOTH page images and the synthesized audio
-        // (PCM payload + 44-byte RIFF/WAVE header).
+        // (PCM payload + 44-byte RIFF/WAVE header), plus the full script
+        // for burned-in captions.
         $this->assertSame(2, $composer->lastCall['pages']);
         $this->assertSame(strlen(self::FAKE_WAV) + 44, $composer->lastCall['audio_bytes']);
+        $this->assertGreaterThan(0, $composer->lastCall['captions_chars']);
+        $this->assertSame(mb_strlen($reel->script_text), $composer->lastCall['captions_chars']);
 
         // Temp files are 100% cleaned up (audio + video).
         $tempDir = (string) config('services.reels.temp_dir');
@@ -239,6 +270,95 @@ final class FlyerReelPipelineTest extends TestCase
         // Raw PCM is wrapped in a 44-byte RIFF/WAVE header before disk.
         $this->assertSame(strlen(self::FAKE_WAV) + 44, $composer->lastCall['audio_bytes'],
             'Streamed PCM chunks must concatenate and containerize into a full WAV.');
+    }
+
+    public function test_voiceover_always_speaks_the_closing_cta_even_if_gemini_forgets_it(): void
+    {
+        $flyer = $this->seedFlyer();
+        $composer = $this->fakeComposer();
+
+        // Gemini "forgets" the closing CTA — it must be enforced anyway,
+        // because the voiceover is synthesized from this exact script.
+        // (57 words: valid for the 45–65 gate, but no urgency/CTA ending.)
+        $this->fakeGemini('عرض كازيون نزل النهارده وفيه توفير تقيل جوه المجلة الجديدة! '
+            .'زيت عافية بـ 219 جنيه بدل 244، بتوفير 25 جنيه في الباكت، ومكرونة رومي بـ 12.5 بس بدل 16 يعني توفير 3.5 جنيه. '
+            .'سكر برضه بـ 41.95 بس، والأسعار كلها نزلت النهارده بمناسبة العرض. '
+            .'الجودة عالية والكميات محدودة، فلو عايز توفر في مشتريات البيت يبقى ده وقتك.');
+
+        $this->artisan('flyers:generate-reel', ['flyer_id' => $flyer->id])->assertSuccessful();
+
+        $reel = FlyerReel::query()->where('flyer_id', $flyer->id)->firstOrFail();
+        $spoken = (string) $reel->script_text;
+
+        // The two mandatory closing beats: urgency + where to find the rest.
+        $this->assertMatchesRegularExpression('/العرض (ليوم واحد بس|لمدة \d+ أيام) والكمية بتطير!/u', $spoken);
+        $this->assertStringEndsWith('شوف باقي الأسعار والمجلات على منصة مجلاتنا.. الرابط في أول كومنت والبايو.', $spoken);
+        $this->assertSame(1, substr_count($spoken, 'الرابط في أول كومنت'), 'The CTA must not be duplicated.');
+        $this->assertLessThanOrEqual(65, count(preg_split('/\s+/u', $spoken, -1, PREG_SPLIT_NO_EMPTY) ?: []));
+
+        // Captions burn in exactly the spoken text.
+        $this->assertSame(mb_strlen($spoken), $composer->lastCall['captions_chars']);
+
+        // TTS receives that text verbatim → the voice literally says it.
+        $ttsText = null;
+        Http::assertSent(function ($request) use (&$ttsText): bool {
+            if (! str_contains((string) $request->url(), 'gemini-3.8-flash-tts:streamGenerateContent')) {
+                return false;
+            }
+
+            $ttsText = (string) $request['contents'][0]['parts'][0]['text'];
+
+            return true;
+        });
+
+        $this->assertSame("## Transcript:\n".$spoken, $ttsText);
+    }
+
+    public function test_captions_are_synced_and_end_with_a_big_cta_card(): void
+    {
+        $composer = app(LowMemoryReelComposerService::class);
+
+        $script = 'عرض اليوم الواحد من كازيون نزل رسمي النهارده، وفيه توفير تقيل! '
+            .'زيت عافية بـ 219 جنيه بدل 244، بتوفير 25 جنيه في الباكت. '
+            .'العرض ليوم واحد بس والكمية بتطير! شوف باقي الأسعار والمجلات على منصة مجلاتنا.. الرابط في أول كومنت والبايو.';
+
+        $dir = storage_path('framework/testing/reels');
+        @mkdir($dir, 0775, true);
+        $path = $dir.'/captions_test.ass';
+
+        config(['services.reels.caption_font_name' => 'DejaVu Sans', 'services.reels.caption_font_size' => 54]);
+
+        $writeAss = new \ReflectionMethod($composer, 'writeCaptionsAss');
+
+        try {
+            $writeAss->invoke($composer, $script, 20.0, 22.5, $path);
+
+            $ass = (string) file_get_contents($path);
+
+            // Two styles: spoken Caption (bottom) + EndCard (big, centered).
+            $this->assertStringContainsString('Style: Caption,DejaVu Sans,54', $ass);
+            $this->assertStringContainsString('Style: EndCard,DejaVu Sans,62', $ass);
+
+            // Every spoken caption ends no later than the voiceover itself.
+            preg_match_all('/Dialogue: 0,(\d+):(\d+):(\d+\.\d+),(\d+):(\d+):(\d+\.\d+),Caption,/', $ass, $m, PREG_SET_ORDER);
+
+            $this->assertNotEmpty($m, 'No Caption events were written.');
+
+            foreach ($m as $hit) {
+                $end = ((int) $hit[4]) * 3600 + ((int) $hit[5]) * 60 + (float) $hit[6];
+                $this->assertLessThanOrEqual(20.0 + 0.01, $end, 'Caption outlived the voiceover.');
+            }
+
+            // End card spans exactly the silent tail (audio end → total).
+            $this->assertStringContainsString('Dialogue: 0,0:00:20.00,0:00:22.50,EndCard,,0,0,0,,{\\fad(300,0)}', $ass);
+
+            // It is the closing CTA, not the whole script.
+            $this->assertStringContainsString('العرض ليوم واحد بس والكمية بتطير!', $ass);
+            $this->assertStringContainsString('الرابط في أول كومنت والبايو.', $ass);
+            $this->assertStringNotContainsString('زيت عافية', (string) substr($ass, (int) strpos($ass, 'EndCard,,0,0,0,,{')));
+        } finally {
+            @unlink($path);
+        }
     }
 
     public function test_command_skips_ready_reel_without_force(): void

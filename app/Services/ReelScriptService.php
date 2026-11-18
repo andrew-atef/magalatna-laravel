@@ -29,7 +29,7 @@ final class ReelScriptService
     private const TIMEOUT_SECONDS = 60;
 
     /**
-     * @return array{script: string, source: string}
+     * @return array{script: string, caption: string, source: string}
      */
     public function generate(Flyer $flyer): array
     {
@@ -43,16 +43,104 @@ final class ReelScriptService
 
         try {
             $script = $this->viaGemini($flyer, $items, $retailerName);
-
-            return ['script' => $script, 'source' => 'gemini'];
         } catch (Throwable $e) {
             Log::warning('ReelScriptService: Gemini script failed, using deterministic fallback.', [
                 'flyer_id' => $flyer->id,
                 'error' => $e->getMessage(),
             ]);
+
+            $script = $this->fallbackScript($flyer, $items, $retailerName);
         }
 
-        return ['script' => $this->fallbackScript($flyer, $items, $retailerName), 'source' => 'fallback'];
+        // The closing CTA MUST be spoken by the voiceover, not just shown on
+        // screen — Gemini occasionally drops it, so it is enforced here.
+        $script = $this->ensureClosingCta($script, $flyer);
+
+        try {
+            $caption = $this->viaGeminiCaption($flyer, $script, $retailerName);
+        } catch (Throwable $e) {
+            Log::warning('ReelScriptService: Gemini caption failed, using deterministic fallback.', [
+                'flyer_id' => $flyer->id,
+                'error' => $e->getMessage(),
+            ]);
+
+            $caption = $this->fallbackCaption($flyer, $script, $retailerName);
+        }
+
+        return ['script' => $script, 'caption' => $caption, 'source' => 'gemini'];
+    }
+
+    /**
+     * Guarantees the voiceover ends with the urgency hook + the magalatna
+     * CTA ("الرابط في أول كومنت والبايو") — the single most important line
+     * for driving traffic, so it can never depend on LLM compliance.
+     */
+    private function ensureClosingCta(string $script, Flyer $flyer): string
+    {
+        [, , $daysSpan, $singleDay] = self::offerWindow($flyer);
+
+        $urgency = 'العرض '.($singleDay ? 'ليوم واحد بس' : $daysSpan).' والكمية بتطير!';
+        $linkLine = 'شوف باقي الأسعار والمجلات على منصة مجلاتنا.. الرابط في أول كومنت والبايو.';
+
+        $script = trim($script);
+
+        $hasUrgency = str_contains($script, 'والكمية بتطير');
+        $hasLink = str_contains($script, 'الرابط في أول كومنت');
+
+        if ($hasUrgency && $hasLink) {
+            return $script;
+        }
+
+        // Drop a PARTIAL closing left behind by Gemini, so the enforced
+        // closing never stutters ("شوف باقي الأسعار… شوف باقي الأسعار…").
+        if (! $hasLink) {
+            $cut = mb_strpos($script, 'شوف باقي الأسعار');
+
+            if ($cut !== false) {
+                $script = trim(mb_substr($script, 0, $cut));
+            }
+        }
+
+        $closing = trim(($hasUrgency ? '' : $urgency.' ').($hasLink ? '' : $linkLine));
+
+        // Keep the voiceover under ~25s: trim the BODY at a sentence
+        // boundary — the closing CTA itself always survives intact.
+        $budget = self::MAX_WORDS - self::wordCount($closing);
+
+        if (self::wordCount($script) > $budget) {
+            $script = $this->trimToSentenceBudget($script, max(0, $budget));
+        }
+
+        return trim($script.' '.$closing);
+    }
+
+    /**
+     * Cuts text at the last whole sentence that fits the word budget (word
+     * boundary as a last resort), so trimming never leaves a half sentence.
+     */
+    private function trimToSentenceBudget(string $text, int $budget): string
+    {
+        if ($budget <= 0) {
+            return '';
+        }
+
+        $sentences = preg_split('/(?<=[.!؟])\s+/u', trim($text)) ?: [$text];
+        $kept = [];
+
+        foreach ($sentences as $sentence) {
+            if (self::wordCount(implode(' ', array_merge($kept, [$sentence]))) > $budget) {
+                break;
+            }
+
+            $kept[] = $sentence;
+        }
+
+        if ($kept === []) {
+            $words = preg_split('/\s+/u', $text, -1, PREG_SPLIT_NO_EMPTY) ?: [];
+            $kept = [implode(' ', array_slice($words, 0, $budget))];
+        }
+
+        return rtrim(trim(implode(' ', $kept)), '، ');
     }
 
     /**
@@ -171,7 +259,11 @@ PROMPT;
     {
         [$from, $until, $daysSpan, $singleDay] = self::offerWindow($flyer);
 
-        $lines = ["عرض {$daysSpan} من {$retailerName} نزل رسمي لـ{$from}، وفيه توفير تقيل!"];
+        $opener = "عرض {$daysSpan} من {$retailerName} نزل رسمي لـ{$from}، وفيه توفير تقيل!";
+        $closing = 'العرض '.($singleDay ? 'ليوم واحد بس' : $daysSpan)
+            .' والكمية بتطير! شوف باقي الأسعار والمجلات على منصة مجلاتنا.. الرابط في أول كومنت والبايو.';
+
+        $itemLines = [];
         $index = 0;
 
         foreach ($items as $item) {
@@ -186,21 +278,107 @@ PROMPT;
                 $line .= '، بتوفير '.self::trimDecimal($savings).' جنيه في الباكت';
             }
 
-            $lines[] = $line.'!';
+            $itemLines[] = $line.'!';
         }
 
-        $lines[] = 'العرض '.($singleDay ? 'ليوم واحد بس' : 'لمدة '.$daysSpan).' والكمية بتطير! شوف باقي الأسعار والمجلات على منصة مجلاتنا.. الرابط في أول كومنت والبايو.';
+        // NEVER chop the closing CTA: the word budget trims ITEM lines only,
+        // so the voiceover always ends with the urgency hook + magalatna CTA.
+        $budget = self::MAX_WORDS - self::wordCount($opener.' '.$closing);
+        $keptItems = [];
 
-        $script = trim(implode(' ', $lines));
+        foreach ($itemLines as $line) {
+            $lineWords = self::wordCount($line);
+
+            if ($keptItems !== [] && $lineWords > $budget) {
+                break;
+            }
+
+            $keptItems[] = $line;
+            $budget -= $lineWords;
+        }
+
+        return trim(implode(' ', array_merge([$opener], $keptItems, [$closing])));
+    }
+
+    /**
+     * Word count using the same tokenization as the gate (whitespace split).
+     */
+    private static function wordCount(string $text): int
+    {
+        return count(preg_split('/\s+/u', trim($text), -1, PREG_SPLIT_NO_EMPTY) ?: []);
+    }
+
+    /**
+     * TikTok/Reels post description via Gemini — short hook + CTA + hashtags.
+     * A bad/overlong/empty response falls back to the deterministic builder.
+     */
+    private function viaGeminiCaption(Flyer $flyer, string $script, string $retailerName): string
+    {
+        $apiKey = trim((string) config('services.gemini.key', ''));
+
+        if ($apiKey === '') {
+            throw new RuntimeException('GEMINI_API_KEY is not configured.');
+        }
+
+        $prompt = <<<PROMPT
+اكتب وصف (caption) لفيديو تيك توك/ريلز عن العروض دي.
+
+السكريبت:
+{$script}
+
+القواعد الصارمة:
+- 3 أسطر بالظبط، بالعامية المصرية البيضاء.
+- السطر 1: هوك قصير جذاب عن العرض (أقل من 15 كلمة).
+- السطر 2: "كل الأسعار كاملة على منصة مجلاتنا — الرابط في أول كومنت والبايو 👇"
+- السطر 3: هاشتاجات مصفوفة: #عروض_مصر #عروض_اليوم #مجلاتنا #{$retailerName} (بدون مسافات جوا الهاشتاج).
+- ممنوع أي إنجليزية أو إيموجي في أول سطرين، وهاشتاجات بس في التالت.
+- اخرج نص الوصف فقط بدون تنسيق.
+PROMPT;
+
+        $response = Http::timeout(self::TIMEOUT_SECONDS)
+            ->withHeaders([
+                'Content-Type' => 'application/json',
+                'Accept' => 'application/json',
+                'x-goog-api-key' => $apiKey,
+            ])
+            ->withOptions(['http_errors' => false])
+            ->post('https://generativelanguage.googleapis.com/v1beta/models/'
+                .trim((string) config('services.gemini.model', 'gemini-2.5-flash')).':generateContent', [
+                'contents' => [
+                    ['role' => 'user', 'parts' => [['text' => $prompt]]],
+                ],
+                'generationConfig' => [
+                    'temperature' => 0.7,
+                    'responseMimeType' => 'text/plain',
+                ],
+            ]);
+
+        if (! $response->successful()) {
+            throw new RuntimeException('Gemini caption call failed: HTTP '.$response->status());
+        }
+
+        $text = trim((string) $response->json('candidates.0.content.parts.0.text'));
+
+        if ($text === '' || preg_match('/[\x{0600}-\x{06FF}]/u', $text) !== 1 || mb_strlen($text) > 300) {
+            throw new RuntimeException('Gemini caption is empty, not Arabic, or too long.');
+        }
+
+        return $text;
+    }
+
+    /**
+     * Deterministic caption fallback — hook from the script + fixed CTA +
+     * hashtags. Always valid even when Gemini is down.
+     */
+    private function fallbackCaption(Flyer $flyer, string $script, string $retailerName): string
+    {
         $words = preg_split('/\s+/u', $script, -1, PREG_SPLIT_NO_EMPTY) ?: [];
+        $hook = implode(' ', array_slice($words, 0, 12));
+        $hashtagRetailer = trim((string) preg_replace('/\s+/u', '_', $retailerName));
 
-        // Fallback copy is allowed to be slightly shorter than the Gemini
-        // gate (never longer): a reel voiceover must stay under ~25s.
-        if (count($words) > self::MAX_WORDS) {
-            $script = implode(' ', array_slice($words, 0, self::MAX_WORDS));
-        }
-
-        return $script;
+        return $hook."\n"
+            ."🔥 كل الأسعار كاملة على منصة مجلاتنا — الرابط في أول كومنت والبايو 👇\n"
+            .'#عروض_مصر #عروض_اليوم #مجلاتنا #'.$hashtagRetailer;
     }
 
     /**

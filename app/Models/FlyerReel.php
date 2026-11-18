@@ -24,6 +24,7 @@ class FlyerReel extends Model
         'flyer_id',
         'video_path',
         'script_text',
+        'caption',
         'voice_name',
         'audio_duration',
         'video_duration',

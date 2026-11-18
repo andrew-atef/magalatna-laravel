@@ -67,6 +67,13 @@ final class GenerateFlyerReelCommand extends Command
             $this->line("  المسار على R2: {$reel->video_path}");
             $this->line("  مدة الصوت: {$reel->audio_duration} ثانية");
             $this->line("  مدة الفيديو: {$reel->video_duration} ثانية");
+            $this->line('  وصف التيكتوك (انسخه مع الفيديو):');
+
+            foreach (preg_split('/\r?\n/u', (string) $reel->caption) ?: [] as $captionLine) {
+                if (trim($captionLine) !== '') {
+                    $this->line('    '.$captionLine);
+                }
+            }
 
             return self::SUCCESS;
         }
