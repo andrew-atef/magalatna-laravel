@@ -15,13 +15,13 @@ use Throwable;
  * Strategy:
  *  - Resolution is LOCKED to 720x1280 (never 1080x1920) and encoding runs
  *    with -threads 1 — the two knobs that keep libx264's frame buffers tiny.
- *  - Foreground flyer pages are pre-processed ONCE with GD (downscaled,
- *    rounded corners, drop shadow baked as alpha PNG) so the ffmpeg graph
- *    stays cheap: blurred fill background + crisp centered overlay + concat.
- *  - SHARPNESS RULE: the flyer foreground is NEVER resampled by ffmpeg — it
- *    is overlaid 1:1 on a 720x1280 canvas. The slow pan/zoom motion is
- *    applied ONLY to the blurred background (800x1422 → animated 720x1280
- *    crop), because upscaling text is what made prices look mushy.
+ *  - Foreground flyer pages are pre-composited ONCE with GD (downscaled,
+ *    rounded corners, drop shadow, blurred darkened backdrop) into a
+ *    760x1360 opaque JPEG, so ffmpeg receives ONE input per page instead of
+ *    a split/blur/overlay graph — that is what keeps 4 pages under ~112MB.
+ *  - SHARPNESS RULE: the flyer is baked at its native pixel size and the
+ *    final motion is a 1:1 crop (720x1280 out of 760x1360), never a scale —
+ *    so text is never resampled or upscaled.
  *  - Captions are strictly RTL: every line is wrapped in RLE+RLM … PDF and
  *    every Latin/numeric run is isolated with LRE … PDF, then `\q2` disables
  *    libass auto-wrap (we insert explicit breaks, max 4 words per line).
@@ -42,18 +42,23 @@ class LowMemoryReelComposerService
 
     private const FG_MAX_HEIGHT = 1160;
 
-    /** Oversized blurred backdrop — gives the animated crop room to drift. */
-    private const BG_WIDTH = 800;
+    /** Oversized pre-composited page canvas: 720x1280 output + pan margin.
+     *  Motion is a 1:1 crop inside it, so nothing is ever resampled. */
+    private const CANVAS_WIDTH = 760;
 
-    private const BG_HEIGHT = 1422;
+    private const CANVAS_HEIGHT = 1360;
+
+    /** Max drift inside the canvas (px). Kept below the flyer margins so the
+     *  page edge can never be clipped by the moving crop window. */
+    private const MOTION_X = 25;
+
+    private const MOTION_Y = 60;
 
     private const CORNER_RADIUS = 28;
 
     private const SHADOW_OFFSET_X = 6;
 
     private const SHADOW_OFFSET_Y = 8;
-
-    private const CANVAS_PADDING = 18;
 
     private const TRAIL_SECONDS = 2.5;
 
@@ -112,12 +117,12 @@ class LowMemoryReelComposerService
         }
 
         $ulid = uniqid('reelfg_', false);
-        $foregroundPaths = [];
+        $pagePaths = [];
         $captionsPath = $tempDir.'/'.$ulid.'_captions.ass';
 
         try {
             foreach (array_slice($pageImageBinaries, 0, self::MAX_PAGES) as $index => $binary) {
-                $foregroundPaths[] = $this->prepareForeground($binary, $tempDir.'/'.$ulid.'_'.$index.'.png');
+                $pagePaths[] = $this->preparePage($binary, $tempDir.'/'.$ulid.'_'.$index.'.jpg');
             }
 
             $assFile = trim($captionsText) !== ''
@@ -125,7 +130,7 @@ class LowMemoryReelComposerService
                 : null;
 
             try {
-                $this->runFfmpeg($foregroundPaths, $audioPath, $outputPath, $totalDuration, $assFile);
+                $this->runFfmpeg($pagePaths, $audioPath, $outputPath, $totalDuration, $assFile);
             } catch (\RuntimeException $e) {
                 // libass/ASS filter unavailable or font missing on this box —
                 // the reel is still worth shipping: retry WITHOUT captions.
@@ -141,7 +146,7 @@ class LowMemoryReelComposerService
                     // Logging must never block the graceful fallback.
                 }
 
-                $this->runFfmpeg($foregroundPaths, $audioPath, $outputPath, $totalDuration, null);
+                $this->runFfmpeg($pagePaths, $audioPath, $outputPath, $totalDuration, null);
             }
 
             if (! is_file($outputPath) || filesize($outputPath) === 0) {
@@ -150,8 +155,8 @@ class LowMemoryReelComposerService
 
             return ['audio_duration' => $audioDuration, 'video_duration' => $totalDuration];
         } finally {
-            // Memory & disk hygiene: foreground PNGs never survive compose().
-            foreach ($foregroundPaths as $path) {
+            // Memory & disk hygiene: page composites never survive compose().
+            foreach ($pagePaths as $path) {
                 @unlink($path);
             }
             @unlink($captionsPath);
@@ -186,24 +191,31 @@ class LowMemoryReelComposerService
 
     /**
      * Single-pass ffmpeg render. Filter graph:
-     *   per page: split → [bg: scale 800x1422 + blur + animated 720x1280 crop]
-     *                       overlay [crisp fg, 1:1, no resampling] → segment
-     *   all segments → concat → ASS captions → 720x1280
+     *   N pre-composited 760x1360 pages (GD: blurred bg + crisp flyer)
+     *     → concat → ONE animated 1:1 crop (720x1280) → ASS captions
+     *
+     * One input per page (no split/blur/overlay graph) plus
+     * -thread_queue_size 1 is what keeps the encode at ~112MB for 4 pages;
+     * the crop is a pure pixel window, so the flyer is never resampled.
      *
      * The Process runs with cwd = temp dir so the ASS filter can reference
      * the captions file by bare relative filename (no path-escaping traps).
      *
-     * @param  list<string>  $foregroundPaths
+     * @param  list<string>  $pagePaths
      */
-    private function runFfmpeg(array $foregroundPaths, string $audioPath, string $outputPath, float $totalDuration, ?string $assFile): void
+    private function runFfmpeg(array $pagePaths, string $audioPath, string $outputPath, float $totalDuration, ?string $assFile): void
     {
         $bin = (string) config('services.reels.ffmpeg_bin', 'ffmpeg');
-        $count = count($foregroundPaths);
+        $count = count($pagePaths);
         $segmentDuration = round($totalDuration / $count, 3);
 
         $args = [$bin, '-y', '-threads', '1'];
 
-        foreach ($foregroundPaths as $path) {
+        foreach ($pagePaths as $path) {
+            // Keep the demuxer→filter queue at ONE packet: each additional
+            // queued 760x1360 frame costs ~1.5MB per page.
+            $args[] = '-thread_queue_size';
+            $args[] = '1';
             $args[] = '-framerate';
             $args[] = '25';
             $args[] = '-loop';
@@ -219,30 +231,15 @@ class LowMemoryReelComposerService
 
         $filters = [];
 
-        for ($i = 0; $i < $count; $i++) {
-            $filters[] = "[{$i}:v]split=2[src{$i}a][src{$i}b]";
-
-            // Background: blurred + slightly oversized (800x1422) so the
-            // animated 720x1280 crop never exposes an edge.
-            $filters[] = "[src{$i}a]scale=".self::BG_WIDTH.':'.self::BG_HEIGHT
-                .':force_original_aspect_ratio=increase,crop='.self::BG_WIDTH.':'.self::BG_HEIGHT
-                .',boxblur=20:5,eq=brightness=-0.06,setsar=1[bgfull'.$i.']';
-
-            // ALL motion lives here: a slow drift across the oversized,
-            // already-blurred backdrop. Drift resets per page (each input has
-            // its own timeline) which reads as a natural pan per slide.
-            $filters[] = "[bgfull{$i}]crop=".self::WIDTH.':'.self::HEIGHT
-                .":x='(iw-ow)*t/{$segmentDuration}':y='(ih-oh)*t/{$segmentDuration}'[bg{$i}]";
-
-            // Foreground is overlaid 1:1 — NO crop/scale means zero blur.
-            $filters[] = "[bg{$i}][src{$i}b]overlay=(W-w)/2:(H-h)/2[seg{$i}]";
-        }
-
-        $concatInputs = implode('', array_map(static fn (int $i): string => "[seg{$i}]", range(0, $count - 1)));
+        $concatInputs = implode('', array_map(static fn (int $i): string => "[{$i}:v]", range(0, $count - 1)));
         $filters[] = $concatInputs.'concat=n='.$count.':v=1:a=0[vc]';
 
-        // No motion pass here: the frames are already final-size and crisp.
-        $tailChain = '[vc]setsar=1';
+        // Gentle drift across the whole reel: a 1:1 crop window inside the
+        // 760x1360 canvas (25x60px of headroom, safely inside the flyer
+        // margins). No scale filter anywhere → text stays pixel-sharp.
+        $tailChain = '[vc]crop='.self::WIDTH.':'.self::HEIGHT
+            .":x='".self::MOTION_X."*t/{$totalDuration}':y='".self::MOTION_Y."*t/{$totalDuration}'"
+            .',setsar=1';
 
         if ($assFile !== null) {
             // Note: NO fontsdir option — several libass builds mis-parse it
@@ -257,6 +254,8 @@ class LowMemoryReelComposerService
 
         $filters[] = $tailChain;
 
+        $args[] = '-filter_complex_threads';
+        $args[] = '1';
         $args[] = '-filter_complex';
         $args[] = implode(';', $filters);
 
@@ -511,11 +510,12 @@ class LowMemoryReelComposerService
     }
 
     /**
-     * GD pre-processing (runs ONCE per page, never per frame): downscale,
-     * rounded corners (alpha mask) and a soft drop shadow baked into a PNG
-     * with alpha — so the ffmpeg graph needs NO geq/drawbox tricks.
+     * GD pre-composite (runs ONCE per page, never per frame): a 760x1360
+     * opaque JPEG made of a heavily blurred, darkened copy of the page plus
+     * the crisp flyer (rounded corners + baked drop shadow) at native pixel
+     * size. This is why the ffmpeg graph is just concat + one 1:1 crop.
      */
-    private function prepareForeground(string $binary, string $outputPath): string
+    private function preparePage(string $binary, string $outputPath): string
     {
         if (! function_exists('imagecreatefromstring')) {
             throw new \RuntimeException('ext-gd is required to compose reels.');
@@ -528,14 +528,14 @@ class LowMemoryReelComposerService
         }
 
         if ($src === false) {
-            throw new \RuntimeException('Failed to decode flyer page image for foreground preparation.');
+            throw new \RuntimeException('Failed to decode flyer page image for page preparation.');
         }
 
-        $srcWidth = (int) imagesx($src);
-        $srcHeight = (int) imagesy($src);
+        $srcWidth = max(1, (int) imagesx($src));
+        $srcHeight = max(1, (int) imagesy($src));
 
-        // Masters arrive at 1200px wide, so this is a pure DOWNSCALE
-        // (ratio capped at 1.0) — never stretch a 400px thumb into mush.
+        // Masters arrive at ~1200px, so this is a pure DOWNSCALE (ratio
+        // capped at 1.0) — never stretch a low-res thumb into mush.
         $ratio = min(1.0, self::FG_MAX_WIDTH / $srcWidth, self::FG_MAX_HEIGHT / $srcHeight);
         $width = max(1, (int) round($srcWidth * $ratio));
         $height = max(1, (int) round($srcHeight * $ratio));
@@ -544,46 +544,58 @@ class LowMemoryReelComposerService
         imagealphablending($fg, false);
         imagesavealpha($fg, true);
 
-        // Bicubic/Lanczos resampling keeps the price tags and product text
-        // crisp when shrinking the 1200px page into the 690px box.
+        // Bicubic resampling keeps the price tags and product text crisp when
+        // shrinking the page into the 690px box (IMG_LANCZOS4 is not exposed
+        // by PHP-GD; IMG_BICUBIC is the best generally-available kernel).
         if (function_exists('imagesetinterpolation')) {
-            $method = defined('IMG_LANCZOS4')
-                ? IMG_LANCZOS4
-                : (defined('IMG_BICUBIC') ? IMG_BICUBIC : IMG_BILINEAR);
-
-            imagesetinterpolation($fg, $method);
+            imagesetinterpolation($fg, IMG_BICUBIC);
         }
 
         imagecopyresampled($fg, $src, 0, 0, 0, 0, $width, $height, $srcWidth, $srcHeight);
+
+        // Cheap, convincing blur: shrink the page to ~1/24 width and blow it
+        // back up to the canvas. The canvas stays opaque, so ffmpeg only ever
+        // decodes a JPEG (no alpha channel, no per-frame overlay graph).
+        $tinyWidth = max(8, (int) round($srcWidth / 24));
+        $tiny = imagescale($src, $tinyWidth, -1, IMG_BILINEAR_FIXED);
         imagedestroy($src);
 
-        // Rounded corners: only the 4 corner squares are touched pixel-wise
-        // (~4 × r² pixels) — the body stays untouched, so this is fast.
-        self::roundCorners($fg, self::CORNER_RADIUS);
-
-        // Canvas with baked drop shadow: soft black rounded layer offset
-        // behind the crisp foreground.
-        $canvasW = $width + self::CANVAS_PADDING * 2;
-        $canvasH = $height + self::CANVAS_PADDING * 2;
+        $canvasW = self::CANVAS_WIDTH;
+        $canvasH = self::CANVAS_HEIGHT;
         $canvas = imagecreatetruecolor($canvasW, $canvasH);
-        imagealphablending($canvas, false);
-        imagesavealpha($canvas, true);
-        $canvasTransparent = imagecolorallocatealpha($canvas, 0, 0, 0, 127);
-        imagefill($canvas, 0, 0, $canvasTransparent);
+
+        if (function_exists('imagesetinterpolation')) {
+            imagesetinterpolation($canvas, IMG_BICUBIC);
+        }
+
+        if ($tiny !== false) {
+            imagecopyresampled($canvas, $tiny, 0, 0, 0, 0, $canvasW, $canvasH, imagesx($tiny), imagesy($tiny));
+            imagedestroy($tiny);
+        }
+
+        // Slightly darken the backdrop so white captions stay legible.
+        imagefilter($canvas, IMG_FILTER_BRIGHTNESS, -16);
         imagealphablending($canvas, true);
 
+        // Rounded corners on the crisp flyer + baked drop shadow, then paste
+        // it CENTERED at 1:1 pixel size (zero resampling from here on).
+        self::roundCorners($fg, self::CORNER_RADIUS);
+
+        $offsetX = intdiv($canvasW - $width, 2);
+        $offsetY = intdiv($canvasH - $height, 2);
+
         $shadow = self::createRoundedLayer($width, $height, self::CORNER_RADIUS, 0, 0, 0, 82);
-        imagecopy($canvas, $shadow, self::CANVAS_PADDING + self::SHADOW_OFFSET_X, self::CANVAS_PADDING + self::SHADOW_OFFSET_Y, 0, 0, $width, $height);
+        imagecopy($canvas, $shadow, $offsetX + self::SHADOW_OFFSET_X, $offsetY + self::SHADOW_OFFSET_Y, 0, 0, $width, $height);
         imagedestroy($shadow);
 
-        imagecopy($canvas, $fg, self::CANVAS_PADDING, self::CANVAS_PADDING, 0, 0, $width, $height);
+        imagecopy($canvas, $fg, $offsetX, $offsetY, 0, 0, $width, $height);
         imagedestroy($fg);
 
-        $ok = imagepng($canvas, $outputPath, 6);
+        $ok = imagejpeg($canvas, $outputPath, 92);
         imagedestroy($canvas);
 
         if ($ok === false || ! is_file($outputPath) || filesize($outputPath) === 0) {
-            throw new \RuntimeException('Failed to write prepared foreground PNG: '.$outputPath);
+            throw new \RuntimeException('Failed to write prepared page JPEG: '.$outputPath);
         }
 
         return $outputPath;

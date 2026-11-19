@@ -408,6 +408,38 @@ final class FlyerReelPipelineTest extends TestCase
         $this->assertSame(mb_strlen($spoken), $composer->lastCall['captions_chars']);
     }
 
+    public function test_page_composite_is_a_760x1360_opaque_jpeg(): void
+    {
+        $composer = app(LowMemoryReelComposerService::class);
+
+        $dir = storage_path('framework/testing/reels');
+        @mkdir($dir, 0775, true);
+        $srcPath = $dir.'/src_page.jpg';
+        $outPath = $dir.'/page_composite.jpg';
+
+        $im = imagecreatetruecolor(1200, 1700);
+        imagefill($im, 0, 0, (int) imagecolorallocate($im, 255, 255, 255));
+        imagejpeg($im, $srcPath, 90);
+        imagedestroy($im);
+
+        try {
+            $method = new \ReflectionMethod($composer, 'preparePage');
+            $method->invoke($composer, (string) file_get_contents($srcPath), $outPath);
+
+            $info = getimagesize($outPath);
+
+            $this->assertIsArray($info);
+            // Fixed canvas: 720x1280 output + pan headroom, 1:1 pixels.
+            $this->assertSame(760, $info[0]);
+            $this->assertSame(1360, $info[1]);
+            $this->assertSame(IMAGETYPE_JPEG, $info[2]);
+            $this->assertGreaterThan(0, (int) filesize($outPath));
+        } finally {
+            @unlink($srcPath);
+            @unlink($outPath);
+        }
+    }
+
     public function test_captions_are_synced_and_end_with_a_big_cta_card(): void
     {
         $composer = app(LowMemoryReelComposerService::class);
