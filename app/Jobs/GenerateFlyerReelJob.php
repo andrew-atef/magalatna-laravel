@@ -158,8 +158,12 @@ final class GenerateFlyerReelJob implements ShouldQueue
     }
 
     /**
-     * Up to 4 page images from R2, 400px thumbs first (smaller transfer +
-     * decode buffers), cover first. Missing thumbs fall back to masters.
+     * Up to 4 page images from R2, cover first.
+     *
+     * MASTERS FIRST: image_path is the full ~1200px page, which is what the
+     * composer downscales to 690px (a 400px thumb would have to be enlarged
+     * and the prices would look mushy). thumb_path is only a last resort for
+     * legacy pages that never got a master uploaded.
      *
      * @return list<string>
      */
@@ -174,8 +178,8 @@ final class GenerateFlyerReelJob implements ShouldQueue
 
         foreach ($pages as $page) {
             $candidates = array_values(array_filter([
-                trim((string) $page->thumb_path),
                 trim((string) $page->image_path),
+                trim((string) $page->thumb_path),
             ], static fn (string $p): bool => $p !== ''));
 
             foreach ($candidates as $path) {

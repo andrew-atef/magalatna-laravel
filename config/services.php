@@ -54,8 +54,10 @@ return [
         'temp_dir' => env('REELS_TEMP_DIR', sys_get_temp_dir()),
         // Burned-in captions: the font FAMILY libass matches through the
         // system font provider (fontconfig on the VPS — install an Arabic
-        // font such as fonts-noto-core, then set the name here).
-        'caption_font_name' => env('REELS_CAPTION_FONT_NAME', 'DejaVu Sans'),
+        // font with `apt install fonts-noto-core`, then set the name here).
+        // NEVER a Latin-only family like DejaVu Sans: libass would fall back
+        // per-glyph and the Arabic would render with broken shaping.
+        'caption_font_name' => env('REELS_CAPTION_FONT_NAME', 'Noto Sans Arabic'),
         'caption_font_size' => env('REELS_CAPTION_FONT_SIZE', 54),
         // Closing CTA card shown big & centered during the silent tail.
         'endcard_font_size' => env('REELS_ENDCARD_FONT_SIZE', 62),

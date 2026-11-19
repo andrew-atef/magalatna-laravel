@@ -18,8 +18,13 @@ use Throwable;
  *  - Foreground flyer pages are pre-processed ONCE with GD (downscaled,
  *    rounded corners, drop shadow baked as alpha PNG) so the ffmpeg graph
  *    stays cheap: blurred fill background + crisp centered overlay + concat.
- *  - The "dynamic movement" is a single time-animated crop (slow zoom+pan)
- *    applied AFTER the concat — one filter, no per-frame zoompan buffers.
+ *  - SHARPNESS RULE: the flyer foreground is NEVER resampled by ffmpeg — it
+ *    is overlaid 1:1 on a 720x1280 canvas. The slow pan/zoom motion is
+ *    applied ONLY to the blurred background (800x1422 → animated 720x1280
+ *    crop), because upscaling text is what made prices look mushy.
+ *  - Captions are strictly RTL: every line is wrapped in RLE+RLM … PDF and
+ *    every Latin/numeric run is isolated with LRE … PDF, then `\q2` disables
+ *    libass auto-wrap (we insert explicit breaks, max 4 words per line).
  *  - Every temporary file lives in a configurable temp dir and is the
  *    CALLER's responsibility to unlink (the job wraps compose() in
  *    try/finally).
@@ -31,10 +36,16 @@ class LowMemoryReelComposerService
 
     private const HEIGHT = 1280;
 
-    /** Foreground crisp layer max box — fills most of the 720x1280 frame. */
-    private const FG_MAX_WIDTH = 680;
+    /** Foreground crisp layer max box — fills most of the 720x1280 frame.
+     *  Masters arrive at 1200px, so this is always a DOWNSCALE (zero upscaling). */
+    private const FG_MAX_WIDTH = 690;
 
-    private const FG_MAX_HEIGHT = 1150;
+    private const FG_MAX_HEIGHT = 1160;
+
+    /** Oversized blurred backdrop — gives the animated crop room to drift. */
+    private const BG_WIDTH = 800;
+
+    private const BG_HEIGHT = 1422;
 
     private const CORNER_RADIUS = 28;
 
@@ -61,7 +72,8 @@ class LowMemoryReelComposerService
 
     private const CAPTION_MARGIN_H = 36;
 
-    private const CAPTION_MAX_WORDS = 5;
+    /** Max words per burned-in caption line (bidi-safe short lines). */
+    private const CAPTION_MAX_WORDS = 4;
 
     /** End-card styling: last 2.5s, big centered CTA, fades in. */
     private const END_CARD_FONT_SIZE = 62;
@@ -174,8 +186,9 @@ class LowMemoryReelComposerService
 
     /**
      * Single-pass ffmpeg render. Filter graph:
-     *   per page: split → [fill+crop+boxblur+darken (bg)] overlay [crisp fg] → segment
-     *   all segments → concat → time-animated slow zoom/pan crop → ASS captions → 720x1280
+     *   per page: split → [bg: scale 800x1422 + blur + animated 720x1280 crop]
+     *                       overlay [crisp fg, 1:1, no resampling] → segment
+     *   all segments → concat → ASS captions → 720x1280
      *
      * The Process runs with cwd = temp dir so the ASS filter can reference
      * the captions file by bare relative filename (no path-escaping traps).
@@ -208,20 +221,28 @@ class LowMemoryReelComposerService
 
         for ($i = 0; $i < $count; $i++) {
             $filters[] = "[{$i}:v]split=2[src{$i}a][src{$i}b]";
-            $filters[] = "[src{$i}a]scale=".self::WIDTH.':'.self::HEIGHT
-                .':force_original_aspect_ratio=increase,crop='.self::WIDTH.':'.self::HEIGHT
-                .',boxblur=20:5,eq=brightness=-0.06,format=yuv420p[bg'.$i.']';
+
+            // Background: blurred + slightly oversized (800x1422) so the
+            // animated 720x1280 crop never exposes an edge.
+            $filters[] = "[src{$i}a]scale=".self::BG_WIDTH.':'.self::BG_HEIGHT
+                .':force_original_aspect_ratio=increase,crop='.self::BG_WIDTH.':'.self::BG_HEIGHT
+                .',boxblur=20:5,eq=brightness=-0.06,setsar=1[bgfull'.$i.']';
+
+            // ALL motion lives here: a slow drift across the oversized,
+            // already-blurred backdrop. Drift resets per page (each input has
+            // its own timeline) which reads as a natural pan per slide.
+            $filters[] = "[bgfull{$i}]crop=".self::WIDTH.':'.self::HEIGHT
+                .":x='(iw-ow)*t/{$segmentDuration}':y='(ih-oh)*t/{$segmentDuration}'[bg{$i}]";
+
+            // Foreground is overlaid 1:1 — NO crop/scale means zero blur.
             $filters[] = "[bg{$i}][src{$i}b]overlay=(W-w)/2:(H-h)/2[seg{$i}]";
         }
 
         $concatInputs = implode('', array_map(static fn (int $i): string => "[seg{$i}]", range(0, $count - 1)));
         $filters[] = $concatInputs.'concat=n='.$count.':v=1:a=0[vc]';
 
-        // Subtle slow zoom + pan: crop 93% of the frame and drift toward the
-        // bottom-right corner across the WHOLE duration, then restore size.
-        $tailChain = '[vc]crop='.(self::WIDTH - 48).':'.(self::HEIGHT - 64)
-            .":x='(iw-ow)*t/{$totalDuration}':y='(ih-oh)*t/{$totalDuration}'"
-            .',scale='.self::WIDTH.':'.self::HEIGHT.',setsar=1';
+        // No motion pass here: the frames are already final-size and crisp.
+        $tailChain = '[vc]setsar=1';
 
         if ($assFile !== null) {
             // Note: NO fontsdir option — several libass builds mis-parse it
@@ -246,8 +267,11 @@ class LowMemoryReelComposerService
 
         $args = array_merge($args, [
             '-c:v', 'libx264',
-            '-preset', 'veryfast',
-            '-crf', '26',
+            // Text/price-tag friendly: slower preset + stillimage tuning keeps
+            // sharp glyph/price edges at CRF 20. -threads 1 keeps RAM flat.
+            '-preset', 'fast',
+            '-crf', '20',
+            '-tune', 'stillimage',
             '-threads', '1',
             '-c:a', 'aac',
             '-b:a', '128k',
@@ -285,7 +309,7 @@ class LowMemoryReelComposerService
             throw new \RuntimeException('Caption text produced no segments.');
         }
 
-        $fontName = trim((string) config('services.reels.caption_font_name', 'DejaVu Sans'));
+        $fontName = trim((string) config('services.reels.caption_font_name', 'Noto Sans Arabic'));
         $fontSize = max(24, (int) config('services.reels.caption_font_size', self::CAPTION_FONT_SIZE));
         $endCardSize = max(28, (int) config('services.reels.endcard_font_size', self::END_CARD_FONT_SIZE));
 
@@ -301,7 +325,8 @@ class LowMemoryReelComposerService
             $start = $cursor;
             $cursor = min($audioDuration, $cursor + $duration);
 
-            $events .= 'Dialogue: 0,'.self::assTime($start).','.self::assTime($cursor).',Caption,,0,0,0,,'.self::assEscape($text)."\n";
+            $events .= 'Dialogue: 0,'.self::assTime($start).','.self::assTime($cursor)
+                .',Caption,,0,0,0,,{\q2}'.self::assBidiLines($text, self::CAPTION_MAX_WORDS)."\n";
         }
 
         // END CARD: while the voiceover is over (the 2.5s tail) the CTA is
@@ -310,7 +335,8 @@ class LowMemoryReelComposerService
 
         if ($endCard !== '' && $totalDuration > $audioDuration) {
             $events .= 'Dialogue: 0,'.self::assTime($audioDuration).','.self::assTime($totalDuration)
-                .',EndCard,,0,0,0,,{\\fad('.self::END_CARD_FADE_MS.',0)}'.self::assEscape($endCard)."\n";
+                .',EndCard,,0,0,0,,{\\fad('.self::END_CARD_FADE_MS.',0)\\q2}'
+                .self::assBidiLines($endCard, self::CAPTION_MAX_WORDS)."\n";
         }
 
         $ass = "[Script Info]\n"
@@ -420,6 +446,65 @@ class LowMemoryReelComposerService
     }
 
     /**
+     * ASS text field for one event: explicit `\N` breaks of at most
+     * $maxWords words, with EACH line bidi-isolated independently. Keeping
+     * the breaks explicit (paired with `\q2`) means libass can never pick
+     * its own wrap points inside a mixed Arabic/number sentence.
+     */
+    private static function assBidiLines(string $text, int $maxWords): string
+    {
+        return implode('\\N', array_map(
+            static fn (string $line): string => self::assBidiLine($line),
+            self::splitLines($text, $maxWords)
+        ));
+    }
+
+    /**
+     * @return list<string>
+     */
+    private static function splitLines(string $text, int $maxWords): array
+    {
+        $clean = trim((string) preg_replace('/\s+/u', ' ', $text));
+
+        if ($clean === '') {
+            return [];
+        }
+
+        $words = preg_split('/\s+/u', $clean, -1, PREG_SPLIT_NO_EMPTY) ?: [];
+
+        if ($words === []) {
+            return [];
+        }
+
+        return array_map(
+            static fn (array $chunk): string => implode(' ', $chunk),
+            array_chunk($words, max(1, $maxWords))
+        );
+    }
+
+    /**
+     * Strict-RTL line for libass/FriBidi:
+     *  1. every LTR run (Latin word, decimal like 41.95, compound figure like
+     *     6×500) is isolated with LRE … PDF so its characters stay in order;
+     *  2. the whole line is wrapped in RLE + RLM … PDF so the paragraph
+     *     direction can never flip to LTR — even when the line starts with a
+     *     number, `..` or `!` (the classic causes of mirrored punctuation and
+     *     reversed word order in burned-in Arabic subtitles).
+     */
+    private static function assBidiLine(string $line): string
+    {
+        $line = self::assEscape($line);
+
+        $isolated = (string) preg_replace_callback(
+            '/[A-Za-z0-9]+(?:[._\/:×*+\-][A-Za-z0-9]+)*/u',
+            static fn (array $match): string => "\u{202A}".$match[0]."\u{202C}",
+            $line
+        );
+
+        return "\u{202B}\u{200F}".$isolated."\u{202C}";
+    }
+
+    /**
      * GD pre-processing (runs ONCE per page, never per frame): downscale,
      * rounded corners (alpha mask) and a soft drop shadow baked into a PNG
      * with alpha — so the ffmpeg graph needs NO geq/drawbox tricks.
@@ -443,14 +528,26 @@ class LowMemoryReelComposerService
         $srcWidth = (int) imagesx($src);
         $srcHeight = (int) imagesy($src);
 
-        // Prefer filling the FG box: small 400px thumbs are gently upscaled.
-        $ratio = min(self::FG_MAX_WIDTH / $srcWidth, self::FG_MAX_HEIGHT / $srcHeight);
+        // Masters arrive at 1200px wide, so this is a pure DOWNSCALE
+        // (ratio capped at 1.0) — never stretch a 400px thumb into mush.
+        $ratio = min(1.0, self::FG_MAX_WIDTH / $srcWidth, self::FG_MAX_HEIGHT / $srcHeight);
         $width = max(1, (int) round($srcWidth * $ratio));
         $height = max(1, (int) round($srcHeight * $ratio));
 
         $fg = imagecreatetruecolor($width, $height);
         imagealphablending($fg, false);
         imagesavealpha($fg, true);
+
+        // Bicubic/Lanczos resampling keeps the price tags and product text
+        // crisp when shrinking the 1200px page into the 690px box.
+        if (function_exists('imagesetinterpolation')) {
+            $method = defined('IMG_LANCZOS4')
+                ? IMG_LANCZOS4
+                : (defined('IMG_BICUBIC') ? IMG_BICUBIC : IMG_BILINEAR);
+
+            imagesetinterpolation($fg, $method);
+        }
+
         imagecopyresampled($fg, $src, 0, 0, 0, 0, $width, $height, $srcWidth, $srcHeight);
         imagedestroy($src);
 

@@ -61,6 +61,11 @@ final class ReelScriptService
         // screen — Gemini occasionally drops it, so it is enforced here.
         $script = $this->ensureClosingCta($script, $flyer);
 
+        // Speech + on-screen captions must stay Arabic-first: transliterate
+        // any Latin brand token left by the LLM and fix decimal commas so
+        // both TTS pronunciation and libass rendering stay smooth.
+        $script = $this->normalizeForSpeech($script);
+
         try {
             $caption = $this->viaGeminiCaption($flyer, $script, $retailerName);
         } catch (Throwable $e) {
@@ -88,6 +93,67 @@ final class ReelScriptService
         } catch (Throwable) {
             // Logging unavailable (permissions/disk full) — carry on.
         }
+    }
+
+    /**
+     * Arabic-first normalization for BOTH the voiceover and the burned-in
+     * captions:
+     *  - decimal commas / Arabic decimal separator between digits become a
+     *    plain dot ("41,95" and "41٫95" → "41.95") — TTS reads it right and
+     *    libass shows a stable LTR number run;
+     *  - Latin brand tokens are transliterated through the shared
+     *    config('ocr_aliases.brand_aliases') dictionary (Elvive → إلفيف,
+     *    Lipton → ليبتون, Pepsi → بيبسي, …).
+     */
+    private function normalizeForSpeech(string $text): string
+    {
+        $text = (string) preg_replace('/(?<=\d)[,٫](?=\d)/u', '.', $text);
+
+        $map = $this->latinBrandMap();
+
+        if ($map !== []) {
+            $pattern = '/(?<![\p{L}\p{N}])('.implode('|', array_map(
+                static fn (string $latin): string => preg_quote($latin, '/'),
+                array_keys($map)
+            )).')(?![\p{L}\p{N}])/iu';
+
+            $text = (string) preg_replace_callback(
+                $pattern,
+                static fn (array $match): string => $map[mb_strtolower($match[0])] ?? $match[0],
+                $text
+            );
+        }
+
+        return trim((string) preg_replace('/\s+/u', ' ', $text));
+    }
+
+    /**
+     * Latin (only) keys of the brand alias dictionary, longest first so
+     * multi-word brands are replaced before their individual words.
+     *
+     * @return array<string, string>
+     */
+    private function latinBrandMap(): array
+    {
+        $map = [];
+
+        foreach ((array) config('ocr_aliases.brand_aliases', []) as $raw => $canonical) {
+            $key = trim((string) $raw);
+
+            if ($key === '' || preg_match('/^[A-Za-z0-9 .&\-]+$/', $key) !== 1) {
+                continue; // Arabic-keyed aliases are handled by ProductDataNormalizer.
+            }
+
+            if (! is_string($canonical) || trim($canonical) === '') {
+                continue;
+            }
+
+            $map[mb_strtolower($key)] = trim($canonical);
+        }
+
+        uksort($map, static fn (string $a, string $b): int => mb_strlen($b) <=> mb_strlen($a));
+
+        return $map;
     }
 
     /**

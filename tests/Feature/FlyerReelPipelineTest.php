@@ -120,6 +120,7 @@ final class FlyerReelPipelineTest extends TestCase
                     'audio_bytes' => filesize($audioPath),
                     'output' => $outputPath,
                     'captions_chars' => mb_strlen(trim($captionsText)),
+                    'binaries' => array_map(static fn (string $b): string => substr($b, 0, 16), $pageImageBinaries),
                 ];
 
                 file_put_contents($outputPath, 'FAKE_MP4_BYTES');
@@ -366,6 +367,47 @@ final class FlyerReelPipelineTest extends TestCase
         $this->assertNotNull($reel->caption);
     }
 
+    public function test_job_sends_full_resolution_masters_not_thumbnails(): void
+    {
+        $flyer = $this->seedFlyer();
+        $composer = $this->fakeComposer();
+        $this->fakeGemini();
+
+        $this->artisan('flyers:generate-reel', ['flyer_id' => $flyer->id])->assertSuccessful();
+
+        // image_path (1200px master) must win over thumb_path (400px).
+        $this->assertSame(['FAKE_MASTER_1', 'FAKE_MASTER_2'], $composer->lastCall['binaries']);
+    }
+
+    public function test_latin_brands_are_transliterated_and_decimal_commas_normalized(): void
+    {
+        $flyer = $this->seedFlyer();
+        $composer = $this->fakeComposer();
+
+        $this->fakeGemini(
+            'عرض كازيون النهارده فيه توفير تقيل على Elvive وشامبو Lipton، وكمان زيت عافية بـ 219 جنيه بدل 244. '
+            .'سكر بـ 41,95 جنيه بس، ومكرونة رومي بـ 12.5 بدل 16، وده توفير حقيقي على كل حاجة محتاجها في البيت. '
+            .'العرض ساري لمدة أسبوع والكمية بتطير! شوف باقي الأسعار والمجلات على منصة مجلاتنا.. الرابط في أول كومنت والبايو.'
+        );
+
+        $this->artisan('flyers:generate-reel', ['flyer_id' => $flyer->id])->assertSuccessful();
+
+        $spoken = (string) FlyerReel::query()->where('flyer_id', $flyer->id)->firstOrFail()->script_text;
+
+        // Latin brands → Arabic (config: ocr_aliases.brand_aliases).
+        $this->assertStringContainsString('إلفيف', $spoken);
+        $this->assertStringContainsString('ليبتون', $spoken);
+        $this->assertStringNotContainsString('Elvive', $spoken);
+        $this->assertStringNotContainsString('Lipton', $spoken);
+
+        // Decimal comma → dot, so both TTS and libass read "41.95".
+        $this->assertStringContainsString('41.95', $spoken);
+        $this->assertStringNotContainsString('41,95', $spoken);
+
+        // Captions are burned from exactly the same normalized text.
+        $this->assertSame(mb_strlen($spoken), $composer->lastCall['captions_chars']);
+    }
+
     public function test_captions_are_synced_and_end_with_a_big_cta_card(): void
     {
         $composer = app(LowMemoryReelComposerService::class);
@@ -401,13 +443,58 @@ final class FlyerReelPipelineTest extends TestCase
                 $this->assertLessThanOrEqual(20.0 + 0.01, $end, 'Caption outlived the voiceover.');
             }
 
-            // End card spans exactly the silent tail (audio end → total).
-            $this->assertStringContainsString('Dialogue: 0,0:00:20.00,0:00:22.50,EndCard,,0,0,0,,{\\fad(300,0)}', $ass);
+            // End card spans exactly the silent tail (audio end → total) and
+            // uses the same explicit-wrap discipline as the captions.
+            $endCardStart = strpos($ass, 'EndCard,,0,0,0,,{');
+            $this->assertNotFalse($endCardStart);
+            $endCardBlock = (string) substr($ass, (int) $endCardStart);
 
-            // It is the closing CTA, not the whole script.
-            $this->assertStringContainsString('العرض ليوم واحد بس والكمية بتطير!', $ass);
-            $this->assertStringContainsString('الرابط في أول كومنت والبايو.', $ass);
-            $this->assertStringNotContainsString('زيت عافية', (string) substr($ass, (int) strpos($ass, 'EndCard,,0,0,0,,{')));
+            $this->assertStringContainsString(
+                'Dialogue: 0,0:00:20.00,0:00:22.50,EndCard,,0,0,0,,',
+                $ass
+            );
+            $this->assertStringContainsString('{\\fad(300,0)\\q2}', $endCardBlock);
+
+            // It is the closing CTA, not the whole script (lines are broken
+            // at 4 words, so assert on the surviving fragments).
+            $this->assertStringContainsString('بتطير!', $endCardBlock);
+            $this->assertStringContainsString('الرابط', $endCardBlock);
+            $this->assertStringContainsString('كومنت', $endCardBlock);
+            $this->assertStringNotContainsString('زيت عافية', $endCardBlock);
+
+            // Strict RTL: every event is RLE+RLM … PDF wrapped and carries
+            // \q2, and every line is ≤ 4 words (explicit \N breaks only).
+            $this->assertStringContainsString('{\q2}', $ass);
+            $this->assertStringContainsString("\u{202B}\u{200F}", $ass);
+            $this->assertStringContainsString("\u{202C}", $ass);
+
+            // Numbers are isolated as LTR runs so "219" never renders "912".
+            $this->assertStringContainsString("\u{202A}219\u{202C}", $ass);
+
+            $captionLineCount = 0;
+
+            foreach (explode("\n", $ass) as $eventLine) {
+                if (! str_contains($eventLine, ',Caption,,0,0,0,,')) {
+                    continue;
+                }
+
+                $this->assertStringContainsString('{\q2}', $eventLine);
+                $this->assertStringContainsString("\u{202B}\u{200F}", $eventLine);
+
+                $text = substr($eventLine, (int) strpos($eventLine, '{\q2}') + 5);
+                $text = str_replace(["\u{202A}", "\u{202B}", "\u{202C}", "\u{200F}"], '', $text);
+
+                foreach (explode('\N', $text) as $line) {
+                    $captionLineCount++;
+                    $this->assertLessThanOrEqual(
+                        4,
+                        count(preg_split('/\s+/u', trim($line), -1, PREG_SPLIT_NO_EMPTY) ?: []),
+                        'Caption line exceeds 4 words: '.$line
+                    );
+                }
+            }
+
+            $this->assertGreaterThan(0, $captionLineCount);
         } finally {
             @unlink($path);
         }
