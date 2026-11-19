@@ -272,6 +272,12 @@ class LowMemoryReelComposerService
             '-preset', 'fast',
             '-crf', '20',
             '-tune', 'stillimage',
+            // FFmpeg 4.4 (Ubuntu 22.04) silently IGNORES `-tune stillimage`
+            // — verified on the VPS: x264 dumped bframes=3 ref=2
+            // rc-lookahead=30. That lookahead/mbtree frame pool is what blew
+            // the encode up to ~196MB. Applying the stillimage set explicitly
+            // is the single biggest RAM lever: 196MB → 75MB at 720x1280.
+            '-x264-params', 'ref=1:bframes=0:rc-lookahead=0:sync-lookahead=0:no-mbtree=1:weightp=0:8x8dct=0:aq-mode=0',
             '-threads', '1',
             '-c:a', 'aac',
             '-b:a', '128k',
