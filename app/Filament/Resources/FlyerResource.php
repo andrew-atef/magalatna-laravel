@@ -341,7 +341,7 @@ final class FlyerResource extends Resource
 
                 Tables\Actions\ViewAction::make(),
 
-                RegenerateContentAction::forTable(),
+                RegenerateContentAction::make(),
 
                 Tables\Actions\Action::make('publishAndIndex')
                     ->label('Publish & Index')
