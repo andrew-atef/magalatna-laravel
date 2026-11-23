@@ -7,11 +7,15 @@ namespace Tests\Feature;
 use App\Jobs\PurgeCloudflareCacheJob;
 use App\Jobs\RegenerateFlyerContentJob;
 use App\Models\FlyerItem;
+use App\Models\User;
 use App\Services\GeminiVisionService;
+use Filament\Facades\Filament;
+use Filament\Tables\Actions\Action as TableAction;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\Storage;
+use Livewire\Livewire;
 use RuntimeException;
 use Tests\Concerns\CreatesFixtures;
 use Tests\TestCase;
@@ -246,5 +250,47 @@ final class RegenerateFlyerContentTest extends TestCase
 
         $this->artisan('flyers:regenerate', ['flyer_id' => 999999])->assertFailed();
         $this->artisan('flyers:regenerate', ['flyer_id' => $flyer->id, '--mode' => 'bogus'])->assertFailed();
+    }
+
+    public function test_for_table_action_is_a_table_action_with_table_method(): void
+    {
+        // Regression: the base Filament\Actions\Action lacks table(), which
+        // Filament's table calls on every registered action — putting it in
+        // ->actions([...]) 500'd the whole flyers list (BadMethodCallException).
+        $action = \App\Filament\Actions\RegenerateContentAction::forTable();
+
+        $this->assertInstanceOf(TableAction::class, $action);
+        $this->assertTrue(method_exists($action, 'table'));
+    }
+
+    public function test_flyers_list_mounts_and_regenerate_table_action_dispatches(): void
+    {
+        config(['auth.panel.admin_emails' => 'admin@magalatna.com']);
+
+        $user = User::forceCreate([
+            'name' => 'Admin',
+            'email' => 'admin@magalatna.com',
+            'password' => 'password',
+            'email_verified_at' => now(),
+        ]);
+
+        $this->actingAs($user);
+        Filament::setCurrentPanel(Filament::getPanel('admin'));
+
+        $flyer = $this->createPublishedFlyer();
+
+        Queue::fake();
+
+        // Mounting ListRecords boots the table (pushActions → $action->table()).
+        // Before the fix this threw "Method Filament\Actions\Action::table does
+        // not exist" and returned a 500 for the entire flyers list.
+        Livewire::test(\App\Filament\Resources\FlyerResource\Pages\ListFlyers::class)
+            ->assertOk()
+            ->assertSee($flyer->title)
+            ->callTableAction('regenerateContent', $flyer, ['mode' => 'copy']);
+
+        Queue::assertPushed(RegenerateFlyerContentJob::class, function (RegenerateFlyerContentJob $job) use ($flyer): bool {
+            return $job->flyerId === $flyer->id && $job->mode === 'copy';
+        });
     }
 }
