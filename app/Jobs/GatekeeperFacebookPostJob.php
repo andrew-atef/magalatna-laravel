@@ -750,8 +750,11 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
      * a flyer that already carries discover_image_path is skipped, so retries
      * and rebuild batches never re-encode). Non-fatal: any R2/Intervention
      * failure just logs and leaves the flyer's meta fallback to the cover.
+     *
+     * Public: shared with RegenerateFlyerContentJob (single authority for the
+     * 1280x720 composite — never duplicated).
      */
-    private static function ensureDiscoverImage(Flyer $flyer): void
+    public static function ensureDiscoverImage(Flyer $flyer): void
     {
         if (trim((string) $flyer->discover_image_path) !== '') {
             return;

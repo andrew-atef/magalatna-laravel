@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Filament\Resources;
 
 use App\Enums\FlyerStatus;
+use App\Filament\Actions\RegenerateContentAction;
 use App\Filament\Resources\FlyerResource\Pages;
 use App\Filament\Resources\FlyerResource\RelationManagers\ItemsRelationManager;
 use App\Models\Flyer;
@@ -339,6 +340,8 @@ final class FlyerResource extends Resource
                 Tables\Actions\EditAction::make(),
 
                 Tables\Actions\ViewAction::make(),
+
+                RegenerateContentAction::make(),
 
                 Tables\Actions\Action::make('publishAndIndex')
                     ->label('Publish & Index')

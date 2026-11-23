@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Filament\Resources\FlyerResource\Pages;
 
+use App\Filament\Actions\RegenerateContentAction;
 use App\Filament\Resources\FlyerResource;
 use Filament\Actions;
 use Filament\Resources\Pages\ViewRecord;
@@ -16,6 +17,7 @@ final class ViewFlyer extends ViewRecord
     {
         return [
             Actions\EditAction::make(),
+            RegenerateContentAction::make()->record($this->record),
         ];
     }
 }
