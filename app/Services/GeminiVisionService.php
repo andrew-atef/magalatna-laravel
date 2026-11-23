@@ -10,8 +10,10 @@ use App\Services\ProductDataNormalizer;
 use App\Support\PublicUrlGuard;
 use Carbon\Carbon;
 use Illuminate\Http\Client\Response;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\RateLimiter;
 use Psr\Http\Message\ResponseInterface;
 use RuntimeException;
 use Throwable;
@@ -25,17 +27,48 @@ final class GeminiVisionService
     /** Hard cap per classification image download — protects the 128MB worker. */
     private const MAX_INLINE_IMAGE_BYTES = 15 * 1024 * 1024;
 
-    private function model(): string
+    /** Short cooldown for transient failures (5xx / timeout / malformed body). */
+    private const TRANSIENT_COOLDOWN_SECONDS = 60;
+
+    /** Long cooldown for models Google reports as unsupported (400/404). */
+    private const UNSUPPORTED_COOLDOWN_SECONDS = 21600;
+
+    /**
+     * Ordered model waterfall from config('services.gemini.models').
+     * Config-only by contract: env() is resolved once in config/services.php.
+     *
+     * @return list<array{name: string, rpm: int, rpd: int}>
+     */
+    private function configuredModels(): array
     {
-        // Config-only by contract: env() is resolved once in config/services.php.
-        $model = trim((string) config('services.gemini.model', 'gemini-2.5-flash'));
+        $models = config('services.gemini.models', []);
 
-        return $model !== '' ? $model : 'gemini-2.5-flash';
+        if (! is_array($models)) {
+            return [];
+        }
+
+        $normalized = [];
+
+        foreach ($models as $model) {
+            if (! is_array($model)) {
+                continue;
+            }
+
+            $name = trim((string) ($model['name'] ?? ''));
+
+            if ($name === '') {
+                continue;
+            }
+
+            $normalized[] = [
+                'name' => $name,
+                'rpm' => max(0, (int) ($model['rpm'] ?? 5)),
+                'rpd' => max(0, (int) ($model['rpd'] ?? 20)),
+            ];
+        }
+
+        return $normalized;
     }
-
-    private const MAX_RETRIES = 4;
-
-    private const INITIAL_RETRY_DELAY_MS = 8000;
 
     /**
      * Phase 1: Gatekeeper / Classification.
@@ -221,14 +254,10 @@ final class GeminiVisionService
     }
 
     /**
-     * Core Gemini HTTP call with capped transient-5xx retry.
+     * Structured-JSON Gemini call through the ordered model waterfall.
      *
      * Auth travels in the `x-goog-api-key` header — never `?key=` in the
      * query string, which leaks into access/proxy logs.
-     *
-     * On 429 the call throws GeminiRateLimitedException immediately so the
-     * queue job can release() itself and free the timeout-bounded worker,
-     * instead of the worker burning its whole runtime in usleep() loops.
      *
      * @param  array<string, mixed>  $payload
      * @return array<string, mixed>
@@ -238,107 +267,318 @@ final class GeminiVisionService
      */
     private function callGemini(array $payload, string $apiKey): array
     {
-        $url = self::BASE_URL.'/'.$this->model().':generateContent';
+        $result = $this->executeWithModelFallback(
+            fn (string $modelName): Response => $this->postToModel($modelName, $payload, $apiKey),
+            true,
+        );
 
-        $attempt = 0;
-        $delayMs = self::INITIAL_RETRY_DELAY_MS;
-        // Cap inline backoff: any longer wait must happen via job release(),
-        // never inside the (timeout-bounded) worker process.
-        $maxDelayMs = 5000;
+        /** @var array<string, mixed> $result */
+        return $result;
+    }
 
-        while (true) {
-            $attempt++;
+    /**
+     * Ordered multi-model waterfall + per-model circuit breaker.
+     *
+     * Iterates config('services.gemini.models') in STRICT priority order and
+     * returns the FIRST success. Every skip decision is local (cache-backed,
+     * SQLite-safe) so a throttled model costs <1ms — never a multi-second
+     * usleep() inside the timeout-bounded worker when the next model is ready
+     * right behind it.
+     *
+     * $requestBuilder receives the model name and performs exactly ONE HTTP
+     * request (it may throw ConnectionException on network failure).
+     *
+     * @param  callable(string): Response  $requestBuilder
+     * @return array<string, mixed>|string decoded JSON (jsonMode) or candidate text
+     *
+     * @throws RuntimeException bad API key, or all models permanently failed / daily-exhausted
+     * @throws GeminiRateLimitedException all models temporarily throttled — the job should release()
+     */
+    private function executeWithModelFallback(callable $requestBuilder, bool $jsonMode = true): array|string
+    {
+        $models = $this->configuredModels();
+
+        if ($models === []) {
+            throw new RuntimeException('No Gemini models configured (services.gemini.models).');
+        }
+
+        // Gemini free-tier RPD resets at midnight Pacific, NOT Cairo/UTC.
+        $ptNow = now('America/Los_Angeles');
+        $ptDate = $ptNow->toDateString();
+        $ptEndOfDay = $ptNow->copy()->endOfDay();
+
+        $earliestRetryAfter = null;
+        $anyTemporaryFailure = false;
+        $attemptOrder = 0;
+
+        foreach ($models as $model) {
+            $attemptOrder++;
+            $name = $model['name'];
+            $rpm = $model['rpm'];
+            $rpd = $model['rpd'];
+            $cooldownKey = "gemini_cooldown:{$name}";
+            $rpdKey = "gemini_rpd:{$name}:{$ptDate}";
+            $rpmKey = "gemini_rpm:{$name}";
+
+            // 1) Local circuit breaker: a cooling model is skipped in <1ms.
+            if (Cache::has($cooldownKey)) {
+                $reason = (string) Cache::get($cooldownKey, '');
+
+                // 'unsupported' (400/404, 6h) is NOT a 15-60s retry candidate.
+                if ($reason !== 'unsupported') {
+                    $anyTemporaryFailure = true;
+                    $until = (int) Cache::get("gemini_cooldown_until:{$name}", 0);
+                    $wait = $until > time() ? $until - time() : self::TRANSIENT_COOLDOWN_SECONDS;
+                    $earliestRetryAfter = min($earliestRetryAfter ?? PHP_INT_MAX, max(5, $wait));
+                }
+
+                $this->safeLog('debug', 'Gemini model on cooldown, skipping.', [
+                    'model' => $name,
+                    'reason' => $reason,
+                    'attempt_order' => $attemptOrder,
+                ]);
+
+                continue;
+            }
+
+            // 2) Local RPD quota (Pacific-Time day).
+            if ($rpd > 0 && (int) Cache::get($rpdKey, 0) >= $rpd) {
+                $this->safeLog('debug', 'Gemini model daily quota exhausted, skipping.', [
+                    'model' => $name,
+                    'rpd' => $rpd,
+                    'attempt_order' => $attemptOrder,
+                ]);
+
+                continue;
+            }
+
+            // 3) Local RPM quota — skip immediately, never sleep in-worker.
+            if ($rpm > 0 && RateLimiter::tooManyAttempts($rpmKey, $rpm)) {
+                $wait = max(5, RateLimiter::availableIn($rpmKey));
+                $earliestRetryAfter = min($earliestRetryAfter ?? PHP_INT_MAX, $wait);
+                $anyTemporaryFailure = true;
+
+                $this->safeLog('debug', 'Gemini model RPM window full, skipping.', [
+                    'model' => $name,
+                    'rpm' => $rpm,
+                    'retry_after' => $wait,
+                    'attempt_order' => $attemptOrder,
+                ]);
+
+                continue;
+            }
+
+            // 4) Budget the attempt: RPM hit + atomic RPD increment. Cache::add
+            //    seeds the daily counter WITH its PT-midnight TTL only when the
+            //    key is newly created; increment then bumps it atomically.
+            RateLimiter::hit($rpmKey, 60);
+            Cache::add($rpdKey, 0, $ptEndOfDay);
+            Cache::increment($rpdKey);
 
             try {
-                /** @var Response $response */
-                $response = Http::timeout(self::TIMEOUT_SECONDS)
-                    ->withHeaders([
-                        'Content-Type' => 'application/json',
-                        'Accept' => 'application/json',
-                        'x-goog-api-key' => $apiKey,
-                    ])
-                    ->withOptions([
-                        'http_errors' => false,
-                    ])
-                    ->post($url, $payload);
-
-                $status = $response->status();
-
-                if ($status === 429) {
-                    $retryAfter = (int) $response->header('Retry-After');
-
-                    Log::warning('Gemini API 429 Too Many Requests.', [
-                        'attempt' => $attempt,
-                        'retry_after' => $retryAfter,
-                    ]);
-
-                    throw new GeminiRateLimitedException(
-                        'Gemini API rate limited (429) after '.$attempt.' attempt(s).',
-                        $retryAfter,
-                    );
-                }
-
-                if (! $response->successful()) {
-                    $bodySnippet = substr((string) $response->body(), 0, 1000);
-
-                    Log::error('Gemini API non-successful response.', [
-                        'status' => $status,
-                        'body_snippet' => $bodySnippet,
-                        'attempt' => $attempt,
-                    ]);
-
-                    // Retry on 5xx transient with a capped backoff
-                    if ($status >= 500 && $status < 600 && $attempt < self::MAX_RETRIES) {
-                        usleep(min($delayMs, $maxDelayMs) * 1000);
-                        $delayMs = min($delayMs * 2, $maxDelayMs);
-
-                        continue;
-                    }
-
-                    throw new RuntimeException('Gemini API error: HTTP '.$status.' - '.$bodySnippet);
-                }
-
-                $body = (string) $response->body();
-
-                if (trim($body) === '') {
-                    throw new RuntimeException('Gemini API returned empty body.');
-                }
-
-                $json = json_decode($body, true);
-
-                if (json_last_error() !== JSON_ERROR_NONE) {
-                    $errorMsg = json_last_error_msg();
-                    Log::error('Gemini API returned invalid JSON.', [
-                        'body_snippet' => substr($body, 0, 2000),
-                        'json_error' => $errorMsg,
-                    ]);
-
-                    throw new RuntimeException('Gemini API returned invalid JSON: '.$errorMsg);
-                }
-
-                return $this->extractJsonFromCandidate($json);
-            } catch (GeminiRateLimitedException $e) {
-                throw $e;
-            } catch (RuntimeException $e) {
-                // Deliberate failures — permanent 4xx API errors (400/401/403/
-                // 404), empty/invalid bodies, malformed candidates — must
-                // propagate immediately instead of burning the retry budget.
-                // Connection-level failures (ConnectionException) are NOT
-                // RuntimeExceptions and still fall through to the retry below.
-                throw $e;
+                $response = $requestBuilder($name);
             } catch (Throwable $e) {
-                Log::error('Gemini HTTP call failed.', [
-                    'attempt' => $attempt,
+                // ConnectionException / timeout — short cooldown, fail over.
+                $this->putCooldown($name, 'connection_error', self::TRANSIENT_COOLDOWN_SECONDS);
+                $anyTemporaryFailure = true;
+                $earliestRetryAfter = min($earliestRetryAfter ?? PHP_INT_MAX, self::TRANSIENT_COOLDOWN_SECONDS);
+
+                $this->safeLog('warning', 'Gemini model connection failure, failing over.', [
+                    'model' => $name,
+                    'attempt_order' => $attemptOrder,
                     'error' => $e->getMessage(),
                 ]);
 
-                if ($attempt >= self::MAX_RETRIES) {
-                    throw new RuntimeException('Gemini HTTP call failed after '.$attempt.' attempts: '.$e->getMessage(), 0, $e);
+                continue;
+            }
+
+            $status = $response->status();
+
+            // 401/403 = bad API key, NOT model-specific: fail fast — never burn
+            // the whole waterfall on an auth error.
+            if ($status === 401 || $status === 403) {
+                throw new RuntimeException('Gemini API authentication failed (HTTP '.$status.') — check GEMINI_API_KEY.');
+            }
+
+            // 400/404 = model not found / unsupported: 6-hour cooldown.
+            if ($status === 400 || $status === 404) {
+                $this->putCooldown($name, 'unsupported', self::UNSUPPORTED_COOLDOWN_SECONDS);
+
+                $this->safeLog('warning', 'Gemini model unsupported, cooling down 6h.', [
+                    'model' => $name,
+                    'status' => $status,
+                    'attempt_order' => $attemptOrder,
+                    'body_snippet' => substr((string) $response->body(), 0, 500),
+                ]);
+
+                continue;
+            }
+
+            if ($status === 429) {
+                $retryAfter = (int) $response->header('Retry-After');
+                $body = (string) $response->body();
+                $isDailyQuota = $retryAfter > 120
+                    || preg_match('/perday|requestsperday|generaterequestsperday/i', $body) === 1;
+
+                if ($isDailyQuota && $rpd > 0) {
+                    // Google says the DAY is done — mirror it locally so every
+                    // later call skips this model until the PT reset.
+                    Cache::put($rpdKey, $rpd, $ptEndOfDay);
+
+                    $this->safeLog('warning', 'Gemini model daily quota exhausted (429), skipping for the PT day.', [
+                        'model' => $name,
+                        'retry_after' => $retryAfter,
+                        'attempt_order' => $attemptOrder,
+                    ]);
+
+                    continue;
                 }
 
-                usleep(min($delayMs, $maxDelayMs) * 1000);
-                $delayMs = min($delayMs * 2, $maxDelayMs);
+                // RPM burst: short cooldown, then straight to the next model.
+                $cooldown = max(60, min(120, $retryAfter > 0 ? $retryAfter : 65));
+                $this->putCooldown($name, '429_rpm', $cooldown);
+                $anyTemporaryFailure = true;
+                $earliestRetryAfter = min($earliestRetryAfter ?? PHP_INT_MAX, $cooldown);
+
+                $this->safeLog('warning', 'Gemini model rate limited (429 RPM), failing over.', [
+                    'model' => $name,
+                    'cooldown' => $cooldown,
+                    'attempt_order' => $attemptOrder,
+                ]);
+
+                continue;
             }
+
+            if (! $response->successful()) {
+                // 5xx (and any other non-success): short cooldown + failover.
+                $this->putCooldown($name, 'http_'.$status, self::TRANSIENT_COOLDOWN_SECONDS);
+                $anyTemporaryFailure = true;
+                $earliestRetryAfter = min($earliestRetryAfter ?? PHP_INT_MAX, self::TRANSIENT_COOLDOWN_SECONDS);
+
+                $this->safeLog('warning', 'Gemini model HTTP error, failing over.', [
+                    'model' => $name,
+                    'status' => $status,
+                    'attempt_order' => $attemptOrder,
+                    'body_snippet' => substr((string) $response->body(), 0, 500),
+                ]);
+
+                continue;
+            }
+
+            // 200 — validate the payload BEFORE declaring success: a malformed
+            // body / empty candidate is a MODEL failure, not a caller failure.
+            try {
+                if ($jsonMode) {
+                    $body = (string) $response->body();
+
+                    if (trim($body) === '') {
+                        throw new RuntimeException('Gemini API returned empty body.');
+                    }
+
+                    $raw = json_decode($body, true);
+
+                    if (json_last_error() !== JSON_ERROR_NONE) {
+                        throw new RuntimeException('Gemini API returned invalid JSON: '.json_last_error_msg());
+                    }
+
+                    if (! is_array($raw)) {
+                        throw new RuntimeException('Gemini API JSON is not an object.');
+                    }
+
+                    $result = $this->extractJsonFromCandidate($raw);
+                } else {
+                    $json = $response->json();
+                    $text = $json['candidates'][0]['content']['parts'][0]['text'] ?? '';
+
+                    if (! is_string($text) || trim($text) === '') {
+                        throw new RuntimeException('Gemini API returned empty candidate text.');
+                    }
+
+                    $result = trim($text);
+                }
+            } catch (Throwable $e) {
+                $this->putCooldown($name, 'invalid_response', self::TRANSIENT_COOLDOWN_SECONDS);
+                $anyTemporaryFailure = true;
+                $earliestRetryAfter = min($earliestRetryAfter ?? PHP_INT_MAX, self::TRANSIENT_COOLDOWN_SECONDS);
+
+                $this->safeLog('warning', 'Gemini model returned malformed response, failing over.', [
+                    'model' => $name,
+                    'attempt_order' => $attemptOrder,
+                    'error' => $e->getMessage(),
+                ]);
+
+                continue;
+            }
+
+            $this->safeLog('info', 'Gemini model succeeded.', [
+                'model' => $name,
+                'attempt_order' => $attemptOrder,
+                'json_mode' => $jsonMode,
+            ]);
+
+            return $result;
+        }
+
+        // Every model skipped/failed. Temporary throttling → the queue job
+        // releases itself and retries after the earliest window; permanent
+        // exhaustion → hard failure.
+        if ($anyTemporaryFailure) {
+            $retry = max(15, min(60, $earliestRetryAfter ?? 30));
+
+            throw new GeminiRateLimitedException(
+                'All configured Gemini models are temporarily rate limited (429/RPM). Retry after '.$retry.'s.',
+                $retry,
+            );
+        }
+
+        throw new RuntimeException('All configured Gemini models failed or exhausted their daily quota.');
+    }
+
+    /**
+     * ONE HTTP request to a specific model. Auth in the x-goog-api-key header
+     * (never ?key= in the query string). http_errors=false so the waterfall
+     * engine inspects every status itself; network failures still throw
+     * ConnectionException for the engine to catch.
+     *
+     * @param  array<string, mixed>  $payload
+     */
+    private function postToModel(string $modelName, array $payload, string $apiKey): Response
+    {
+        return Http::timeout(self::TIMEOUT_SECONDS)
+            ->withHeaders([
+                'Content-Type' => 'application/json',
+                'Accept' => 'application/json',
+                'x-goog-api-key' => $apiKey,
+            ])
+            ->withOptions([
+                'http_errors' => false,
+            ])
+            ->post(self::BASE_URL.'/'.$modelName.':generateContent', $payload);
+    }
+
+    /**
+     * Circuit-breaker cooldown. The reason string is the contract value
+     * ('unsupported', '429_rpm', ...); the companion *_until key carries the
+     * expiry timestamp so gemini:models-status can display remaining seconds
+     * (the cache store has no generic TTL-read API).
+     */
+    private function putCooldown(string $modelName, string $reason, int $seconds): void
+    {
+        Cache::put("gemini_cooldown:{$modelName}", $reason, $seconds);
+        Cache::put("gemini_cooldown_until:{$modelName}", time() + $seconds, $seconds);
+    }
+
+    /**
+     * Logging must never break the pipeline (read-only log file, full disk).
+     *
+     * @param  array<string, mixed>  $context
+     */
+    private function safeLog(string $level, string $message, array $context = []): void
+    {
+        try {
+            Log::{$level}($message, $context);
+        } catch (Throwable) {
+            // Logging unavailable — carry on.
         }
     }
 
@@ -763,13 +1003,36 @@ PROMPT;
     }
 
     /**
-     * Raw text call without JSON schema (for BLUF / editorial copy).
+     * Plain-text generation through the SAME ordered waterfall + circuit
+     * breaker as vision/OCR. ReelScriptService (reel scripts + TikTok
+     * captions) uses this instead of raw Http::post, so every Gemini text
+     * call shares one failover engine and one set of per-model quotas.
      *
-     * Auth travels in the `x-goog-api-key` header — never `?key=` in the
-     * query string. Transient 5xx responses are retried with a capped
-     * backoff; 429 throws GeminiRateLimitedException so queue jobs can
-     * release() instead of the worker sleeping. Errors NEVER include the
-     * API key.
+     * @throws RuntimeException
+     * @throws GeminiRateLimitedException
+     */
+    public function generatePlainText(string $prompt, float $temperature = 0.7): string
+    {
+        $apiKey = $this->apiKey();
+
+        $payload = [
+            'contents' => [
+                ['role' => 'user', 'parts' => [['text' => $prompt]]],
+            ],
+            'generationConfig' => [
+                'temperature' => $temperature,
+                'topP' => 0.95,
+                'responseMimeType' => 'text/plain',
+            ],
+        ];
+
+        return $this->callGeminiRawText($payload, $apiKey);
+    }
+
+    /**
+     * Raw-text call (BLUF / editorial / reel copy) through the ordered model
+     * waterfall. Auth travels in the `x-goog-api-key` header — never `?key=`
+     * in the query string. Errors NEVER include the API key.
      *
      * @param  array<string, mixed>  $payload
      *
@@ -778,69 +1041,13 @@ PROMPT;
      */
     private function callGeminiRawText(array $payload, string $apiKey): string
     {
-        $url = self::BASE_URL.'/'.$this->model().':generateContent';
+        $result = $this->executeWithModelFallback(
+            fn (string $modelName): Response => $this->postToModel($modelName, $payload, $apiKey),
+            false,
+        );
 
-        $attempt = 0;
-        $maxAttempts = 3;
-        $delayMs = 2000;
-
-        while (true) {
-            $attempt++;
-
-            $response = Http::timeout(self::TIMEOUT_SECONDS)
-                ->withHeaders([
-                    'Content-Type' => 'application/json',
-                    'Accept' => 'application/json',
-                    'x-goog-api-key' => $apiKey,
-                ])
-                ->withOptions([
-                    'http_errors' => false,
-                ])
-                ->post($url, $payload);
-
-            $status = $response->status();
-
-            if ($status === 429) {
-                $retryAfter = (int) $response->header('Retry-After');
-
-                Log::warning('Gemini raw-text call rate limited (429).', [
-                    'attempt' => $attempt,
-                    'retry_after' => $retryAfter,
-                ]);
-
-                throw new GeminiRateLimitedException(
-                    'Gemini API rate limited (429) on raw-text call after '.$attempt.' attempt(s).',
-                    $retryAfter,
-                );
-            }
-
-            if (! $response->successful()) {
-                Log::error('Gemini raw-text call failed.', [
-                    'status' => $status,
-                    'body_snippet' => substr((string) $response->body(), 0, 1000),
-                    'attempt' => $attempt,
-                ]);
-
-                // Retry transient 5xx with a capped backoff
-                if ($status >= 500 && $status < 600 && $attempt < $maxAttempts) {
-                    usleep($delayMs * 1000);
-                    $delayMs = min($delayMs * 2, 5000);
-
-                    continue;
-                }
-
-                throw new RuntimeException('Gemini BLUF error: HTTP '.$status);
-            }
-
-            $json = $response->json();
-            $text = $json['candidates'][0]['content']['parts'][0]['text'] ?? '';
-
-            if (! is_string($text) || trim($text) === '') {
-                throw new RuntimeException('Gemini BLUF empty response');
-            }
-
-            return trim($text);
-        }
+        /** @var string $result */
+        return $result;
     }
 
     /**

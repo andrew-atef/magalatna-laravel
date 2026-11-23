@@ -23,7 +23,6 @@ use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
-use Illuminate\Support\Facades\RateLimiter;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
 use Psr\Http\Message\ResponseInterface;
@@ -37,20 +36,19 @@ final class ProcessSinglePageJob implements ShouldQueue
     use Queueable;
     use SerializesModels;
 
-    public int $tries = 3;
+    public int $tries = 15;
+
+    /**
+     * Temporary GeminiRateLimitedException release() loops must never count
+     * toward permanent failure — only genuinely thrown exceptions do, so an
+     * RPM burst across the model waterfall can never trip MaxAttemptsExceeded.
+     */
+    public int $maxExceptions = 3;
 
     /** @var list<int> */
     public array $backoff = [10, 30, 60];
 
     public int $timeout = 180;
-
-    /**
-     * Gemini free-tier budget: 15 requests per 60s. Backed by the default
-     * cache store (SQLite-safe, no Redis dependency).
-     */
-    private const GEMINI_RPM_LIMIT = 15;
-
-    private const GEMINI_RPM_WINDOW = 60;
 
     /** Hard cap per image download — protects the 128MB queue worker. */
     private const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
@@ -79,38 +77,12 @@ final class ProcessSinglePageJob implements ShouldQueue
         }
 
         try {
-            // Cache-backed rate limiter (RateLimiter facade): unlike
-            // Redis::throttle — which silently disables itself when Redis is
-            // absent and lets the whole batch slam Gemini at once — this works
-            // on any cache store. Release back to the queue when the window
-            // is exhausted instead of burning a synchronous wait.
-            if (RateLimiter::tooManyAttempts('gemini-api-limit', self::GEMINI_RPM_LIMIT)) {
-                $retryAfter = max(10, RateLimiter::availableIn('gemini-api-limit'));
-
-                Log::warning('Gemini rate limit hit, releasing job.', [
-                    'flyer_id' => $this->flyerId,
-                    'page_number' => $this->pageNumber,
-                    'retry_after_seconds' => $retryAfter,
-                ]);
-
-                $this->release($retryAfter);
-
-                return;
-            }
-
-            $processed = RateLimiter::attempt(
-                'gemini-api-limit',
-                self::GEMINI_RPM_LIMIT,
-                function () use ($gemini, $optimizer): void {
-                    $this->processPage($gemini, $optimizer);
-                },
-                self::GEMINI_RPM_WINDOW,
-            );
-
-            if ($processed === false) {
-                // Window filled between the check and the attempt.
-                $this->release(10);
-            }
+            // Per-model RPM/RPD quotas + the ordered model waterfall live
+            // INSIDE GeminiVisionService now — no global 'gemini-api-limit'
+            // gate here. When every model is temporarily throttled the
+            // waterfall throws GeminiRateLimitedException and this job
+            // releases itself, freeing the timeout-bounded worker.
+            $this->processPage($gemini, $optimizer);
         } catch (GeminiRateLimitedException $e) {
             // Gemini answered 429 — free the worker immediately and retry the
             // job after the rate-limit window instead of sleeping in-process.
@@ -137,7 +109,7 @@ final class ProcessSinglePageJob implements ShouldQueue
     }
 
     /**
-     * Core page processing logic (called inside throttle).
+     * Core page processing logic.
      *
      * @throws Throwable
      */

@@ -7,7 +7,6 @@ namespace App\Services;
 use App\Models\Flyer;
 use App\Models\FlyerItem;
 use Carbon\Carbon;
-use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use RuntimeException;
 use Throwable;
@@ -31,7 +30,9 @@ final class ReelScriptService
      */
     private const MAX_WORDS = 90;
 
-    private const TIMEOUT_SECONDS = 60;
+    public function __construct(
+        private readonly GeminiVisionService $geminiVisionService,
+    ) {}
 
     /**
      * @return array{script: string, caption: string, source: string}
@@ -254,12 +255,6 @@ final class ReelScriptService
      */
     private function viaGemini(Flyer $flyer, \Illuminate\Support\Collection $items, string $retailerName): string
     {
-        $apiKey = trim((string) config('services.gemini.key', ''));
-
-        if ($apiKey === '') {
-            throw new RuntimeException('GEMINI_API_KEY is not configured.');
-        }
-
         $itemsText = $items
             ->map(static function (FlyerItem $item): string {
                 $sale = self::trimDecimal((float) $item->sale_price);
@@ -295,30 +290,11 @@ final class ReelScriptService
 - أخرج نص السكريبت فقط بدون أي مقدمات أو علامات تنسيق.
 PROMPT;
 
-        $response = Http::timeout(self::TIMEOUT_SECONDS)
-            ->withHeaders([
-                'Content-Type' => 'application/json',
-                'Accept' => 'application/json',
-                'x-goog-api-key' => $apiKey,
-            ])
-            ->withOptions(['http_errors' => false])
-            ->post('https://generativelanguage.googleapis.com/v1beta/models/'
-                .trim((string) config('services.gemini.model', 'gemini-2.5-flash')).':generateContent', [
-                'contents' => [
-                    ['role' => 'user', 'parts' => [['text' => $prompt]]],
-                ],
-                'generationConfig' => [
-                    'temperature' => 0.8,
-                    'topP' => 0.95,
-                    'responseMimeType' => 'text/plain',
-                ],
-            ]);
+        // Same ordered model waterfall + per-model RPM/RPD circuit breaker as
+        // vision/OCR — never a raw single-model Http::post here.
+        $raw = $this->geminiVisionService->generatePlainText($prompt, 0.8);
 
-        if (! $response->successful()) {
-            throw new RuntimeException('Gemini script call failed: HTTP '.$response->status());
-        }
-
-        $text = trim(html_entity_decode((string) $response->json('candidates.0.content.parts.0.text'), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+        $text = trim(html_entity_decode($raw, ENT_QUOTES | ENT_HTML5, 'UTF-8'));
         $text = str_replace(['"', '“', '”', '«', '»'], '', $text);
         $text = (string) preg_replace('/^[\s\*#\-]*(سكريبت|السكريبت)[:：]?\s*/u', '', $text);
         $text = trim($text);
@@ -406,12 +382,6 @@ PROMPT;
      */
     private function viaGeminiCaption(Flyer $flyer, string $script, string $retailerName): string
     {
-        $apiKey = trim((string) config('services.gemini.key', ''));
-
-        if ($apiKey === '') {
-            throw new RuntimeException('GEMINI_API_KEY is not configured.');
-        }
-
         $prompt = <<<PROMPT
 اكتب وصف (caption) لفيديو تيك توك/ريلز عن العروض دي.
 
@@ -427,29 +397,8 @@ PROMPT;
 - اخرج نص الوصف فقط بدون تنسيق.
 PROMPT;
 
-        $response = Http::timeout(self::TIMEOUT_SECONDS)
-            ->withHeaders([
-                'Content-Type' => 'application/json',
-                'Accept' => 'application/json',
-                'x-goog-api-key' => $apiKey,
-            ])
-            ->withOptions(['http_errors' => false])
-            ->post('https://generativelanguage.googleapis.com/v1beta/models/'
-                .trim((string) config('services.gemini.model', 'gemini-2.5-flash')).':generateContent', [
-                'contents' => [
-                    ['role' => 'user', 'parts' => [['text' => $prompt]]],
-                ],
-                'generationConfig' => [
-                    'temperature' => 0.7,
-                    'responseMimeType' => 'text/plain',
-                ],
-            ]);
-
-        if (! $response->successful()) {
-            throw new RuntimeException('Gemini caption call failed: HTTP '.$response->status());
-        }
-
-        $text = trim((string) $response->json('candidates.0.content.parts.0.text'));
+        // Same waterfall engine as the script call above.
+        $text = trim($this->geminiVisionService->generatePlainText($prompt, 0.7));
 
         if ($text === '' || preg_match('/[\x{0600}-\x{06FF}]/u', $text) !== 1 || mb_strlen($text) > 300) {
             throw new RuntimeException('Gemini caption is empty, not Arabic, or too long.');

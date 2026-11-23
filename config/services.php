@@ -1,5 +1,60 @@
 <?php
 
+/*
+|--------------------------------------------------------------------------
+| Gemini ordered model waterfall (GEMINI_MODELS)
+|--------------------------------------------------------------------------
+| Comma-separated "name:rpm:rpd" entries in STRICT priority order, e.g.
+|   gemini-4-hydrogen:5:20,gemini-3.8-flash:5:20,gemini-3.5-flash-lite:15:500
+| Omitted quotas default to 5 RPM / 20 RPD. Empty/unset falls back to the
+| single GEMINI_MODEL at 15 RPM / 500 RPD.
+|
+| Parsed with plain array operations ONLY — no Closures — so the result
+| serializes cleanly under `php artisan config:cache`.
+*/
+$geminiModels = [];
+$geminiModelsRaw = trim((string) env('GEMINI_MODELS', ''));
+
+if ($geminiModelsRaw !== '') {
+    $geminiSeen = [];
+
+    foreach (explode(',', $geminiModelsRaw) as $geminiEntry) {
+        $geminiEntry = trim($geminiEntry);
+
+        if ($geminiEntry === '') {
+            continue;
+        }
+
+        $geminiParts = explode(':', $geminiEntry, 3);
+        $geminiName = trim($geminiParts[0]);
+
+        // Skip blanks and duplicate names (a repeated model would double-spend
+        // its own RPM/RPD budget inside one waterfall pass).
+        if ($geminiName === '' || isset($geminiSeen[$geminiName])) {
+            continue;
+        }
+
+        $geminiSeen[$geminiName] = true;
+        $geminiModels[] = [
+            'name' => $geminiName,
+            'rpm' => isset($geminiParts[1]) && trim($geminiParts[1]) !== '' ? max(0, (int) trim($geminiParts[1])) : 5,
+            'rpd' => isset($geminiParts[2]) && trim($geminiParts[2]) !== '' ? max(0, (int) trim($geminiParts[2])) : 20,
+        ];
+    }
+}
+
+if ($geminiModels === []) {
+    $geminiFallbackName = trim((string) env('GEMINI_MODEL', 'gemini-2.5-flash'));
+
+    if ($geminiFallbackName === '') {
+        $geminiFallbackName = 'gemini-2.5-flash';
+    }
+
+    $geminiModels = [
+        ['name' => $geminiFallbackName, 'rpm' => 15, 'rpd' => 500],
+    ];
+}
+
 return [
 
     /*
@@ -38,6 +93,10 @@ return [
     'gemini' => [
         'key' => env('GEMINI_API_KEY'),
         'model' => env('GEMINI_MODEL', 'gemini-2.5-flash'),
+        // Ordered priority waterfall with per-model RPM/RPD quotas (parsed
+        // above). GeminiVisionService iterates this list on EVERY text/vision/
+        // OCR/script call; ReelScriptService shares the same engine.
+        'models' => $geminiModels,
         // Audio synthesis (TTS) model — speechMetadata + responseModalities:
         // ["audio"] require a TTS-capable model on the streamGenerateContent
         // endpoint. Non-TTS models answer 400 "Speech metadata is not

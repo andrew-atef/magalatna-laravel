@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Jobs;
 
 use App\Enums\FlyerStatus;
+use App\Exceptions\GeminiRateLimitedException;
 use App\Models\Flyer;
 use App\Models\FlyerItem;
 use App\Models\RawFacebookPost;
@@ -37,7 +38,13 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
     use Queueable;
     use SerializesModels;
 
-    public int $tries = 3;
+    public int $tries = 10;
+
+    /**
+     * Temporary waterfall release() loops never count toward permanent
+     * failure — only genuinely thrown exceptions do.
+     */
+    public int $maxExceptions = 3;
 
     /** @var list<int> */
     public array $backoff = [10, 30, 60];
@@ -386,6 +393,19 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
 
                 return;
             }
+        } catch (GeminiRateLimitedException $e) {
+            // The whole ordered model waterfall is temporarily throttled —
+            // free the worker and retry after the earliest RPM window instead
+            // of sleeping in-process.
+            Log::warning('Gatekeeper hit Gemini waterfall rate limit, releasing job.', [
+                'facebook_post_id' => $this->facebookPostId,
+                'retry_after_seconds' => $e->retryAfterSeconds,
+                'attempt' => $this->attempts(),
+            ]);
+
+            $this->release($e->retryAfterSeconds > 0 ? $e->retryAfterSeconds : 20);
+
+            return;
         } catch (Throwable $e) {
             if (str_contains($e->getMessage(), '429') || str_contains($e->getMessage(), 'rate limit') || str_contains($e->getMessage(), 'rate limited')) {
                 Log::warning('Gatekeeper hit Gemini 429 rate limit, releasing job back to queue for 30s.', [
