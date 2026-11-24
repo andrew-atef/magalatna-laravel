@@ -33,7 +33,9 @@ final class CleanFlyerItemsCommand extends Command
         {--dry-run : عرض التغييرات المقترحة دون حفظ أي بيانات}
         {--brands-only : تشغيل إصلاح البراندات المخالفة فقط (إيليت/إلفيف/دولتين/بيبيسي) ثم الخروج}
         {--repair-titles : إصلاح عناوين المجلات المقصوصة وسط الكلمة (| تخفيضا، | مه) ثم الخروج}
-        {--ai-audit : تشغيل مدقق النصوص الذكي (Gemini 3.5 Flash Lite) بعد التنظيف}';
+        {--ai-audit : تشغيل مدقق النصوص الذكي (Gemini 3.5 Flash Lite) بعد التنظيف}
+        {--flyer=* : معرفات مجلات محددة للتنظيف فقط}
+        {--all : تضمين المجلات المنتهية/التاريخية (افتراضياً: فقط المجلات النشطة والقادمة)}';
 
     protected $description = 'تنظيف وتوحيد بيانات سلع المجلات: تصحيح أسماء المنتجات والبراندات، التصنيف التلقائي، وإزالة التكرار (أغنى صف يفوز) مع إعادة بناء النصوص الترويجية';
 
@@ -60,10 +62,25 @@ final class CleanFlyerItemsCommand extends Command
             return $this->runAiAuditor($dryRun);
         }
 
-        $flyerIds = Flyer::query()
-            ->whereHas('items')
-            ->orderBy('id')
-            ->pluck('id');
+        // Build flyer query based on options
+        $flyerQuery = Flyer::query()->whereHas('items');
+
+        $flyerIdsOption = $this->option('flyer');
+        if ($flyerIdsOption !== []) {
+            // Specific flyer IDs provided — process ONLY those
+            $flyerQuery->whereIn('id', $flyerIdsOption);
+        } elseif (!(bool) $this->option('all')) {
+            // DEFAULT: only active/upcoming flyers (valid_until >= today, status published/pending)
+            $todayCairo = now('Africa/Cairo')->toDateString();
+            $flyerQuery->where('valid_until', '>=', $todayCairo)
+                ->whereIn('status', [
+                    \App\Enums\FlyerStatus::Published->value,
+                    \App\Enums\FlyerStatus::PendingReview->value,
+                ]);
+        }
+        // --all: no additional filters (process all flyers with items)
+
+        $flyerIds = $flyerQuery->orderBy('id')->pluck('id');
 
         $total = $flyerIds->count();
 
@@ -204,12 +221,6 @@ final class CleanFlyerItemsCommand extends Command
                         // ($flyer->items()) hits the DB fresh and the new
                         // copy never quotes deleted/merged duplicates.
                         $flyer->unsetRelation('items');
-
-                        // Blank the Gemini key: generateBlufSummary()/Editorial()
-                        // throw immediately in apiKey(), the Gatekeeper builders
-                        // catch it, and the DETERMINISTIC fallback copy is built —
-                        // no AI cost, no rate limits, fully reproducible output.
-                        config()->set('services.gemini.key', '');
 
                         $flyer->bluf_summary = GatekeeperFacebookPostJob::buildBlufSummary($flyer);
                         $flyer->editorial_overview = GatekeeperFacebookPostJob::buildEditorialOverview($flyer);
@@ -677,15 +688,26 @@ final class CleanFlyerItemsCommand extends Command
     }
 
     /**
-     * Run the AI Text Auditor on all flyers with items.
+     * Run the AI Text Auditor on flyers (scoped by options).
      */
     private function runAiAuditor(bool $dryRun): int
     {
-        $flyerIds = Flyer::query()
-            ->whereHas('items')
-            ->orderBy('id')
-            ->pluck('id');
+        // Build query same as main handle()
+        $flyerQuery = Flyer::query()->whereHas('items');
 
+        $flyerIdsOption = $this->option('flyer');
+        if ($flyerIdsOption !== []) {
+            $flyerQuery->whereIn('id', $flyerIdsOption);
+        } elseif (!(bool) $this->option('all')) {
+            $todayCairo = now('Africa/Cairo')->toDateString();
+            $flyerQuery->where('valid_until', '>=', $todayCairo)
+                ->whereIn('status', [
+                    \App\Enums\FlyerStatus::Published->value,
+                    \App\Enums\FlyerStatus::PendingReview->value,
+                ]);
+        }
+
+        $flyerIds = $flyerQuery->orderBy('id')->pluck('id');
         $total = $flyerIds->count();
 
         if ($total === 0) {
@@ -707,24 +729,48 @@ final class CleanFlyerItemsCommand extends Command
                 ->get();
 
             foreach ($flyers as $flyer) {
-                try {
-                    $result = $dryRun
-                        ? ['applied' => 0, 'dropped' => 0, 'skipped' => false] // Dry run: just log what would happen
-                        : $auditor->audit($flyer);
+                // CLI rate-limit handling: wait & retry ONCE if hit
+                $retryOnce = true;
+                $result = null;
 
-                    $stats['flyers']++;
-                    $stats['fixes'] += $result['applied'];
-                    $stats['drops'] += $result['dropped'];
-                    if ($result['skipped']) {
+                while (true) {
+                    try {
+                        $result = $dryRun
+                            ? ['applied' => 0, 'dropped' => 0, 'skipped' => false]
+                            : $auditor->audit($flyer);
+                        break;
+                    } catch (\App\Exceptions\GeminiRateLimitedException $e) {
+                        if (! $retryOnce) {
+                            throw $e;
+                        }
+                        $retryOnce = false;
+                        $wait = max(10, min(60, (int) $e->retryAfterSeconds));
+                        $this->warn("  #{$flyer->id}: rate limited (429), waiting {$wait}s and retrying once...");
+                        sleep($wait);
+                    } catch (Throwable $e) {
+                        // Print exact reason and continue to next flyer
+                        $this->warn("  #{$flyer->id}: SKIPPED — {$e->getMessage()}");
+                        $stats['flyers']++;
                         $stats['skipped']++;
+                        $result = ['applied' => 0, 'dropped' => 0, 'skipped' => true];
+                        break;
                     }
+                }
 
-                    if (! $result['skipped'] && ($result['applied'] > 0 || $result['dropped'] > 0)) {
+                if ($result === null) {
+                    continue;
+                }
+
+                $stats['flyers']++;
+                $stats['fixes'] += $result['applied'];
+                $stats['drops'] += $result['dropped'];
+                if ($result['skipped']) {
+                    $stats['skipped']++;
+                }
+
+                if (! $result['skipped'] && ($result['applied'] > 0 || $result['dropped'] > 0)) {
                         $this->line("  #{$flyer->id}: {$result['applied']} تصحيحات، {$result['dropped']} محذوفات");
                     }
-                } catch (Throwable $e) {
-                    $this->warn("  #{$flyer->id}: خطأ - {$e->getMessage()}");
-                }
             }
 
             unset($flyers);

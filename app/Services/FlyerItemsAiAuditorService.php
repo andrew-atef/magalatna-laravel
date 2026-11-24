@@ -91,12 +91,13 @@ final class FlyerItemsAiAuditorService
     }
 
     /**
-     * Call Gemini auditor model with the items payload.
+     * Call Gemini auditor model with the items payload using the SAME
+     * multi-model waterfall + circuit breaker as GeminiVisionService
+     * (prefers high-RPD flash/flash-lite models from config).
      */
     private function callAuditor(array $items, string $flyerTitle): ?array
     {
         try {
-            $model = (string) config('services.gemini.auditor_model', 'gemini-3.5-flash-lite');
             $apiKey = (string) config('services.gemini.key', '');
 
             if ($apiKey === '') {
@@ -120,38 +121,11 @@ final class FlyerItemsAiAuditorService
                 ],
             ];
 
-            $response = Http::timeout(self::TIMEOUT_SECONDS)
-                ->withHeaders([
-                    'Content-Type' => 'application/json',
-                    'x-goog-api-key' => $apiKey,
-                ])
-                ->withOptions(['http_errors' => false])
-                ->post(self::BASE_URL . '/' . $model . ':generateContent', $payload);
+            // Use the SAME waterfall engine as vision (ordered models, RPM/RPD quotas, cooldowns)
+            $vision = app(\App\Services\GeminiVisionService::class);
+            $raw = $vision->callGeminiForAuditor($payload, $apiKey);
 
-            if ($response->status() === 429) {
-                Log::warning('FlyerItemsAiAuditor: rate limited (429), skipping.', [
-                    'model' => $model,
-                    'flyer_title' => $flyerTitle,
-                ]);
-                return null;
-            }
-
-            if (!$response->successful()) {
-                Log::warning('FlyerItemsAiAuditor: HTTP error, skipping.', [
-                    'status' => $response->status(),
-                    'body' => $response->body(),
-                ]);
-                return null;
-            }
-
-            $body = (string) $response->body();
-            if (trim($body) === '') {
-                return null;
-            }
-
-            $raw = json_decode($body, true);
-            if (json_last_error() !== JSON_ERROR_NONE) {
-                Log::warning('FlyerItemsAiAuditor: invalid JSON response.', ['error' => json_last_error_msg()]);
+            if ($raw === null) {
                 return null;
             }
 
@@ -166,6 +140,9 @@ final class FlyerItemsAiAuditorService
                 'fixes' => is_array($result['fixes']) ? $result['fixes'] : [],
                 'drop_ids' => is_array($result['drop_ids']) ? $result['drop_ids'] : [],
             ];
+        } catch (\App\Exceptions\GeminiRateLimitedException $e) {
+            // Re-throw so CLI can wait & retry once
+            throw $e;
         } catch (Throwable $e) {
             Log::warning('FlyerItemsAiAuditor: exception, skipping.', [
                 'error' => $e->getMessage(),
@@ -182,7 +159,7 @@ final class FlyerItemsAiAuditorService
         $itemsJson = json_encode($items, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
 
         return <<<PROMPT
-You are a quality auditor for Egyptian supermarket flyer data. The flyer "{${flyerTitle}}" has been deterministically normalized, but cross-item OCR inconsistencies may remain.
+You are a quality auditor for Egyptian supermarket flyer data. The flyer "{$flyerTitle}" has been deterministically normalized, but cross-item OCR inconsistencies may remain.
 
 Review the following items (compact JSON: id, name, brand, category, unit, sale_price) and return ONLY a JSON object with two keys:
 - "fixes": array of objects, each with {id, name?, brand?, category?} for items needing correction

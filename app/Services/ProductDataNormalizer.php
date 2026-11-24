@@ -240,6 +240,7 @@ final class ProductDataNormalizer
             'grapefruit', 'grapefruit pink', 'apple royal gala', 'gala',
             'sweet corn', 'brazel', 'brazil', 'green line', 'white', 'fresh',
             'imported', 'مستورد', 'طازج', 'عادي', 'حار',
+            'banana local',
         ];
         $normRaw = self::brandKey($raw);
         if (in_array($normRaw, $fakeBrands, true)) {
@@ -599,16 +600,25 @@ final class ProductDataNormalizer
         }
 
         // Also guard by product name keywords (appliance/non-consumable terms).
+        // NOTE: 'سم' is checked via digit-anchored regex below to avoid matching
+        // substrings like 'بسمتي' or 'سمك'. Other terms are exact word matches.
         $applianceKeywords = [
             'ميكروويف', 'ثلاجة', 'ثلاجه', 'فريزر', 'غسالة', 'تكييف', 'سخان', 'بوتاجاز',
-            'شاشة', 'تلفزيون', 'تليفزيون', 'قلاية', 'فرن', 'خلاط',
-            'حقيبة', 'شنطة', 'سم', 'بوصة', 'قدم', 'واط',
+            'شاشة', 'تلفزيون', 'تليفزيون', 'قلاية', 'فرن', 'خلاط', 'فرن كهربائي',
+            'حقيبة', 'شنطة', 'بوصة', 'قدم', 'واط',
         ];
         $nameLower = mb_strtolower($productName);
         foreach ($applianceKeywords as $kw) {
             if (str_contains($nameLower, $kw)) {
                 return null;
             }
+        }
+
+        // Digit-anchored measurement units that indicate non-consumable (appliance) specs:
+        // e.g., "16 بوصة", "25 لتر", "1400 واط", "50 متر", "16 سم" (with digit before)
+        // This avoids false positives on "بسمتي", "سمك", etc.
+        if (preg_match('/\d+(?:\.\d+)?\s*(?:سم|بوصة|قدم|واط|متر)(?![\p{L}\p{N}])/u', $nameLower) === 1) {
+            return null;
         }
 
         $unitAlt = 'ملل|ملي|مل|غرام|جرام|جم|ج|كيلو|كغ|كجم|ليتر|لتر';

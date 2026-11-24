@@ -1030,6 +1030,38 @@ PROMPT;
     }
 
     /**
+     * Auditor call (text-only JSON) through the SAME ordered model waterfall
+     * + circuit breaker as vision/OCR. Used by FlyerItemsAiAuditorService.
+     * Prefers high-RPD models from config (flash/flash-lite tier).
+     *
+     * @param  array<string, mixed>  $payload
+     * @return array<string, mixed>|null decoded JSON or null on failure
+     *
+     * @throws RuntimeException
+     * @throws GeminiRateLimitedException
+     */
+    public function callGeminiForAuditor(array $payload, string $apiKey): ?array
+    {
+        try {
+            $result = $this->executeWithModelFallback(
+                fn (string $modelName): Response => $this->postToModel($modelName, $payload, $apiKey),
+                true,
+            );
+
+            /** @var array<string, mixed> $result */
+            return $result;
+        } catch (\App\Exceptions\GeminiRateLimitedException $e) {
+            // Re-throw so CLI can catch and wait/retry once
+            throw $e;
+        } catch (Throwable $e) {
+            $this->safeLog('warning', 'FlyerItemsAiAuditor: waterfall failed.', [
+                'error' => $e->getMessage(),
+            ]);
+            return null;
+        }
+    }
+
+    /**
      * Raw-text call (BLUF / editorial / reel copy) through the ordered model
      * waterfall. Auth travels in the `x-goog-api-key` header — never `?key=`
      * in the query string. Errors NEVER include the API key.
