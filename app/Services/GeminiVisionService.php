@@ -1256,7 +1256,7 @@ OLD PRICE vs SALE PRICE:
 - Never swap them.
 
 For each distinct product bounding box/card, return:
-- product_name: Exact Arabic name as printed (include size/weight if shown, e.g., "أرز مصري 5 كجم").
+- product_name: MUST ALWAYS be written in Arabic! If a flyer tile only prints English text (e.g., "Balady Beef Escalope", "Dragon Fruit", "Cantaloupe"), translate it into natural Egyptian Supermarket Arabic ("اسكالوب بقري بلدي", "دراجون فروت", "كانتلوب"). Never return pure-English product_name. Include size/weight if shown, e.g., "أرز مصري 5 كجم".
 - sale_price: float (EGP) after applying superscript rule.
 - old_price: nullable float (same rule) if crossed-out price exists.
 - unit: nullable string normalized: one of "كجم","جرام","لتر","مل","قطعة","علبة","كرتونة","حبة","كيس" or null if not stated. Infer from packaging text (e.g., "1 لتر", "500 جم").

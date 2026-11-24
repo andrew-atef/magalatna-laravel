@@ -373,14 +373,17 @@ final class ProcessSinglePageJob implements ShouldQueue
                                 $savingsAmount = round($oldPrice - $salePrice, 2);
                                 $discountPercent = round(($savingsAmount / $oldPrice) * 100, 2);
 
-                                // Guard against unrealistic discounts >90% (likely superscript misread)
-                                if ($discountPercent > 90) {
+                                // Guard against OCR superscript misreads: clear if >75%.
+                                if ($discountPercent > 75) {
                                     Log::warning('Unrealistic discount percent, possible superscript parse error.', [
                                         'product_name' => $productName,
                                         'sale_price' => $salePrice,
                                         'old_price' => $oldPrice,
                                         'discount_percent' => $discountPercent,
                                     ]);
+                                    $savingsAmount = null;
+                                    $discountPercent = null;
+                                    $oldPrice = null;
                                 }
                             } elseif ($oldPrice !== null && $oldPrice <= $salePrice) {
                                 // If old_price <= sale_price, treat as no discount (data error)

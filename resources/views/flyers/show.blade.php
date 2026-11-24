@@ -124,6 +124,8 @@
         'meat' => 'لحوم ومجمدات',
         'grocery' => 'بقالة ومشروبات',
         'clean' => 'منظفات وعناية',
+        'apparel' => 'ملابس وأحذية',
+        'home' => 'أدوات منزلية',
     ];
     $presentCategories = $flyer->items
         ->map(fn ($item) => match ($item->category ?: \App\Services\ProductDataNormalizer::inferCategory($item->product_name)) {
@@ -131,6 +133,8 @@
             'dairy_cheese' => 'dairy',
             'meat_poultry' => 'meat',
             'cleaning_laundry', 'personal_care' => 'clean',
+            'apparel_clothing' => 'apparel',
+            'home_appliances' => 'home',
             default => 'grocery',
         })
         ->unique()
@@ -448,7 +452,7 @@
             <div class="mx-auto mb-6 max-w-3xl overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
                 <img
                     src="{{ $discoverImage }}"
-                    alt="صورة غلاف مجلة {{ $cleanTitle }} بأسعارها المميزة على خلفية كازيون"
+                    alt="غلاف {{ $cleanTitle }} - {{ $retailerClean }}"
                     width="1280" height="720"
                     loading="eager" fetchpriority="high" decoding="async"
                     class="w-full h-auto"
@@ -608,6 +612,8 @@
                                 'dairy_cheese' => 'dairy',
                                 'meat_poultry' => 'meat',
                                 'cleaning_laundry', 'personal_care' => 'clean',
+                                'apparel_clothing' => 'apparel',
+                                'home_appliances' => 'home',
                                 default => 'grocery',
                             };
                             $unitPrice = ProductDataNormalizer::extractStandardUnitPrice($item);

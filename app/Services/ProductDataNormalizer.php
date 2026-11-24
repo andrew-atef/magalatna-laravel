@@ -39,6 +39,7 @@ final class ProductDataNormalizer
         'meat_poultry',
         'groceries',
         'beverages_snacks',
+        'apparel_clothing',
         'cleaning_laundry',
         'personal_care',
         'home_appliances',
@@ -88,6 +89,9 @@ final class ProductDataNormalizer
                 // Cosmetic oils — must outrank oils_ghee ("زيت" is shared).
                 'زيت شعر', 'زيت اطفال', 'دابر', 'فاتيكا',
             ],
+            'apparel_clothing' => [
+                'جاكيت', 'بنطلون', 'جينز', 'جبردين', 'هودي', 'سويت شيرت', 'سويت بانتس', 'تيشيرت', 'قميص', 'فستان', 'كارديجان', 'بيزك', 'تانك توب', 'طرحة', 'طرحه', 'بونييه', 'شراب', 'بوكسر', 'اندر', 'كوتشي', 'كوتشى', 'سابوه', 'حزام جلد', 'ملابس',
+            ],
             'cleaning_laundry' => [
                 'مسحوق', 'برسيل', 'اريل', 'تايد', 'اوكسي', 'بريل', 'وفير', 'جنرال',
                 'مناديل', 'كلور', 'منظف', 'سائل اطباق',
@@ -101,14 +105,14 @@ final class ProductDataNormalizer
                 'زبد', 'سمن', 'كريستال', 'الممتاز', 'شطاره',
             ],
             'beverages_snacks' => [
-                'عصير', 'بيبسي', 'كوكاكولا', 'سفن', 'ميرندا', 'مياه', 'شاي', 'قهوه',
+                'عصير', 'بيبسي', 'كوكاكولا', 'سفن', 'ميرندا', 'مياه', 'مياة', 'جالون', 'بيور', 'شاي', 'قهوه',
                 'نسكافيه', 'بن ', 'بسكويت', 'شوكولاته', 'كيك', 'دونتس', 'شيبس',
                 'مربي', 'حلوه',
                 // NOTE: "جبنتي" (Egyptian cheese brand, contains "جبن") is NOT
                 // here — it belongs to dairy_cheese below.
             ],
             'dairy_cheese' => [
-                'حليب', 'لبن', 'جبن', 'مثلثات', 'شيدر', 'موتزريلا', 'زبادي', 'رايب', 'قشطه',
+                'حليب', 'لبن', 'جبن', 'جبنة', 'جبنتي', 'مثلثات', 'شيدر', 'موتزريلا', 'زبادي', 'رايب', 'قشطه',
             ],
             'meat_poultry' => [
                 'دجاج', 'فراخ', 'بانيه', 'ستربس', 'مسحب', 'لحم', 'لحوم', 'مفروم',
@@ -154,6 +158,15 @@ final class ProductDataNormalizer
         if ($name === '') {
             return '';
         }
+
+        // 0a. Strip stray foreign/non-Arabic characters (OCR drift).
+        $name = str_replace(['ö', 'Ö', 'ہ', 'ی'], ['o', 'O', 'ة', 'ي'], $name);
+
+        // 0b. Add space before '(' for pack notation.
+        $name = (string) preg_replace('/(\S)\(/u', '$1 (', $name);
+
+        // 0b. Strip stray single-letter OCR prefix noise ("م مربى" → "مربى").
+        $name = (string) preg_replace('/^م\\s+(?=مربى|زيت|جبنة|لبن|شاي|سكر|أرز)/u', '', $name);
 
         // 1. Numeral systems + Arabic decimal comma ("١,٥" → "1.5").
         $name = ArabicNormalizer::toWesternDigits($name);
@@ -216,11 +229,33 @@ final class ProductDataNormalizer
         if ($raw !== '') {
             $key = self::brandKey($raw);
 
+            // 1. Static alias map (kept minimal for basic Latin->Arabic drift).
             $aliases = self::brandAliases();
             if (isset($aliases[$key])) {
                 return $aliases[$key];
             }
 
+            // 2. Dynamic Product-Name <-> Brand cross-check: if a word in the
+            //    cleaned product name is exactly 1 edit away from the brand,
+            //    snap the brand to that word (catches ليبشون -> ليبتون, etc.).
+            foreach (preg_split('/\s+/u', trim($cleanedProductName)) ?: [] as $word) {
+                $word = trim((string) $word);
+                if (mb_strlen($word) < 4) {
+                    continue;
+                }
+                $normWord = self::brandKey($word);
+                if (self::mbLevenshtein($key, $normWord) === 1) {
+                    return $word;
+                }
+            }
+
+            // 3. Popularity-weighted fuzzy snap against DB popular brands.
+            $popularSnap = self::fuzzySnapToPopularBrand($key);
+            if ($popularSnap !== null) {
+                return $popularSnap;
+            }
+
+            // 4. Legacy dynamic fuzzy snap against any cached Brand row.
             $snapped = self::fuzzySnapToBrand($key);
             if ($snapped !== null) {
                 return $snapped;
@@ -254,22 +289,30 @@ final class ProductDataNormalizer
         $name = ArabicNormalizer::normalize(ArabicNormalizer::toWesternDigits($productName));
         $name = mb_strtolower(trim((string) preg_replace('/\s+/u', ' ', $name)));
 
+        $shortAmbiguous = ['جل', 'بن', 'رز', 'اكس', 'جبن', 'بيض', 'لبن', 'شاي', 'ماء', 'زيت'];
+
         if ($name !== '') {
             foreach (self::categoryRules() as $category => $keywords) {
                 foreach ($keywords as $keyword) {
-                    if ($keyword !== '' && str_contains($name, $keyword)) {
+                    if ($keyword === '') {
+                        continue;
+                    }
+
+                    $kw = trim(ArabicNormalizer::normalize($keyword));
+
+                    if (in_array($kw, $shortAmbiguous, true)) {
+                        // Word-boundary match for short ambiguous tokens.
+                        if (preg_match('/(?<![\\p{L}\\p{N}])'.preg_quote($kw, '/').'(?![\\p{L}\\p{N}])/u', $name) === 1) {
+                            return $category;
+                        }
+                    } elseif (str_contains($name, $kw)) {
                         return $category;
                     }
                 }
             }
 
-            // Bare "زيت" generic-oil FALLBACK — deliberately checked AFTER the
-            // ordered scan so groceries' "زيتون" (table olives) always wins:
-            // anything containing "زيتون" has already returned groceries above,
-            // and motor/hair oils hit their explicit rules even earlier. Only
-            // unclassified names like "زيت 1 لتر" or "زيت نباتي خليط" reach
-            // this fallback and land in oils_ghee.
-            if (str_contains($name, 'زيت')) {
+            // Bare "زيت" generic-oil FALLBACK — word-boundary safe.
+            if (preg_match('/(?<![\\p{L}\\p{N}])زيت(?![\\p{L}\\p{N}])/u', $name) === 1) {
                 return 'oils_ghee';
             }
         }
@@ -479,7 +522,7 @@ final class ProductDataNormalizer
 
         $discount = round((($old - $sale) / $old) * 100, 2);
 
-        if ($discount > 90) {
+        if ($discount > 75) {
             $item->savings_amount = null;
             $item->discount_percent = null;
 
@@ -514,79 +557,293 @@ final class ProductDataNormalizer
             return null;
         }
 
-        // 1) Preferred source: quantity + unit printed INSIDE the name —
-        //    first match wins (flyer names put the pack size first).
+        $unitAlt = 'ملل|ملي|مل|غرام|جرام|جم|ج|كيلو|كغ|كجم|ليتر|لتر';
+
         $name = ArabicNormalizer::toWesternDigits(trim($productName));
 
-        if (preg_match('/(\d+(?:\.\d+)?)\s*(كيلو|كجم|كغ|جم|جرام|لتر|ليتر|مل|ملي|م\s*ل)/u', $name, $m) === 1) {
-            $qty = (float) str_replace(',', '.', $m[1]);
-            $unitToken = trim($m[2]);
+        // Strip dimension patterns (25 x 40 cm) and piece-count ranges.
+        $name = (string) preg_replace('/\d+\s*[x×*]\s*\d+\s*(?:سم|cm|م|متر)\b/u', ' ', $name);
+        $name = (string) preg_replace('/\d+\s*-\s*\d+\s*pcs\/kg/u', ' ', $name);
 
-            if ($qty > 0) {
-                $standard = self::standardize($qty, $unitToken);
-
-                if ($standard !== null) {
-                    [$standardQty, $standardUnit] = $standard;
-
-                    if ($standardQty === 1.0 && ! $includeQuantityOne) {
-                        return null;
-                    }
-
-                    return self::unitPrice($salePrice, $standardQty, $standardUnit);
+        // 1) Weight range packs: 1000 - 1100 جم -> midpoint.
+        if (preg_match('/(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*('.$unitAlt.')/u', $name, $m) === 1) {
+            $min = (float) $m[1];
+            $max = (float) $m[2];
+            $token = trim($m[3]);
+            $qty = ($min + $max) / 2.0;
+            $standard = self::standardize($qty, $token);
+            if ($standard !== null) {
+                [$standardQty, $standardUnit] = $standard;
+                $res = self::finalizeUnitPrice($salePrice, $standardQty, $standardUnit, $includeQuantityOne);
+                if ($res !== null) {
+                    return $res;
                 }
             }
         }
 
-        // 2) Fallback: the OCR `unit` column alone ("كجم" → the price IS
-        //    per kg; "جم"/"مل" → normalise to the standard unit; "قطعة" …
-        //    → no comparable standard unit, stay null).
-        return match (trim((string) $unit)) {
+        // 2) Addition packs: 8 + 1 كيلو -> sum.
+        if (preg_match('/(\d+(?:\.\d+)?)\s*\+\s*(\d+(?:\.\d+)?)\s*('.$unitAlt.')/u', $name, $m) === 1) {
+            $qty = (float) $m[1] + (float) $m[2];
+            $token = trim($m[3]);
+            $standard = self::standardize($qty, $token);
+            if ($standard !== null) {
+                [$standardQty, $standardUnit] = $standard;
+                $res = self::finalizeUnitPrice($salePrice, $standardQty, $standardUnit, $includeQuantityOne);
+                if ($res !== null) {
+                    return $res;
+                }
+            }
+        }
+
+        // 3) Multiplier packs: both orders.
+        if (preg_match('/(\d+)\s*[x×*]\s*(\d+(?:\.\d+)?)\s*('.$unitAlt.')/u', $name, $m) === 1) {
+            $qty = (float) $m[1] * (float) $m[2];
+            $token = trim($m[3]);
+            $standard = self::standardize($qty, $token);
+            if ($standard !== null) {
+                [$standardQty, $standardUnit] = $standard;
+                $res = self::finalizeUnitPrice($salePrice, $standardQty, $standardUnit, $includeQuantityOne);
+                if ($res !== null) {
+                    return $res;
+                }
+            }
+        } elseif (preg_match('/(\d+(?:\.\d+)?)\s*('.$unitAlt.')\s*[x×*]\s*(\d+)/u', $name, $m) === 1) {
+            $qty = (float) $m[1] * (float) $m[3];
+            $token = trim($m[2]);
+            $standard = self::standardize($qty, $token);
+            if ($standard !== null) {
+                [$standardQty, $standardUnit] = $standard;
+                $res = self::finalizeUnitPrice($salePrice, $standardQty, $standardUnit, $includeQuantityOne);
+                if ($res !== null) {
+                    return $res;
+                }
+            }
+        }
+
+        // 4) Multi-term / mixed bundle handling when '+' present.
+        if (str_contains($name, '+')) {
+            $segments = array_map('trim', explode('+', $name));
+            $mixed = false;
+            $termQtys = [];
+            $termUnits = [];
+            foreach ($segments as $seg) {
+                $segRes = self::segmentStandardQty($seg, $unitAlt);
+                if ($segRes === null) {
+                    $mixed = true;
+                    break;
+                }
+                $termQtys[] = $segRes[0];
+                $termUnits[] = $segRes[1];
+            }
+
+            if ($mixed) {
+                return null;
+            }
+
+            $dims = array_unique(array_map(static function (string $u): string {
+                return $u === 'كجم' ? 'mass' : 'volume';
+            }, $termUnits));
+
+            if (count($dims) !== 1) {
+                return null;
+            }
+
+            $totalStd = array_sum($termQtys);
+            if ($totalStd <= 0 || $totalStd < 0.01) {
+                return null;
+            }
+
+            if ($totalStd === 1.0 && ! $includeQuantityOne) {
+                return null;
+            }
+
+            return self::unitPrice($salePrice, $totalStd, $termUnits[0]);
+        }
+
+        // 5) Single term extraction.
+        $segRes = self::segmentStandardQty($name, $unitAlt);
+        if ($segRes !== null) {
+            [$standardQty, $standardUnit] = $segRes;
+            if ($standardQty <= 0 || $standardQty < 0.01) {
+                return null;
+            }
+            if ($standardQty === 1.0 && ! $includeQuantityOne) {
+                return null;
+            }
+            return self::unitPrice($salePrice, $standardQty, $standardUnit);
+        }
+
+        // 6) Fallback to unit column: only bare كجم/لتر may return price/1.0.
+        $u = trim((string) $unit);
+        return match ($u) {
             'كجم', 'كيلو', 'كغ' => self::unitPrice($salePrice, 1.0, 'كجم'),
             'لتر', 'ليتر' => self::unitPrice($salePrice, 1.0, 'لتر'),
-            'جم', 'جرام' => self::unitPrice($salePrice, 0.001, 'كجم'),
-            'مل', 'ملي' => self::unitPrice($salePrice, 0.001, 'لتر'),
             default => null,
         };
     }
 
-    /**
-     * @return array{0: float, 1: string}|null [standardQuantity, standardUnit]
-     */
+    private static function segmentStandardQty(string $seg, string $unitAlt): ?array
+    {
+        $seg = trim($seg);
+        if ($seg === '') {
+            return null;
+        }
+
+        // Multiplier inside segment.
+        if (preg_match('/(\d+)\s*[x×*]\s*(\d+(?:\.\d+)?)\s*('.$unitAlt.')/u', $seg, $m) === 1) {
+            $qty = (float) $m[1] * (float) $m[2];
+            $token = trim($m[3]);
+            $std = self::standardize($qty, $token);
+            if ($std === null) {
+                return null;
+            }
+            [$sq, $su] = $std;
+            if ($sq <= 0 || $sq < 0.01) {
+                return null;
+            }
+            return [$sq, $su];
+        }
+        if (preg_match('/(\d+(?:\.\d+)?)\s*('.$unitAlt.')\s*[x×*]\s*(\d+)/u', $seg, $m) === 1) {
+            $qty = (float) $m[1] * (float) $m[3];
+            $token = trim($m[2]);
+            $std = self::standardize($qty, $token);
+            if ($std === null) {
+                return null;
+            }
+            [$sq, $su] = $std;
+            if ($sq <= 0 || $sq < 0.01) {
+                return null;
+            }
+            return [$sq, $su];
+        }
+
+        // Standard qty+unit matches.
+        if (preg_match_all('/(\d+(?:\.\d+)?)\s*('.$unitAlt.')/u', $seg, $matches, PREG_SET_ORDER) < 1) {
+            return null;
+        }
+
+         if (count($matches) === 1) {
+            $qty = (float) $matches[0][1];
+            $token = trim($matches[0][2]);
+
+            // Strip non-weight count/formula phrases that would otherwise be
+            // misread as pack multipliers ("2 في 1 400 مل", "100 فتلة 250 جم").
+            $cleanSeg = (string) preg_replace('/\d+\s*في\s*\d+/u', ' ', $seg);
+            $cleanSeg = (string) preg_replace('/\d+\s*(?:فتلة|منديل|كيس|حفاضة|حفاضه|قرص|كبسل)/u', ' ', $cleanSeg);
+
+            // Recompute standard matches on the cleaned segment.
+            if (preg_match_all('/(\d+(?:\.\d+)?)\s*('.$unitAlt.')/u', $cleanSeg, $cm, PREG_SET_ORDER) >= 1) {
+                // If the cleaned segment still has the same single match, use it.
+                $qty = (float) $cm[0][1];
+                $token = trim($cm[0][2]);
+            }
+
+            $countFactor = 1.0;
+
+            // Explicit multiplier separated by x/* (handled separately above, but
+            // guard here too): if the original segment had "a × b unit".
+            if (preg_match('/(\d+)\s*[x×*]\s*(\d+(?:\.\d+)?)\s*('.$unitAlt.')/u', $seg, $xm) === 1) {
+                $countFactor = (float) $xm[1];
+                $qty = (float) $xm[2];
+                $token = trim($xm[3]);
+            } elseif (preg_match('/(\d+(?:\.\d+)?)\s*('.$unitAlt.')\s*[x×*]\s*(\d+)/u', $seg, $xm) === 1) {
+                $countFactor = (float) $xm[3];
+                $qty = (float) $xm[1];
+                $token = trim($xm[2]);
+            } else {
+                // Leading small pack count: "2 شاي 250 جم" style (2..36).
+                if (preg_match('/^\s*(\d{1,2})\s+[\p{L}\s]+?\d+(?:\.\d+)?\s*(?:'.$unitAlt.')/u', $cleanSeg, $lm) === 1) {
+                    $lead = (int) $lm[1];
+                    if ($lead >= 2 && $lead <= 36) {
+                        // Ensure the leading number is not the qty itself.
+                        preg_match_all('/\d+(?:\.\d+)?/u', $cleanSeg, $allNums);
+                        $allNums = $allNums[0] ?? [];
+                        if (count($allNums) >= 2 && (float)$allNums[0] === (float)$lead && (float)$allNums[0] != $qty) {
+                            $countFactor = (float) $lead;
+                        }
+                    }
+                }
+            }
+
+            $rawQty = $countFactor * $qty;
+            $std = self::standardize($rawQty, $token);
+            if ($std === null) {
+                return null;
+            }
+            [$sq, $su] = $std;
+            if ($sq <= 0 || $sq < 0.01) {
+                return null;
+            }
+            return [$sq, $su];
+        }
+
+        // Multiple matches: sum if same dimension.
+        $total = 0.0;
+        $unit = null;
+        foreach ($matches as $mm) {
+            $q = (float) $mm[1];
+            $t = trim($mm[2]);
+            $st = self::standardize($q, $t);
+            if ($st === null) {
+                return null;
+            }
+            [$sq, $su] = $st;
+            if ($sq <= 0 || $sq < 0.01) {
+                return null;
+            }
+            if ($unit === null) {
+                $unit = $su;
+            } elseif ($unit !== $su) {
+                return null;
+            }
+            $total += $sq;
+        }
+        if ($total <= 0) {
+            return null;
+        }
+        return [$total, $unit];
+    }
+
+    private static function finalizeUnitPrice(float $salePrice, float $standardQty, string $standardUnit, bool $includeQuantityOne): ?array
+    {
+        if ($standardQty <= 0 || $standardQty < 0.01) {
+            return null;
+        }
+        if ($standardQty === 1.0 && ! $includeQuantityOne) {
+            return null;
+        }
+        return self::unitPrice($salePrice, $standardQty, $standardUnit);
+    }
+
     private static function standardize(float $qty, string $unitToken): ?array
     {
-        if (in_array($unitToken, ['جم', 'جرام'], true)) {
+        $token = trim($unitToken);
+        if (in_array($token, ['جم', 'جرام', 'غرام', 'ج'], true)) {
             return [$qty / 1000, 'كجم'];
         }
-
-        if (in_array($unitToken, ['كجم', 'كيلو', 'كغ'], true)) {
+        if (in_array($token, ['كجم', 'كيلو', 'كغ'], true)) {
             return [$qty, 'كجم'];
         }
-
-        if (in_array($unitToken, ['مل', 'ملي', 'م ل'], true)) {
+        if (in_array($token, ['مل', 'ملل', 'ملي', 'م ل'], true)) {
             return [$qty / 1000, 'لتر'];
         }
-
-        if (in_array($unitToken, ['لتر', 'ليتر'], true)) {
+        if (in_array($token, ['لتر', 'ليتر'], true)) {
             return [$qty, 'لتر'];
         }
-
         return null;
     }
 
-    /**
-     * @return array{amount: float, unit: string}|null
-     */
     private static function unitPrice(float $salePrice, float $standardQty, string $standardUnit): ?array
     {
         if ($standardQty <= 0) {
             return null;
         }
-
         return [
             'amount' => $salePrice / $standardQty,
             'unit' => $standardUnit,
         ];
     }
+
 
     // -------------------------------------------------------------------------
     // Internals
@@ -767,6 +1024,95 @@ final class ProductDataNormalizer
     }
 
     /**
+     * Popularity-weighted fuzzy snap against DB popular brands (>=3 flyer items).
+     *
+     * @return string|null canonical brand name
+     */
+    private static function fuzzySnapToPopularBrand(string $key): ?string
+    {
+        if ($key === '') {
+            return null;
+        }
+
+        $popular = self::popularBrands();
+
+        // Already a popular brand → return canonical stored name.
+        if (isset($popular[$key])) {
+            return $popular[$key];
+        }
+
+        if (mb_strlen($key) < 4) {
+            return null;
+        }
+
+        foreach ($popular as $popKey => $popName) {
+            $dist = self::mbLevenshtein($key, $popKey);
+
+            if ($dist <= 1) {
+                return $popName;
+            }
+
+            if (mb_strlen($key) >= 7 && mb_strlen($popKey) >= 7
+                && mb_substr($key, 0, 1) === mb_substr($popKey, 0, 1)
+                && $dist <= 2) {
+                return $popName;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Popular canonical brands (>=3 flyer items), cached 12h.
+     *
+     * @return array<string, string> normalized key => stored name
+     */
+    private static function popularBrands(): array
+    {
+        static $cached = null;
+
+        if ($cached !== null) {
+            return $cached;
+        }
+
+        try {
+            if (! \Illuminate\Support\Facades\Schema::hasTable('brands') || ! \Illuminate\Support\Facades\Schema::hasTable('flyer_items')) {
+                $cached = [];
+                return $cached;
+            }
+
+            $cached = Cache::remember('popular_brands:canonical', 43200, static function (): array {
+                try {
+                    $rows = \Illuminate\Support\Facades\DB::table('flyer_items')
+                        ->select('brands.name')
+                        ->join('brands', 'brands.id', '=', 'flyer_items.brand_id')
+                        ->groupBy('brands.id', 'brands.name')
+                        ->havingRaw('COUNT(*) >= 3')
+                        ->pluck('name')
+                        ->all();
+                    $names = $rows;
+                } catch (Throwable $e) {
+                    return [];
+                }
+
+            $keys = [];
+            foreach ((array) $names as $name) {
+                $name = trim((string) $name);
+                if ($name !== '') {
+                    $keys[self::brandKey($name)] = $name;
+                }
+            }
+
+            return $keys;
+        });
+        } catch (Throwable $e) {
+            $cached = [];
+        }
+        
+        return $cached;
+    }
+
+    /**
      * @return list<string> known canonical brand names, longest first
      */
     private static function knownCanonicalBrands(): array
@@ -774,6 +1120,7 @@ final class ProductDataNormalizer
         $names = array_values(array_unique(array_merge(
             array_values(self::cachedBrandKeys()),
             array_values(self::brandAliases()),
+            array_values(self::popularBrands()),
         )));
 
         usort($names, static fn (string $a, string $b): int => mb_strlen($b) <=> mb_strlen($a));

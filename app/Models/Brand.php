@@ -22,6 +22,7 @@ class Brand extends Model
         $invalidate = static function (): void {
             DB::afterCommit(static function (): void {
                 Cache::forget('auto_linker:brands');
+                Cache::forget('popular_brands:canonical');
             });
         };
 

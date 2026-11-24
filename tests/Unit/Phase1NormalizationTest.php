@@ -310,6 +310,24 @@ final class Phase1NormalizationTest extends TestCase
         $this->assertEqualsWithDelta(36.20, (float) $fractional['amount'], 0.01);
     }
 
+    public function test_unit_price_safe_count_phrases(): void
+    {
+        // "100 فتلة" must NOT multiply the 250 g quantity.
+        $tea = ProductDataNormalizer::extractStandardUnitPrice('شاي ليبتون 100 فتلة 250 جم', null, 100.0);
+        $this->assertNotNull($tea);
+        $this->assertEqualsWithDelta(400.0, $tea['amount'], 0.01);
+
+        // "3 في 1" must NOT multiply the 18 g quantity.
+        $coffee = ProductDataNormalizer::extractStandardUnitPrice('أبو عوف 3 في 1 18 جم', null, 10.0);
+        $this->assertNotNull($coffee);
+        $this->assertEqualsWithDelta(555.56, $coffee['amount'], 0.01);
+
+        // Multi-term still sums to 30 L.
+        $water = ProductDataNormalizer::extractStandardUnitPrice('12 مياة نستلة 1.5 لتر + 20 مياة 600 ملل', null, 106.99);
+        $this->assertNotNull($water);
+        $this->assertEqualsWithDelta(3.57, $water['amount'], 0.01);
+    }
+
     public function test_unit_price_null_for_quantity_one_unless_legacy_opt_in(): void
     {
         // Pipeline rule: a printed pack of exactly "1" is NOT re-quoted.
@@ -329,8 +347,7 @@ final class Phase1NormalizationTest extends TestCase
         $this->assertEqualsWithDelta(50.0, $kg['amount'], 0.001);
 
         $grams = ProductDataNormalizer::extractStandardUnitPrice('منتج خام', 'جم', 50.0);
-        $this->assertSame('كجم', $grams['unit']);
-        $this->assertEqualsWithDelta(50000.0, $grams['amount'], 0.001);
+        $this->assertNull($grams);
 
         // "قطعة" has no comparable standard unit.
         $this->assertNull(ProductDataNormalizer::extractStandardUnitPrice('منتج خام', 'قطعة', 50.0));
@@ -349,6 +366,7 @@ final class Phase1NormalizationTest extends TestCase
             'meat_poultry',
             'groceries',
             'beverages_snacks',
+            'apparel_clothing',
             'cleaning_laundry',
             'personal_care',
             'home_appliances',

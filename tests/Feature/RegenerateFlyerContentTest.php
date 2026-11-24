@@ -222,11 +222,8 @@ final class RegenerateFlyerContentTest extends TestCase
         $this->assertDatabaseHas('flyer_items', ['id' => $itemA->id]);
         $this->assertDatabaseHas('flyer_items', ['id' => $itemB->id]);
 
-        // Exactly two TEXT calls — no inlineData (OCR) payload anywhere.
-        Http::assertSentCount(2);
-        Http::assertSent(static function ($request): bool {
-            return ! str_contains((string) json_encode($request->data()), 'inlineData');
-        });
+        // Copy mode is now 100% deterministic — no Gemini HTTP calls at all.
+        Http::assertSentCount(0);
 
         Queue::assertPushed(PurgeCloudflareCacheJob::class);
     }

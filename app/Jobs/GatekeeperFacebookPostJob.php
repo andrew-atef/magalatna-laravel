@@ -151,7 +151,18 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
             }
 
             if ($validFromCarbon === null) {
-                $validFromCarbon = $validUntilCarbon->copy();
+                try {
+                    $publishedCarbon = Carbon::parse($this->publishedAt, 'Africa/Cairo')->startOfDay();
+                } catch (Throwable $e) {
+                    $publishedCarbon = Carbon::today('Africa/Cairo');
+                }
+                if (! $publishedCarbon instanceof Carbon) {
+                    $publishedCarbon = Carbon::today('Africa/Cairo');
+                }
+                $validFromCarbon = $publishedCarbon;
+                if ($validFromCarbon->gt($validUntilCarbon)) {
+                    $validFromCarbon = $validUntilCarbon->copy();
+                }
             }
 
             try {
@@ -969,37 +980,6 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
     public static function buildBlufSummary(Flyer $flyer): string
     {
         try {
-            try {
-                $retailerName = $flyer->retailer?->name ?? $flyer->retailer()->first()?->name ?? 'المتجر';
-                $from = $flyer->valid_from instanceof Carbon ? $flyer->valid_from->format('d/m/Y') : (string) $flyer->valid_from;
-                $until = $flyer->valid_until instanceof Carbon ? $flyer->valid_until->format('d/m/Y') : (string) $flyer->valid_until;
-                $topProducts = $flyer->items()->limit(5)->pluck('product_name')->all();
-                // Nearest-integer max discount — "25%", never "24.69%"
-                // (matches the Flyer accessors and editorial builders).
-                $maxDiscount = round((float) ($flyer->items()->max('discount_percent') ?? 0));
-
-                /** @var GeminiVisionService $gemini */
-                $gemini = app(GeminiVisionService::class);
-                $geminiText = $gemini->generateBlufSummary(
-                    retailerName: $retailerName,
-                    title: $flyer->title,
-                    validFrom: $from,
-                    validUntil: $until,
-                    totalPages: (int) $flyer->total_pages,
-                    topProducts: $topProducts,
-                    maxDiscount: $maxDiscount
-                );
-
-                // Quality gate: the summary must carry actual Arabic content.
-                // Brand names (LG, iPhone, HP, 4K) are legitimate — rejecting on
-                // any Latin character threw away good Arabic copy wholesale.
-                if (trim($geminiText) !== '' && preg_match('/[\x{0600}-\x{06FF}]/u', $geminiText)) {
-                    return $geminiText;
-                }
-            } catch (Throwable $e) {
-                Log::debug('Gemini BLUF generation failed, using fallback.', ['flyer_id' => $flyer->id, 'error' => $e->getMessage()]);
-            }
-
             $titleForBluf = $flyer->title ?? 'العرض';
             // NEVER Carbon::parse('') — an empty/garbage valid_until would resolve
             // to "today" and misstate the offer window. Fall back to a neutral
@@ -1025,13 +1005,13 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
                 }
             }
 
-            $maxDiscount = round((float) ($flyer->items()->max('discount_percent') ?? 0));
+            $maxDiscount = round((float) ($flyer->items()->where('sale_price', '>', 0)->max('discount_percent') ?? 0));
             // 0% protection: never publish "بخصومات تصل إلى 0%." — when no real
             // discount was detected, advertise competitive pricing instead.
             $discountPhrase = $maxDiscount > 0
                 ? 'بخصومات تصل إلى '.self::trimDecimal((float) $maxDiscount).'%'
                 : 'بأسعار تنافسية مخفضة';
-            $topProducts = $flyer->items()->limit(5)->pluck('product_name')->filter()->implode('، ');
+            $topProducts = $flyer->items()->where('sale_price', '>', 0)->orderByDesc('discount_percent')->limit(4)->pluck('product_name')->filter()->implode('، ');
             $topProducts = $topProducts !== '' ? $topProducts : 'سلع متنوعة';
 
             // UPCOMING flyer (published before its start date): "الساري" is
@@ -1078,22 +1058,6 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
     public static function buildEditorialOverview(Flyer $flyer): string
     {
         try {
-            try {
-                /** @var GeminiVisionService $gemini */
-                $gemini = app(GeminiVisionService::class);
-                $text = $gemini->generateEditorialOverview($flyer);
-                // Arabic-presence gate (NOT a Latin-rejection gate): brand names
-                // like LG / iPhone / 4K are valid inside Arabic copy.
-                if (trim($text) !== '' && preg_match('/[\x{0600}-\x{06FF}]/u', $text)) {
-                    $text = (string) preg_replace('/(\d+)\.\s+(\d+%)/u', '$1.$2', $text);
-                    $text = (string) preg_replace('/(\d+)\s+%/u', '$1%', $text);
-
-                    return $text;
-                }
-            } catch (Throwable $e) {
-                Log::debug('Gemini Editorial generation failed, using fallback.', ['flyer_id' => $flyer->id, 'error' => $e->getMessage()]);
-            }
-
             $retailerName = $flyer->retailer?->name ?? $flyer->retailer()->first()?->name ?? 'المتجر';
             $title = $flyer->title ?? 'العرض';
             $from = $flyer->valid_from instanceof Carbon ? $flyer->valid_from->format('Y-m-d') : (string) $flyer->valid_from;
@@ -1145,13 +1109,13 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
                 $isUpcoming = false;
             }
 
-            $maxDiscount = round((float) ($flyer->items()->max('discount_percent') ?? 0));
+            $maxDiscount = round((float) ($flyer->items()->where('sale_price', '>', 0)->max('discount_percent') ?? 0));
             // Trim ".00" BEFORE appending the unit — rtrim() on the finished
             // string hits the Arabic "ج.م" suffix and is a no-op.
             $discountRange = $maxDiscount > 0 ? self::trimDecimal((float) $maxDiscount).'%' : 'متنوعة';
             $discountRange = (string) preg_replace('/(\d+)\.\s+(\d)/u', '$1.$2', $discountRange);
 
-            $heroDeals = $flyer->items()->orderByDesc('discount_percent')->limit(4)->get();
+            $heroDeals = $flyer->items()->where('sale_price', '>', 0)->orderByDesc('discount_percent')->limit(4)->get();
             $heroText = $heroDeals->map(function ($item): string {
                 $sale = self::formatEgp((float) $item->sale_price);
                 $old = $item->old_price ? self::formatEgp((float) $item->old_price) : null;
