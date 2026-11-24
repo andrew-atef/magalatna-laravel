@@ -32,7 +32,8 @@ final class CleanFlyerItemsCommand extends Command
     protected $signature = 'flyers:clean-items
         {--dry-run : عرض التغييرات المقترحة دون حفظ أي بيانات}
         {--brands-only : تشغيل إصلاح البراندات المخالفة فقط (إيليت/إلفيف/دولتين/بيبيسي) ثم الخروج}
-        {--repair-titles : إصلاح عناوين المجلات المقصوصة وسط الكلمة (| تخفيضا، | مه) ثم الخروج}';
+        {--repair-titles : إصلاح عناوين المجلات المقصوصة وسط الكلمة (| تخفيضا، | مه) ثم الخروج}
+        {--ai-audit : تشغيل مدقق النصوص الذكي (Gemini 3.5 Flash Lite) بعد التنظيف}';
 
     protected $description = 'تنظيف وتوحيد بيانات سلع المجلات: تصحيح أسماء المنتجات والبراندات، التصنيف التلقائي، وإزالة التكرار (أغنى صف يفوز) مع إعادة بناء النصوص الترويجية';
 
@@ -52,6 +53,11 @@ final class CleanFlyerItemsCommand extends Command
         // "| مه") BEFORE the word-boundary truncation shipped.
         if ((bool) $this->option('repair-titles')) {
             return $this->repairTruncatedTitles($dryRun);
+        }
+
+        // AI Auditor only mode: run the text auditor on all flyers.
+        if ((bool) $this->option('ai-audit')) {
+            return $this->runAiAuditor($dryRun);
         }
 
         $flyerIds = Flyer::query()
@@ -668,5 +674,65 @@ final class CleanFlyerItemsCommand extends Command
         }
 
         return $slug;
+    }
+
+    /**
+     * Run the AI Text Auditor on all flyers with items.
+     */
+    private function runAiAuditor(bool $dryRun): int
+    {
+        $flyerIds = Flyer::query()
+            ->whereHas('items')
+            ->orderBy('id')
+            ->pluck('id');
+
+        $total = $flyerIds->count();
+
+        if ($total === 0) {
+            $this->info('لا توجد مجلات تحتوي على سلع للتدقيق.');
+
+            return self::SUCCESS;
+        }
+
+        $this->info("بدء تدقيق نصوص {$total} مجلة...");
+
+        $auditor = app(\App\Services\FlyerItemsAiAuditorService::class);
+        $stats = ['flyers' => 0, 'fixes' => 0, 'drops' => 0, 'skipped' => 0];
+
+        foreach ($flyerIds->chunk(25) as $chunk) {
+            $flyers = Flyer::query()
+                ->with(['items', 'retailer'])
+                ->whereIn('id', $chunk->all())
+                ->orderBy('id')
+                ->get();
+
+            foreach ($flyers as $flyer) {
+                try {
+                    $result = $dryRun
+                        ? ['applied' => 0, 'dropped' => 0, 'skipped' => false] // Dry run: just log what would happen
+                        : $auditor->audit($flyer);
+
+                    $stats['flyers']++;
+                    $stats['fixes'] += $result['applied'];
+                    $stats['drops'] += $result['dropped'];
+                    if ($result['skipped']) {
+                        $stats['skipped']++;
+                    }
+
+                    if (! $result['skipped'] && ($result['applied'] > 0 || $result['dropped'] > 0)) {
+                        $this->line("  #{$flyer->id}: {$result['applied']} تصحيحات، {$result['dropped']} محذوفات");
+                    }
+                } catch (Throwable $e) {
+                    $this->warn("  #{$flyer->id}: خطأ - {$e->getMessage()}");
+                }
+            }
+
+            unset($flyers);
+            gc_collect_cycles();
+        }
+
+        $this->info("انتهى التدقيق: {$stats['flyers']} مجلة، {$stats['fixes']} تصحيح، {$stats['drops']} حذف، {$stats['skipped']} متخطاة.");
+
+        return self::SUCCESS;
     }
 }

@@ -705,6 +705,27 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
                 ]);
             }
 
+            // === 2b. AI Text Auditor (1 call, high-RPD model) ===
+            // Runs after dedup, before copy rebuild. Catches cross-item OCR
+            // inconsistencies (spelling unification, fake brands, English names).
+            // Zero-failure degradation: if auditor fails/429, we log and continue.
+            try {
+                $auditor = app(\App\Services\FlyerItemsAiAuditorService::class);
+                $auditResult = $auditor->audit($flyer);
+                if (! $auditResult['skipped']) {
+                    Log::info('[AI_AUDITOR] Flyer audit complete.', [
+                        'flyer_id' => $flyer->id,
+                        'fixes_applied' => $auditResult['applied'],
+                        'items_dropped' => $auditResult['dropped'],
+                    ]);
+                }
+            } catch (Throwable $e) {
+                Log::warning('[AI_AUDITOR] Skipped due to error.', [
+                    'flyer_id' => $flyer->id,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+
             // === 3. O(1) recount from the DB — never trust a stale counter. ===
             $flyer->total_pages = (int) $flyer->pages()->count();
 

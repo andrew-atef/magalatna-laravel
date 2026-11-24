@@ -358,9 +358,10 @@ final class Phase1NormalizationTest extends TestCase
     // Vocabulary integrity
     // ---------------------------------------------------------------------
 
-    public function test_category_vocabulary_is_the_closed_ten_value_set(): void
+    public function test_category_vocabulary_is_the_closed_eleven_value_set(): void
     {
         $this->assertSame([
+            'electronics',
             'oils_ghee',
             'dairy_cheese',
             'meat_poultry',

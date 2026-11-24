@@ -36,6 +36,7 @@ final class ProductDataNormalizer
             $item->unit !== null ? (string) $item->unit : null,
             (float) $item->sale_price,
             true,
+            $item->category !== null ? (string) $item->category : null,
         );
     }
 

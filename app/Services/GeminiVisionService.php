@@ -1255,13 +1255,26 @@ OLD PRICE vs SALE PRICE:
 - If only one price exists, old_price = null.
 - Never swap them.
 
+APPLIANCE SPECS RULE (MANDATORY):
+For home appliances & electronics (TVs, washing machines, fridges, ACs, microwaves, blenders, etc.):
+MUST include visible capacity, screen size, or model in product_name.
+Example: "غسالة ملابس إل جي 8 كجم فوق أوتوماتيك" or "ثلاجة سامسونج 14 قدم" or "شاشة سامسونج 55 بوصة 4K".
+NEVER output bare "غسالة ملابس" or "ثلاجة" or "شاشة" if specs appear on the tile!
+
+NO GENERIC BRANDS RULE (MANDATORY):
+For fresh produce, fruits, vegetables, and fresh butcher meat with no commercial company brand:
+Set brand_name = null. NEVER put "Balady", "Banana Local", "Avocado", "Dragon Fruit", "Iceberg", "Local", "Fresh", "Imported", "بلدي", "مستورد", "طازج", "عادي", "حار" as brand_name!
+
+ARABIC FIRST RULE (MANDATORY):
+product_name MUST ALWAYS be written in Arabic first! If a flyer tile only prints English text (e.g., "Balady Beef Escalope", "Dragon Fruit", "Cantaloupe"), translate it into natural Egyptian Supermarket Arabic ("اسكالوب بقري بلدي", "دراجون فروت", "كانتلوب"). Never return pure-English product_name. Append model numbers like UA85006LA or 55" as needed. Never pure-English meat names like "Balady Beef Mince".
+
 For each distinct product bounding box/card, return:
-- product_name: MUST ALWAYS be written in Arabic! If a flyer tile only prints English text (e.g., "Balady Beef Escalope", "Dragon Fruit", "Cantaloupe"), translate it into natural Egyptian Supermarket Arabic ("اسكالوب بقري بلدي", "دراجون فروت", "كانتلوب"). Never return pure-English product_name. Include size/weight if shown, e.g., "أرز مصري 5 كجم".
+- product_name: MUST ALWAYS be written in Arabic! (See ARABIC FIRST RULE above). Include size/weight if shown, e.g., "أرز مصري 5 كجم". For appliances, include specs per APPLIANCE SPECS RULE.
 - sale_price: float (EGP) after applying superscript rule.
 - old_price: nullable float (same rule) if crossed-out price exists.
 - unit: nullable string normalized: one of "كجم","جرام","لتر","مل","قطعة","علبة","كرتونة","حبة","كيس" or null if not stated. Infer from packaging text (e.g., "1 لتر", "500 جم").
-- category: nullable string — classify the product into EXACTLY ONE of these fixed Egyptian-retail categories: "oils_ghee" (cooking oils, ghee, butter), "dairy_cheese" (milk, cheese, yogurt, cream), "meat_poultry" (chicken, meat, fish, tuna, frozen), "groceries" (rice, sugar, flour, pasta, lentils, salt), "beverages_snacks" (juice, soda, tea, coffee, water, biscuits, chocolate, chips, gum), "cleaning_laundry" (detergents, dish soap, bleach, tissues), "personal_care" (shampoo, soap bars, toothpaste, diapers, sanitary pads, hair oils), "home_appliances" (cookware, fridges, washing machines, mixers, fans, blankets), "automotive_tools" (motor oil, car batteries, wipers, power tools), or "other". Motor oil / car products are "automotive_tools", NOT cooking oil. Hair "بديل زيت" is "personal_care", NOT cooking oil.
-- brand_name: nullable brand as printed (e.g., "الضحى", "جهينة", "Nestle") or null.
+- category: nullable string — classify the product into EXACTLY ONE of these fixed Egyptian-retail categories: "oils_ghee" (cooking oils, ghee, butter), "dairy_cheese" (milk, cheese, yogurt, cream), "meat_poultry" (chicken, meat, fish, tuna, frozen), "groceries" (rice, sugar, flour, pasta, lentils, salt), "beverages_snacks" (juice, soda, tea, coffee, water, biscuits, chocolate, chips, gum), "cleaning_laundry" (detergents, dish soap, bleach, tissues), "personal_care" (shampoo, soap bars, toothpaste, diapers, sanitary pads, hair oils), "home_appliances" (cookware, fridges, washing machines, mixers, fans, blankets), "automotive_tools" (motor oil, car batteries, wipers, power tools), "electronics" (TVs, phones, laptops, microwaves, blenders, kitchen appliances), or "other". Motor oil / car products are "automotive_tools", NOT cooking oil. Hair "بديل زيت" is "personal_care", NOT cooking oil.
+- brand_name: nullable brand as printed (e.g., "الضحى", "جهينة", "Nestle") or null. For fresh produce/meat with no commercial brand, MUST be null per NO GENERIC BRANDS RULE.
 - bundle_condition: nullable string for conditions like "حد أقصى 2 قطعة للعميل", "العرض حتى نفاذ الكمية", "2+1", or null.
 - extra_attributes: object of additional key-values (e.g., {"weight":"5 كجم","origin":"مصري","flavor":"فراولة"}). Return {} if none.
 

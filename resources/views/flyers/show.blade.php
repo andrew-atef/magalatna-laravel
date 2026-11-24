@@ -126,6 +126,7 @@
         'clean' => 'منظفات وعناية',
         'apparel' => 'ملابس وأحذية',
         'home' => 'أدوات منزلية',
+        'electronics' => 'أجهزة وإلكترونيات',
     ];
     $presentCategories = $flyer->items
         ->map(fn ($item) => match ($item->category ?: \App\Services\ProductDataNormalizer::inferCategory($item->product_name)) {
@@ -135,6 +136,7 @@
             'cleaning_laundry', 'personal_care' => 'clean',
             'apparel_clothing' => 'apparel',
             'home_appliances' => 'home',
+            'electronics' => 'electronics',
             default => 'grocery',
         })
         ->unique()
@@ -614,6 +616,7 @@
                                 'cleaning_laundry', 'personal_care' => 'clean',
                                 'apparel_clothing' => 'apparel',
                                 'home_appliances' => 'home',
+                                'electronics' => 'electronics',
                                 default => 'grocery',
                             };
                             $unitPrice = ProductDataNormalizer::extractStandardUnitPrice($item);

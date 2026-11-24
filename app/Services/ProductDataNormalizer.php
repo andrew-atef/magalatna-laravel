@@ -34,6 +34,7 @@ final class ProductDataNormalizer
 {
     /** @var list<string> The complete closed category vocabulary. */
     public const CATEGORY_VALUES = [
+        'electronics',
         'oils_ghee',
         'dairy_cheese',
         'meat_poultry',
@@ -79,6 +80,13 @@ final class ProductDataNormalizer
     private static function categoryRules(): array
     {
         return [
+            'electronics' => [
+                'تلفزيون', 'تليفزيون', 'شاشة', 'ميني ليد', 'mini led', 'led tv', 'oled', 'qled',
+                'ثلاجة', 'ثلاجه', 'ديب فريزر', 'فريزر', 'غسالة', 'تكييف', 'بوتاجاز', 'ميكروويف',
+                'قلاية هوائية', 'قلاية', 'خلاط', 'هاند بلندر', 'hand blender', 'blender',
+                'محضر قهوة', 'محضر طعام', 'كبة', 'مروحة', 'مروحه', 'سخان', 'مكنسة', 'مكواة',
+                'فرن كهربائي', 'لاب توب', 'موبايل',
+            ],
             'automotive_tools' => [
                 '5w', '10w', '15w', '20w', 'ليكوي مولي', 'موتور', 'محرك', 'سيارات',
                 'بطارية سيارة', 'مساحات', 'زيت محرك', 'دريل', 'شنيور',
@@ -225,6 +233,31 @@ final class ProductDataNormalizer
     public static function canonicalBrandName(?string $rawBrand, string $cleanedProductName): ?string
     {
         $raw = trim((string) $rawBrand);
+
+        // Fake-brand blacklist: reject generic produce/variety/cut/adjective words.
+        $fakeBrands = [
+            'balady', 'بلدي', 'local', 'iceberg', 'avocado', 'dragon fruit',
+            'grapefruit', 'grapefruit pink', 'apple royal gala', 'gala',
+            'sweet corn', 'brazel', 'brazil', 'green line', 'white', 'fresh',
+            'imported', 'مستورد', 'طازج', 'عادي', 'حار',
+        ];
+        $normRaw = self::brandKey($raw);
+        if (in_array($normRaw, $fakeBrands, true)) {
+            return null;
+        }
+
+        // Also reject if brand equals generic food/produce name at start of product_name.
+        if ($raw !== '') {
+            $cleaned = trim($cleanedProductName);
+            $normCleaned = self::brandKey($cleaned);
+            if (str_starts_with($normCleaned, $normRaw) && mb_strlen($normRaw) >= 3) {
+                // Check if the brand is a generic produce/meat term
+                $genericFoodTerms = ['كابوتشا', 'أفوكادو', 'دراجون فروت', 'بلدي', 'مستورد', 'طازج'];
+                if (in_array($normRaw, $genericFoodTerms, true)) {
+                    return null;
+                }
+            }
+        }
 
         if ($raw !== '') {
             $key = self::brandKey($raw);
@@ -552,9 +585,30 @@ final class ProductDataNormalizer
         ?string $unit,
         float $salePrice,
         bool $includeQuantityOne = false,
+        ?string $category = null,
     ): ?array {
         if ($salePrice <= 0) {
             return null;
+        }
+
+        // Appliance/non-consumable guard: never compute unit price for electronics,
+        // home appliances, apparel, or automotive — they are sold by piece, not by kg/L.
+        $noUnitPriceCategories = ['electronics', 'home_appliances', 'apparel_clothing', 'automotive_tools'];
+        if ($category !== null && in_array($category, $noUnitPriceCategories, true)) {
+            return null;
+        }
+
+        // Also guard by product name keywords (appliance/non-consumable terms).
+        $applianceKeywords = [
+            'ميكروويف', 'ثلاجة', 'ثلاجه', 'فريزر', 'غسالة', 'تكييف', 'سخان', 'بوتاجاز',
+            'شاشة', 'تلفزيون', 'تليفزيون', 'قلاية', 'فرن', 'خلاط',
+            'حقيبة', 'شنطة', 'سم', 'بوصة', 'قدم', 'واط',
+        ];
+        $nameLower = mb_strtolower($productName);
+        foreach ($applianceKeywords as $kw) {
+            if (str_contains($nameLower, $kw)) {
+                return null;
+            }
         }
 
         $unitAlt = 'ملل|ملي|مل|غرام|جرام|جم|ج|كيلو|كغ|كجم|ليتر|لتر';
