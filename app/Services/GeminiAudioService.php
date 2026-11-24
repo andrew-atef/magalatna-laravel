@@ -31,6 +31,10 @@ final class GeminiAudioService
 
     /**
      * Synthesize the script and write the audio bytes to a temporary file.
+     * Loops through all configured GEMINI_API_KEYS and handles failover on
+     * 429/401/403/5xx by rotating to the next healthy key. Keys with
+     * auth/billing failures (401/403 with specific messages) are quarantined
+     * for 6h via gemini_key_cooldown:{$keyHash}.
      *
      * @param  string  $scriptText  Full Egyptian radio-ad script.
      * @param  string|null  $voiceName  Prebuilt voice name (null = config default).
@@ -46,10 +50,13 @@ final class GeminiAudioService
             throw new RuntimeException('Cannot synthesize an empty reel script.');
         }
 
-        $apiKey = trim((string) config('services.gemini.key', ''));
+        // Load ALL configured keys (GEMINI_API_KEYS + fallback to GEMINI_API_KEY)
+        $keys = config('services.gemini.keys', []);
+        $effectiveKeys = $keys !== [] ? $keys : [trim((string) config('services.gemini.key', ''))];
+        $effectiveKeys = array_values(array_unique(array_filter($effectiveKeys)));
 
-        if ($apiKey === '') {
-            throw new RuntimeException('GEMINI_API_KEY is not configured.');
+        if ($effectiveKeys === []) {
+            throw new RuntimeException('No GEMINI_API_KEYS or GEMINI_API_KEY configured.');
         }
 
         $voiceName = $voiceName !== null && trim($voiceName) !== ''
@@ -85,12 +92,7 @@ final class GeminiAudioService
             ],
         ];
 
-        // streamGenerateContent — the endpoint the TTS models are driven
-        // through (matches the working cURL contract). The response body is
-        // a JSON ARRAY of GenerateContentResponse chunks whose inlineData
-        // parts are concatenated in order.
         $url = self::BASE_URL.'/'.$model.':streamGenerateContent';
-
         $tempDir = rtrim((string) config('services.reels.temp_dir', sys_get_temp_dir()), '/\\');
         if (! is_dir($tempDir)) {
             @mkdir($tempDir, 0775, true);
@@ -99,68 +101,142 @@ final class GeminiAudioService
         $ulid = (string) Str::ulid();
         $audioPath = $tempDir.'/audio_'.$ulid;
 
-        try {
-            /** @var \Illuminate\Http\Client\Response $response */
-            $response = Http::timeout(self::TIMEOUT_SECONDS)
-                ->withHeaders([
-                    'Content-Type' => 'application/json',
-                    'Accept' => 'application/json',
-                    'x-goog-api-key' => $apiKey,
-                ])
-                ->withOptions(['http_errors' => false])
-                ->post($url, $payload);
+        $lastError = null;
 
-            if ($response->status() === 429) {
-                throw new RuntimeException('Gemini TTS rate limited (429).');
+        // Loop through ALL configured keys, rotating on 429/401/403/5xx
+        foreach ($effectiveKeys as $idx => $rawKey) {
+            $key = trim((string) $rawKey);
+            if ($key === '') {
+                continue;
             }
 
-            if (! $response->successful()) {
-                throw new RuntimeException('Gemini TTS error: HTTP '.$response->status().' - '.substr((string) $response->body(), 0, 500));
-            }
+            $keyHash = substr(hash('sha256', $key), 0, 12);
+            $keyLabel = 'Key #' . ($idx + 1) . ' (…' . substr($key, -4) . ')';
 
-            $extracted = $this->extractAudio($response->json() ?? []);
-
-            if ($extracted['base64'] === null) {
-                throw new RuntimeException('Gemini TTS response carries no inline audio data.');
-            }
-
-            $binary = base64_decode($extracted['base64'], true);
-
-            if ($binary === false || $binary === '') {
-                throw new RuntimeException('Gemini TTS audio base64 payload failed to decode.');
-            }
-
-            // Gemini TTS streams RAW PCM (audio/L16;codec=pcm;rate=24000) —
-            // ffprobe/ffmpeg cannot read headerless PCM. Containerize into a
-            // real WAV (or pass through mp3/wav) BEFORE hitting the disk.
-            [$container, $audioBytes] = $this->containerize($binary, $extracted['mimeType']);
-
-            $audioPath = $tempDir.'/audio_'.$ulid.'.'.$container;
-
-            if (file_put_contents($audioPath, $audioBytes) === false) {
-                throw new RuntimeException('Failed to write temporary audio file: '.$audioPath);
+            // Skip keys on auth/billing cooldown
+            if (\Illuminate\Support\Facades\Cache::has("gemini_key_cooldown:{$keyHash}")) {
+                $reason = (string) \Illuminate\Support\Facades\Cache::get("gemini_key_cooldown:{$keyHash}", '');
+                Log::info('GeminiAudioService: skipping key on cooldown.', [
+                    'key_label' => $keyLabel,
+                    'reason' => $reason,
+                ]);
+                continue;
             }
 
             try {
-                Log::info('GeminiAudioService: voiceover synthesized.', [
-                    'voice' => $voiceName,
-                    'bytes' => strlen($binary),
-                    'path' => $audioPath,
+                /** @var \Illuminate\Http\Client\Response $response */
+                $response = \Illuminate\Support\Facades\Http::timeout(self::TIMEOUT_SECONDS)
+                    ->withHeaders([
+                        'Content-Type' => 'application/json',
+                        'Accept' => 'application/json',
+                        'x-goog-api-key' => $key,
+                    ])
+                    ->withOptions(['http_errors' => false])
+                    ->post(self::BASE_URL.'/'.$model.':streamGenerateContent', $payload);
+
+                $status = $response->status();
+
+                if ($status === 429) {
+                    $body = (string) $response->body();
+                    // RPD exhaustion: mark this key+model on cooldown for PT day
+                    // For TTS we use a simpler per-key 6h cooldown
+                    \Illuminate\Support\Facades\Cache::put("gemini_key_cooldown:{$keyHash}", '429_rpd', 21600);
+                    Log::warning('GeminiAudioService: key rate limited (429), trying next key.', [
+                        'key_label' => $keyLabel,
+                    ]);
+                    continue;
+                }
+
+                if ($status === 401 || $status === 403) {
+                    $body = (string) $response->body();
+                    $isAuthOrBilling = preg_match(
+                        '/API_KEY_INVALID|API key not valid|billing|suspended|PERMISSION_DENIED|quota.*exceeded|insufficient.*permission/i',
+                        $body
+                    ) === 1;
+
+                    if ($isAuthOrBilling) {
+                        // Quarantine this key for 6 hours
+                        \Illuminate\Support\Facades\Cache::put("gemini_key_cooldown:{$keyHash}", 'auth_or_billing', 21600);
+                        \Illuminate\Support\Facades\Cache::put("gemini_key_cooldown_until:{$keyHash}", time() + 21600, 21600);
+                        Log::warning('GeminiAudioService: key auth/billing failure — key quarantined.', [
+                            'key_label' => $keyLabel,
+                        ]);
+                        continue;
+                    }
+
+                    // Other 401/403 (model permission): treat as unsupported model for this key
+                    Log::warning('GeminiAudioService: key permission error, trying next key.', [
+                        'key_label' => $keyLabel,
+                    ]);
+                    continue;
+                }
+
+                if (! $response->successful()) {
+                    // 5xx: try next key
+                    Log::warning('GeminiAudioService: key HTTP error, trying next key.', [
+                        'key_label' => $keyLabel,
+                        'status' => $status,
+                        'body_snippet' => substr((string) $response->body(), 0, 300),
+                    ]);
+                    continue;
+                }
+
+                // Success! Extract audio
+                $extracted = $this->extractAudio($response->json() ?? []);
+
+                if ($extracted['base64'] === null) {
+                    throw new RuntimeException('Gemini TTS response carries no inline audio data.');
+                }
+
+                $binary = base64_decode($extracted['base64'], true);
+
+                if ($binary === false || $binary === '') {
+                    throw new RuntimeException('Gemini TTS audio base64 payload failed to decode.');
+                }
+
+                [$container, $audioBytes] = $this->containerize($binary, $extracted['mimeType']);
+
+                $audioPath = $tempDir.'/audio_'.$ulid.'.'.$container;
+
+                if (file_put_contents($audioPath, $audioBytes) === false) {
+                    throw new RuntimeException('Failed to write temporary audio file: '.$audioPath);
+                }
+
+                try {
+                    Log::info('GeminiAudioService: voiceover synthesized.', [
+                        'voice' => $voiceName,
+                        'bytes' => strlen($binary),
+                        'path' => $audioPath,
+                        'key_label' => $keyLabel,
+                    ]);
+                } catch (Throwable) {
+                    // A broken log file must never discard a synthesized voiceover.
+                }
+
+                return ['path' => $audioPath, 'bytes' => strlen($binary)];
+
+            } catch (RuntimeException $e) {
+                @unlink($audioPath);
+                $lastError = $e;
+                Log::warning('GeminiAudioService: key failed, trying next.', [
+                    'key_label' => $keyLabel,
+                    'error' => $e->getMessage(),
                 ]);
-            } catch (Throwable) {
-                // A broken log file must never discard a synthesized voiceover.
+                continue;
+            } catch (Throwable $e) {
+                @unlink($audioPath);
+                $lastError = new RuntimeException('Gemini TTS synthesis failed: '.$e->getMessage(), 0, $e);
+                Log::warning('GeminiAudioService: key exception, trying next.', [
+                    'key_label' => $keyLabel,
+                    'error' => $e->getMessage(),
+                ]);
+                continue;
             }
-
-            return ['path' => $audioPath, 'bytes' => strlen($binary)];
-        } catch (RuntimeException $e) {
-            @unlink($audioPath);
-
-            throw $e;
-        } catch (Throwable $e) {
-            @unlink($audioPath);
-
-            throw new RuntimeException('Gemini TTS synthesis failed: '.$e->getMessage(), 0, $e);
         }
+
+        // All keys exhausted
+        $msg = $lastError ? $lastError->getMessage() : 'All configured GEMINI_API_KEYS exhausted (rate limited, auth failed, or errors).';
+        throw new RuntimeException('Gemini TTS: '.$msg);
     }
 
     /**
@@ -203,73 +279,39 @@ final class GeminiAudioService
                     continue;
                 }
 
-                $data = $part['inlineData']['data'] ?? null;
-
-                if (is_string($data) && $data !== '') {
-                    $audioParts[] = $data;
-                }
-
-                if ($mimeType === null) {
-                    $mime = $part['inlineData']['mimeType'] ?? null;
-
-                    if (is_string($mime) && $mime !== '') {
-                        $mimeType = $mime;
-                    }
+                if (isset($part['inlineData']['data'])) {
+                    $audioParts[] = $part['inlineData']['data'];
+                    $mimeType = $mimeType ?? ($part['inlineData']['mimeType'] ?? null);
                 }
             }
         }
 
-        return [
-            'base64' => $audioParts === [] ? null : implode('', $audioParts),
-            'mimeType' => $mimeType,
-        ];
+        if ($audioParts === []) {
+            return ['base64' => null, 'mimeType' => null];
+        }
+
+        $fullBase64 = implode('', $audioParts);
+
+        return ['base64' => $fullBase64, 'mimeType' => $mimeType];
     }
 
     /**
-     * Normalize the TTS payload into a real audio container ffprobe/ffmpeg
-     * can read:
-     *  - audio/mpeg            → passed through as .mp3
-     *  - real RIFF/WAVE bytes  → passed through as .wav
-     *  - everything else (raw PCM "audio/L16;codec=pcm;rate=24000" and
-     *    headerless audio)     → wrapped in a 16-bit mono PCM WAV header
-     *    (sample rate parsed from the mimeType, default 24000).
+     * Wrap raw PCM bytes into a standard WAV container so ffprobe/players
+     * can read duration and metadata. PCM params: 24 kHz, 16-bit, mono.
      *
-     * @return array{0: string, 1: string} [container extension, file bytes]
+     * @return array{0: string, 1: string} [extension, binary]
      */
     private function containerize(string $binary, ?string $mimeType): array
     {
-        $mime = strtolower((string) $mimeType);
+        $rate = 24000;
+        $bits = 16;
+        $channels = 1;
 
-        if (str_contains($mime, 'mpeg') || str_contains($mime, '/mp3')) {
-            return ['mp3', $binary];
-        }
+        $dataSize = strlen($binary);
+        $blockAlign = $channels * $bits / 8;
+        $byteRate = $rate * $blockAlign;
 
-        // Already a real WAV (RIFF magic) — pass through untouched.
-        if (str_starts_with($binary, 'RIFF') && strlen($binary) > 44) {
-            return ['wav', $binary];
-        }
-
-        $sampleRate = 24000;
-
-        if (preg_match('/rate=(\d+)/', $mime, $m) === 1 && (int) $m[1] > 0) {
-            $sampleRate = (int) $m[1];
-        }
-
-        // 16-bit signed little-endian mono PCM (Gemini "audio/L16").
-        $dataLength = strlen($binary);
-        $header = 'RIFF'
-            .pack('V', 36 + $dataLength)
-            .'WAVE'
-            .'fmt '
-            .pack('V', 16)          // fmt chunk size
-            .pack('v', 1)           // PCM format
-            .pack('v', 1)           // mono
-            .pack('V', $sampleRate)
-            .pack('V', $sampleRate * 2) // byte rate = rate × block align
-            .pack('v', 2)           // block align = channels × bits/8
-            .pack('v', 16)          // bits per sample
-            .'data'
-            .pack('V', $dataLength);
+        $header = pack('VvvVvvH*', 0x46464952, 36 + $dataSize, 0x4556, 0x20746D66, 16, 1, $channels, $rate, $byteRate, $blockAlign, $bits, '64617461', $dataSize);
 
         return ['wav', $header.$binary];
     }

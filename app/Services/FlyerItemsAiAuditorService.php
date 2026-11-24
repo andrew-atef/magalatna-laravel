@@ -121,9 +121,9 @@ final class FlyerItemsAiAuditorService
                 ],
             ];
 
-            // Use the SAME waterfall engine as vision (ordered models, RPM/RPD quotas, cooldowns)
+            // Use the SAME 2D waterfall engine as vision (ordered models × keys, RPM/RPD quotas, cooldowns)
             $vision = app(\App\Services\GeminiVisionService::class);
-            $raw = $vision->callGeminiForAuditor($payload, $apiKey);
+            $raw = $vision->callGeminiForAuditor($payload);
 
             if ($raw === null) {
                 return null;

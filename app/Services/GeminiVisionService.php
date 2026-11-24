@@ -22,7 +22,7 @@ final class GeminiVisionService
 {
     private const BASE_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
 
-    private const TIMEOUT_SECONDS = 60;
+    private const TIMEOUT_SECONDS = 45;
 
     /** Hard cap per classification image download — protects the 128MB worker. */
     private const MAX_INLINE_IMAGE_BYTES = 15 * 1024 * 1024;
@@ -32,6 +32,12 @@ final class GeminiVisionService
 
     /** Long cooldown for models Google reports as unsupported (400/404). */
     private const UNSUPPORTED_COOLDOWN_SECONDS = 21600;
+
+    /** Key-level auth/billing failure cooldown (6 hours). */
+    private const KEY_AUTH_COOLDOWN_SECONDS = 21600;
+
+    /** Wall-clock budget for the entire waterfall loop (seconds). Must stay < 180s queue timeout. */
+    private const WALLCLOCK_BUDGET_SECONDS = 110.0;
 
     /**
      * Ordered model waterfall from config('services.gemini.models').
@@ -64,6 +70,49 @@ final class GeminiVisionService
                 'name' => $name,
                 'rpm' => max(0, (int) ($model['rpm'] ?? 5)),
                 'rpd' => max(0, (int) ($model['rpd'] ?? 20)),
+            ];
+        }
+
+        return $normalized;
+    }
+
+    /**
+     * @return list<array{index: int, key: string, hash: string, label: string}>
+     */
+    private function configuredKeys(): array
+    {
+        $keys = config('services.gemini.keys', []);
+
+        // Backward compatibility: if GEMINI_API_KEYS is empty but GEMINI_API_KEY is set,
+        // wrap the single key in an array so downstream code always iterates a list.
+        if ($keys === []) {
+            $singleKey = trim((string) config('services.gemini.key', ''));
+            if ($singleKey !== '') {
+                $keys = [$singleKey];
+            }
+        }
+
+        if (! is_array($keys)) {
+            return [];
+        }
+
+        $normalized = [];
+
+        foreach ($keys as $idx => $rawKey) {
+            $key = trim((string) $rawKey);
+
+            if ($key === '') {
+                continue;
+            }
+
+            $hash = substr(hash('sha256', $key), 0, 12);
+            $label = 'Key #' . ($idx + 1) . ' (…' . substr($key, -4) . ')';
+
+            $normalized[] = [
+                'index' => $idx,
+                'key' => $key,
+                'hash' => $hash,
+                'label' => $label,
             ];
         }
 
@@ -265,10 +314,13 @@ final class GeminiVisionService
      * @throws RuntimeException
      * @throws GeminiRateLimitedException
      */
-    private function callGemini(array $payload, string $apiKey): array
+    private function callGemini(array $payload, ?string $apiKey = null): array
     {
+        $keys = config('services.gemini.keys', []);
+        $effectiveKeys = $keys !== [] ? $keys : [trim((string) config('services.gemini.key', ''))];
+
         $result = $this->executeWithModelFallback(
-            fn (string $modelName): Response => $this->postToModel($modelName, $payload, $apiKey),
+            fn (string $modelName, string $key): Response => $this->postToModel($modelName, $payload, $key),
             true,
         );
 
@@ -277,29 +329,72 @@ final class GeminiVisionService
     }
 
     /**
-     * Ordered multi-model waterfall + per-model circuit breaker.
+     * 2D Ordered Multi-Model × Multi-Key Waterfall + Key-Level Circuit Breaker.
      *
-     * Iterates config('services.gemini.models') in STRICT priority order and
-     * returns the FIRST success. Every skip decision is local (cache-backed,
-     * SQLite-safe) so a throttled model costs <1ms — never a multi-second
-     * usleep() inside the timeout-bounded worker when the next model is ready
-     * right behind it.
+     * Iterates (Model, Key) pairs in STRICT priority order and returns the
+     * FIRST success. Every skip decision is local (cache-backed, SQLite-safe).
      *
-     * $requestBuilder receives the model name and performs exactly ONE HTTP
-     * request (it may throw ConnectionException on network failure).
+     * Strategy (config 'services.gemini.failover_strategy'):
+     *   - 'model_first' (default): outer loop = Models (strongest first),
+     *     inner loop = Keys. Keeps strongest model, rotates keys on 429/5xx.
+     *   - 'key_first': outer loop = Keys, inner loop = Models. Exhausts all
+     *     models on Key #1 before moving to Key #2.
      *
-     * @param  callable(string): Response  $requestBuilder
+     * Key-Level Circuit Breaker:
+     *   - Each API key has its own 6h cooldown for auth/billing failures
+     *     (401/403/API_KEY_INVALID/billing/suspended/PERMISSION_DENIED).
+     *   - Cache key: "gemini_key_cooldown:{$keyHash}"
+     *   - When a key is on cooldown, ALL (Model, Key) pairs using that key
+     *     are skipped immediately (<1ms).
+     *
+     * Isolated Quotas Per Key:
+     *   - RPM: "gemini_rpm:{$keyHash}:{$modelName}"
+     *   - RPD (PT day): "gemini_rpd:{$keyHash}:{$modelName}:{$ptDate}"
+     *   - Cooldowns: "gemini_cooldown:{$keyHash}:{$modelName}"
+     *
+     * Wall-Clock Budget: max WALLCLOCK_BUDGET_SECONDS (110s) total — if exceeded,
+     * abort and throw GeminiRateLimitedException so the queue job releases
+     * cleanly instead of being killed by the 180s worker timeout.
+     *
+     * @param  callable(string, string): Response  $requestBuilder receives (modelName, apiKey)
      * @return array<string, mixed>|string decoded JSON (jsonMode) or candidate text
      *
-     * @throws RuntimeException bad API key, or all models permanently failed / daily-exhausted
-     * @throws GeminiRateLimitedException all models temporarily throttled — the job should release()
+     * @throws RuntimeException bad API key (all keys), or all (Model, Key) pairs permanently failed / daily-exhausted
+     * @throws GeminiRateLimitedException all (Model, Key) pairs temporarily throttled — the job should release()
      */
     private function executeWithModelFallback(callable $requestBuilder, bool $jsonMode = true): array|string
     {
         $models = $this->configuredModels();
+        $keys = $this->configuredKeys();
+        $strategy = config('services.gemini.failover_strategy', 'model_first');
 
         if ($models === []) {
             throw new RuntimeException('No Gemini models configured (services.gemini.models).');
+        }
+        if ($keys === []) {
+            throw new RuntimeException('No Gemini API keys configured (services.gemini.keys).');
+        }
+
+        // Build ordered (Model, Key) pairs by strategy
+        $pairs = [];
+        if ($strategy === 'key_first') {
+            // Key-first: outer loop = Keys, inner = Models
+            foreach ($keys as $keyInfo) {
+                foreach ($models as $model) {
+                    $pairs[] = ['model' => $model, 'key' => $keyInfo];
+                }
+            }
+        } else {
+            // model_first (default): outer = Models (strongest first), inner = Keys
+            foreach ($models as $model) {
+                foreach ($keys as $keyInfo) {
+                    $pairs[] = ['model' => $model, 'key' => $keyInfo];
+                }
+            }
+        }
+
+        if ($pairs === []) {
+            throw new RuntimeException('No (Model, Key) pairs available for waterfall.');
         }
 
         // Gemini free-tier RPD resets at midnight Pacific, NOT Cairo/UTC.
@@ -310,30 +405,61 @@ final class GeminiVisionService
         $earliestRetryAfter = null;
         $anyTemporaryFailure = false;
         $attemptOrder = 0;
+        $startedAt = microtime(true);
 
-        foreach ($models as $model) {
+        foreach ($pairs as $pair) {
+            // Wall-clock budget guard: if we've spent > 110s, abort cleanly
+            if (microtime(true) - $startedAt > self::WALLCLOCK_BUDGET_SECONDS) {
+                $this->safeLog('warning', 'Gemini waterfall wall-clock budget exceeded, aborting.', [
+                    'elapsed_seconds' => round(microtime(true) - $startedAt, 2),
+                    'attempt_order' => $attemptOrder,
+                ]);
+                $anyTemporaryFailure = true;
+                $earliestRetryAfter = min($earliestRetryAfter ?? PHP_INT_MAX, 15);
+                break;
+            }
+
             $attemptOrder++;
+            $model = $pair['model'];
+            $keyInfo = $pair['key'];
             $name = $model['name'];
+            $key = $keyInfo['key'];
+            $keyHash = $keyInfo['hash'];
+            $keyLabel = $keyInfo['label'];
             $rpm = $model['rpm'];
             $rpd = $model['rpd'];
-            $cooldownKey = "gemini_cooldown:{$name}";
-            $rpdKey = "gemini_rpd:{$name}:{$ptDate}";
-            $rpmKey = "gemini_rpm:{$name}";
 
-            // 1) Local circuit breaker: a cooling model is skipped in <1ms.
+            // 0) Key-level circuit breaker: skip ALL pairs using this key if on auth/billing cooldown
+            $keyCooldownKey = "gemini_key_cooldown:{$keyHash}";
+            if (Cache::has($keyCooldownKey)) {
+                $reason = (string) Cache::get($keyCooldownKey, '');
+                $this->safeLog('debug', 'Gemini API key on cooldown, skipping all its pairs.', [
+                    'key_label' => $keyLabel,
+                    'reason' => $reason,
+                    'attempt_order' => $attemptOrder,
+                ]);
+                continue;
+            }
+
+            // Per-(Key, Model) cache keys for isolated quotas
+            $cooldownKey = "gemini_cooldown:{$keyHash}:{$name}";
+            $rpdKey = "gemini_rpd:{$keyHash}:{$name}:{$ptDate}";
+            $rpmKey = "gemini_rpm:{$keyHash}:{$name}";
+
+            // 1) Local circuit breaker: a cooling (Key, Model) pair is skipped in <1ms
             if (Cache::has($cooldownKey)) {
                 $reason = (string) Cache::get($cooldownKey, '');
 
-                // 'unsupported' (400/404, 6h) is NOT a 15-60s retry candidate.
                 if ($reason !== 'unsupported') {
                     $anyTemporaryFailure = true;
-                    $until = (int) Cache::get("gemini_cooldown_until:{$name}", 0);
+                    $until = (int) Cache::get("gemini_cooldown_until:{$keyHash}:{$name}", 0);
                     $wait = $until > time() ? $until - time() : self::TRANSIENT_COOLDOWN_SECONDS;
                     $earliestRetryAfter = min($earliestRetryAfter ?? PHP_INT_MAX, max(5, $wait));
                 }
 
-                $this->safeLog('debug', 'Gemini model on cooldown, skipping.', [
+                $this->safeLog('debug', 'Gemini (Key, Model) on cooldown, skipping.', [
                     'model' => $name,
+                    'key_label' => $keyLabel,
                     'reason' => $reason,
                     'attempt_order' => $attemptOrder,
                 ]);
@@ -341,76 +467,106 @@ final class GeminiVisionService
                 continue;
             }
 
-            // 2) Local RPD quota (Pacific-Time day).
+            // 2) Local RPD quota (Pacific-Time day) — isolated per Key
             if ($rpd > 0 && (int) Cache::get($rpdKey, 0) >= $rpd) {
-                $this->safeLog('debug', 'Gemini model daily quota exhausted, skipping.', [
+                $this->safeLog('debug', 'Gemini (Key, Model) daily quota exhausted, skipping.', [
                     'model' => $name,
+                    'key_label' => $keyLabel,
                     'rpd' => $rpd,
                     'attempt_order' => $attemptOrder,
                 ]);
-
                 continue;
             }
 
-            // 3) Local RPM quota — skip immediately, never sleep in-worker.
+            // 3) Local RPM quota — skip immediately, never sleep in-worker
             if ($rpm > 0 && RateLimiter::tooManyAttempts($rpmKey, $rpm)) {
                 $wait = max(5, RateLimiter::availableIn($rpmKey));
                 $earliestRetryAfter = min($earliestRetryAfter ?? PHP_INT_MAX, $wait);
                 $anyTemporaryFailure = true;
 
-                $this->safeLog('debug', 'Gemini model RPM window full, skipping.', [
+                $this->safeLog('debug', 'Gemini (Key, Model) RPM window full, skipping.', [
                     'model' => $name,
+                    'key_label' => $keyLabel,
                     'rpm' => $rpm,
                     'retry_after' => $wait,
                     'attempt_order' => $attemptOrder,
                 ]);
-
                 continue;
             }
 
-            // 4) Budget the attempt: RPM hit + atomic RPD increment. Cache::add
-            //    seeds the daily counter WITH its PT-midnight TTL only when the
-            //    key is newly created; increment then bumps it atomically.
+            // 4) Budget the attempt: RPM hit + atomic RPD increment
             RateLimiter::hit($rpmKey, 60);
             Cache::add($rpdKey, 0, $ptEndOfDay);
             Cache::increment($rpdKey);
 
             try {
-                $response = $requestBuilder($name);
+                $response = $requestBuilder($name, $key);
             } catch (Throwable $e) {
-                // ConnectionException / timeout — short cooldown, fail over.
-                $this->putCooldown($name, 'connection_error', self::TRANSIENT_COOLDOWN_SECONDS);
+                // ConnectionException / timeout — short cooldown for this (Key, Model)
+                $this->putCooldown($name, 'connection_error', self::TRANSIENT_COOLDOWN_SECONDS, $keyHash);
                 $anyTemporaryFailure = true;
                 $earliestRetryAfter = min($earliestRetryAfter ?? PHP_INT_MAX, self::TRANSIENT_COOLDOWN_SECONDS);
 
-                $this->safeLog('warning', 'Gemini model connection failure, failing over.', [
+                $this->safeLog('warning', 'Gemini (Key, Model) connection failure, failing over.', [
                     'model' => $name,
+                    'key_label' => $keyLabel,
                     'attempt_order' => $attemptOrder,
                     'error' => $e->getMessage(),
                 ]);
-
                 continue;
             }
 
             $status = $response->status();
 
-            // 401/403 = bad API key, NOT model-specific: fail fast — never burn
-            // the whole waterfall on an auth error.
+            // 401/403 = bad API key — check if it's a key-level auth/billing failure
             if ($status === 401 || $status === 403) {
-                throw new RuntimeException('Gemini API authentication failed (HTTP '.$status.') — check GEMINI_API_KEY.');
+                $body = (string) $response->body();
+                $isAuthOrBilling = preg_match(
+                    '/API_KEY_INVALID|API key not valid|billing|suspended|PERMISSION_DENIED|quota.*exceeded|insufficient.*permission/i',
+                    $body
+                ) === 1;
+
+                if ($isAuthOrBilling) {
+                    // Quarantine THIS KEY for 6 hours — it will be skipped for ALL models
+                    Cache::put("gemini_key_cooldown:{$keyHash}", 'auth_or_billing', self::KEY_AUTH_COOLDOWN_SECONDS);
+                    Cache::put("gemini_key_cooldown_until:{$keyHash}", time() + self::KEY_AUTH_COOLDOWN_SECONDS, self::KEY_AUTH_COOLDOWN_SECONDS);
+
+                    $this->safeLog('warning', 'Gemini API key auth/billing failure — key quarantined for 6h.', [
+                        'key_label' => $keyLabel,
+                        'status' => $status,
+                        'body_snippet' => substr($body, 0, 300),
+                    ]);
+
+                    // Continue to next key/pair — do NOT crash the job while other healthy keys exist!
+                    $anyTemporaryFailure = true;
+                    $earliestRetryAfter = min($earliestRetryAfter ?? PHP_INT_MAX, 15);
+                    continue;
+                }
+
+                // If it's 401/403 but NOT auth/billing (e.g., model permission), treat as model unsupported
+                $this->putCooldown($name, 'unsupported', self::UNSUPPORTED_COOLDOWN_SECONDS, $keyHash);
+
+                $this->safeLog('warning', 'Gemini (Key, Model) permission error, treating as unsupported.', [
+                    'model' => $name,
+                    'key_label' => $keyLabel,
+                    'status' => $status,
+                    'body_snippet' => substr((string) $response->body(), 0, 300),
+                    'attempt_order' => $attemptOrder,
+                ]);
+                continue;
             }
 
-            // 400/404 = model not found / unsupported: 6-hour cooldown.
+            // 400/404 = model not found / unsupported: 6-hour cooldown for THIS (Key, Model)
             if ($status === 400 || $status === 404) {
-                $this->putCooldown($name, 'unsupported', self::UNSUPPORTED_COOLDOWN_SECONDS);
+                $this->putCooldown($name, 'unsupported', self::UNSUPPORTED_COOLDOWN_SECONDS, $keyHash);
 
-                $this->safeLog('warning', 'Gemini model unsupported, cooling down 6h.', [
+                $this->safeLog('warning', 'Gemini (Key, Model) unsupported, cooling down 6h.', [
                     'model' => $name,
+                    'key_label' => $keyLabel,
                     'status' => $status,
                     'attempt_order' => $attemptOrder,
                     'body_snippet' => substr((string) $response->body(), 0, 500),
                 ]);
-
                 continue;
             }
 
@@ -420,53 +576,55 @@ final class GeminiVisionService
                 $isDailyQuota = $retryAfter > 120
                     || preg_match('/perday|requestsperday|generaterequestsperday/i', $body) === 1;
 
-                if ($isDailyQuota && $rpd > 0) {
-                    // Google says the DAY is done — mirror it locally so every
-                    // later call skips this model until the PT reset.
-                    Cache::put($rpdKey, $rpd, $ptEndOfDay);
+                // RPD key for THIS (Key, Model) pair
+                $rpdKey = "gemini_rpd:{$keyHash}:{$name}:{$ptDate}";
 
-                    $this->safeLog('warning', 'Gemini model daily quota exhausted (429), skipping for the PT day.', [
+                if ($isDailyQuota) {
+                    // Google says the DAY is done — mirror it locally for THIS (Key, Model)
+                    Cache::put("gemini_rpd:{$keyHash}:{$name}:{$ptDate}", $model['rpd'] ?? 0, $ptEndOfDay);
+
+                    $this->safeLog('warning', 'Gemini (Key, Model) daily quota exhausted (429), skipping for the PT day.', [
                         'model' => $name,
+                        'key_label' => $keyLabel,
                         'retry_after' => $retryAfter,
                         'attempt_order' => $attemptOrder,
                     ]);
-
                     continue;
                 }
 
-                // RPM burst: short cooldown, then straight to the next model.
+                // RPM burst: short cooldown for THIS (Key, Model)
                 $cooldown = max(60, min(120, $retryAfter > 0 ? $retryAfter : 65));
-                $this->putCooldown($name, '429_rpm', $cooldown);
+                $this->putCooldown($name, '429_rpm', $cooldown, $keyHash);
                 $anyTemporaryFailure = true;
                 $earliestRetryAfter = min($earliestRetryAfter ?? PHP_INT_MAX, $cooldown);
 
-                $this->safeLog('warning', 'Gemini model rate limited (429 RPM), failing over.', [
+                $this->safeLog('warning', 'Gemini (Key, Model) rate limited (429 RPM), failing over.', [
                     'model' => $name,
+                    'key_label' => $keyLabel,
                     'cooldown' => $cooldown,
                     'attempt_order' => $attemptOrder,
                 ]);
-
                 continue;
             }
 
             if (! $response->successful()) {
-                // 5xx (and any other non-success): short cooldown + failover.
-                $this->putCooldown($name, 'http_'.$status, self::TRANSIENT_COOLDOWN_SECONDS);
+                // 5xx (and any other non-success): short cooldown for THIS (Key, Model)
+                $this->putCooldown($name, 'http_'.$status, self::TRANSIENT_COOLDOWN_SECONDS, $keyHash);
                 $anyTemporaryFailure = true;
                 $earliestRetryAfter = min($earliestRetryAfter ?? PHP_INT_MAX, self::TRANSIENT_COOLDOWN_SECONDS);
 
-                $this->safeLog('warning', 'Gemini model HTTP error, failing over.', [
+                $this->safeLog('warning', 'Gemini (Key, Model) HTTP error, failing over.', [
                     'model' => $name,
+                    'key_label' => $keyLabel,
                     'status' => $status,
                     'attempt_order' => $attemptOrder,
                     'body_snippet' => substr((string) $response->body(), 0, 500),
                 ]);
-
                 continue;
             }
 
             // 200 — validate the payload BEFORE declaring success: a malformed
-            // body / empty candidate is a MODEL failure, not a caller failure.
+            // body / empty candidate is a (Key, Model) failure, not a caller failure.
             try {
                 if ($jsonMode) {
                     $body = (string) $response->body();
@@ -497,21 +655,22 @@ final class GeminiVisionService
                     $result = trim($text);
                 }
             } catch (Throwable $e) {
-                $this->putCooldown($name, 'invalid_response', self::TRANSIENT_COOLDOWN_SECONDS);
+                $this->putCooldown($name, 'invalid_response', self::TRANSIENT_COOLDOWN_SECONDS, $keyHash);
                 $anyTemporaryFailure = true;
                 $earliestRetryAfter = min($earliestRetryAfter ?? PHP_INT_MAX, self::TRANSIENT_COOLDOWN_SECONDS);
 
-                $this->safeLog('warning', 'Gemini model returned malformed response, failing over.', [
+                $this->safeLog('warning', 'Gemini (Key, Model) returned malformed response, failing over.', [
                     'model' => $name,
+                    'key_label' => $keyLabel,
                     'attempt_order' => $attemptOrder,
                     'error' => $e->getMessage(),
                 ]);
-
                 continue;
             }
 
-            $this->safeLog('info', 'Gemini model succeeded.', [
+            $this->safeLog('info', 'Gemini (Key, Model) succeeded.', [
                 'model' => $name,
+                'key_label' => $keyLabel,
                 'attempt_order' => $attemptOrder,
                 'json_mode' => $jsonMode,
             ]);
@@ -519,19 +678,19 @@ final class GeminiVisionService
             return $result;
         }
 
-        // Every model skipped/failed. Temporary throttling → the queue job
+        // Every (Model, Key) pair skipped/failed. Temporary throttling → the queue job
         // releases itself and retries after the earliest window; permanent
         // exhaustion → hard failure.
         if ($anyTemporaryFailure) {
             $retry = max(15, min(60, $earliestRetryAfter ?? 30));
 
             throw new GeminiRateLimitedException(
-                'All configured Gemini models are temporarily rate limited (429/RPM). Retry after '.$retry.'s.',
+                'All configured (Model, Key) pairs are temporarily rate limited (429/RPM). Retry after '.$retry.'s.',
                 $retry,
             );
         }
 
-        throw new RuntimeException('All configured Gemini models failed or exhausted their daily quota.');
+        throw new RuntimeException('All configured (Model, Key) pairs failed or exhausted their daily quota.');
     }
 
     /**
@@ -561,11 +720,16 @@ final class GeminiVisionService
      * ('unsupported', '429_rpm', ...); the companion *_until key carries the
      * expiry timestamp so gemini:models-status can display remaining seconds
      * (the cache store has no generic TTL-read API).
+     *
+     * @param  string|null  $keyHash  Optional key hash for isolating cooldown to a specific (Key, Model) pair
      */
-    private function putCooldown(string $modelName, string $reason, int $seconds): void
+    private function putCooldown(string $modelName, string $reason, int $seconds, ?string $keyHash = null): void
     {
-        Cache::put("gemini_cooldown:{$modelName}", $reason, $seconds);
-        Cache::put("gemini_cooldown_until:{$modelName}", time() + $seconds, $seconds);
+        $prefix = $keyHash ? "gemini_cooldown:{$keyHash}:" : 'gemini_cooldown:';
+        $untilPrefix = $keyHash ? "gemini_cooldown_until:{$keyHash}:" : 'gemini_cooldown_until:';
+
+        Cache::put("{$prefix}{$modelName}", $reason, $seconds);
+        Cache::put("{$untilPrefix}{$modelName}", time() + $seconds, $seconds);
     }
 
     /**
@@ -1030,9 +1194,10 @@ PROMPT;
     }
 
     /**
-     * Auditor call (text-only JSON) through the SAME ordered model waterfall
-     * + circuit breaker as vision/OCR. Used by FlyerItemsAiAuditorService.
-     * Prefers high-RPD models from config (flash/flash-lite tier).
+     * Auditor call (text-only JSON) through the 2D ordered model × key
+     * waterfall + circuit breaker as vision/OCR. Used by
+     * FlyerItemsAiAuditorService. Prefers high-RPD models from config
+     * (flash/flash-lite tier).
      *
      * @param  array<string, mixed>  $payload
      * @return array<string, mixed>|null decoded JSON or null on failure
@@ -1040,11 +1205,11 @@ PROMPT;
      * @throws RuntimeException
      * @throws GeminiRateLimitedException
      */
-    public function callGeminiForAuditor(array $payload, string $apiKey): ?array
+    public function callGeminiForAuditor(array $payload): ?array
     {
         try {
             $result = $this->executeWithModelFallback(
-                fn (string $modelName): Response => $this->postToModel($modelName, $payload, $apiKey),
+                fn (string $modelName, string $key): Response => $this->postToModel($modelName, $payload, $key),
                 true,
             );
 
@@ -1062,19 +1227,19 @@ PROMPT;
     }
 
     /**
-     * Raw-text call (BLUF / editorial / reel copy) through the ordered model
-     * waterfall. Auth travels in the `x-goog-api-key` header — never `?key=`
-     * in the query string. Errors NEVER include the API key.
+     * Raw-text call (BLUF / editorial / reel copy) through the 2D ordered
+     * model × key waterfall. Auth travels in the `x-goog-api-key` header —
+     * never `?key=` in the query string. Errors NEVER include the API key.
      *
      * @param  array<string, mixed>  $payload
      *
      * @throws RuntimeException
      * @throws GeminiRateLimitedException
      */
-    private function callGeminiRawText(array $payload, string $apiKey): string
+    private function callGeminiRawText(array $payload): string
     {
         $result = $this->executeWithModelFallback(
-            fn (string $modelName): Response => $this->postToModel($modelName, $payload, $apiKey),
+            fn (string $modelName, string $key): Response => $this->postToModel($modelName, $payload, $key),
             false,
         );
 

@@ -55,6 +55,44 @@ if ($geminiModels === []) {
     ];
 }
 
+/*
+|--------------------------------------------------------------------------
+| Gemini multi-key configuration (GEMINI_API_KEYS)
+|--------------------------------------------------------------------------
+| Comma-separated list of API keys (AIzaSyKey1,AIzaSyKey2,...).
+| If empty, falls back to the single GEMINI_API_KEY.
+| Keys are stored as list<string> under config('services.gemini.keys').
+| Each entry carries its own isolated quotas and circuit breakers.
+*/
+$geminiKeys = [];
+$geminiKeysRaw = trim((string) env('GEMINI_API_KEYS', ''));
+
+if ($geminiKeysRaw !== '') {
+    foreach (explode(',', $geminiKeysRaw) as $idx => $rawKey) {
+        $key = trim($rawKey);
+        if ($key !== '') {
+            $geminiKeys[] = $key;
+        }
+    }
+}
+
+// Backward compatibility: if GEMINI_API_KEYS is empty but GEMINI_API_KEY is set,
+// wrap the single key in an array so downstream code always iterates a list.
+if ($geminiKeys === []) {
+    $singleKey = trim((string) env('GEMINI_API_KEY', ''));
+    if ($singleKey !== '') {
+        $geminiKeys[] = $singleKey;
+    }
+}
+
+// Deduplicate while preserving order
+$geminiKeys = array_values(array_unique($geminiKeys));
+
+$failoverStrategy = trim((string) env('GEMINI_FAILOVER_STRATEGY', 'model_first'));
+if (! in_array($failoverStrategy, ['model_first', 'key_first'], true)) {
+    $failoverStrategy = 'model_first';
+}
+
 return [
 
     /*
@@ -91,12 +129,14 @@ return [
     ],
 
     'gemini' => [
-        'key' => env('GEMINI_API_KEY'),
+        'key' => $geminiKeys[0] ?? env('GEMINI_API_KEY'), // legacy single-key accessor
+        'keys' => $geminiKeys, // list<string> — multi-key pool for 2D waterfall
         'model' => env('GEMINI_MODEL', 'gemini-2.5-flash'),
         // Ordered priority waterfall with per-model RPM/RPD quotas (parsed
         // above). GeminiVisionService iterates this list on EVERY text/vision/
         // OCR/script call; ReelScriptService shares the same engine.
         'models' => $geminiModels,
+        'failover_strategy' => $failoverStrategy, // 'model_first' | 'key_first'
         // Audio synthesis (TTS) model — speechMetadata + responseModalities:
         // ["audio"] require a TTS-capable model on the streamGenerateContent
         // endpoint. Non-TTS models answer 400 "Speech metadata is not

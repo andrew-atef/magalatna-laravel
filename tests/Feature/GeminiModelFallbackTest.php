@@ -66,6 +66,31 @@ final class GeminiModelFallbackTest extends TestCase
         return now('America/Los_Angeles')->toDateString();
     }
 
+    private function keyHash(): string
+    {
+        return substr(hash('sha256', 'test-gemini-key'), 0, 12);
+    }
+
+    private function cooldownKey(string $model): string
+    {
+        return 'gemini_cooldown:'.$this->keyHash().':'.$model;
+    }
+
+    private function cooldownUntilKey(string $model): string
+    {
+        return 'gemini_cooldown_until:'.$this->keyHash().':'.$model;
+    }
+
+    private function rpdKey(string $model): string
+    {
+        return 'gemini_rpd:'.$this->keyHash().':'.$model.':'.$this->ptDate();
+    }
+
+    private function rpmKey(string $model): string
+    {
+        return 'gemini_rpm:'.$this->keyHash().':'.$model;
+    }
+
     private function countCallsTo(string $model): int
     {
         return collect(Http::recorded())
@@ -87,8 +112,8 @@ final class GeminiModelFallbackTest extends TestCase
         Http::assertSent(static fn ($request): bool => str_contains($request->url(), 'gemini-4-hydrogen:generateContent'));
 
         // The attempt was budgeted against model #1's own quotas.
-        $this->assertSame(1, RateLimiter::attempts('gemini_rpm:gemini-4-hydrogen'));
-        $this->assertSame(1, (int) Cache::get('gemini_rpd:gemini-4-hydrogen:'.$this->ptDate()));
+        $this->assertSame(1, RateLimiter::attempts($this->rpmKey('gemini-4-hydrogen')));
+        $this->assertSame(1, (int) Cache::get($this->rpdKey('gemini-4-hydrogen')));
     }
 
     public function test_rpm_429_fails_over_to_second_model_and_cooldown_skips_first_on_next_call(): void
@@ -107,8 +132,8 @@ final class GeminiModelFallbackTest extends TestCase
         Http::assertSentCount(2);
 
         // 429 RPM burst (no Retry-After, no PerDay marker) → 65s cooldown.
-        $this->assertSame('429_rpm', Cache::get('gemini_cooldown:gemini-4-hydrogen'));
-        $until = (int) Cache::get('gemini_cooldown_until:gemini-4-hydrogen', 0);
+        $this->assertSame('429_rpm', Cache::get($this->cooldownKey('gemini-4-hydrogen')));
+        $until = (int) Cache::get($this->cooldownUntilKey('gemini-4-hydrogen'), 0);
         $this->assertGreaterThanOrEqual(time() + 60, $until);
         $this->assertLessThanOrEqual(time() + 66, $until);
 
@@ -139,10 +164,10 @@ final class GeminiModelFallbackTest extends TestCase
 
         // #1: Google daily quota → local RPD counter pinned to the limit for
         // the rest of the Pacific-Time day.
-        $this->assertSame(20, (int) Cache::get('gemini_rpd:gemini-4-hydrogen:'.$this->ptDate()));
+        $this->assertSame(20, (int) Cache::get($this->rpdKey('gemini-4-hydrogen')));
         // #2: 503 → short transient cooldown. #3: malformed body → same.
-        $this->assertSame('http_503', Cache::get('gemini_cooldown:gemini-3.8-flash'));
-        $this->assertSame('invalid_response', Cache::get('gemini_cooldown:gemini-3.6-flash'));
+        $this->assertSame('http_503', Cache::get($this->cooldownKey('gemini-3.8-flash')));
+        $this->assertSame('invalid_response', Cache::get($this->cooldownKey('gemini-3.6-flash')));
 
         // A follow-up call skips #1 (daily), #2 and #3 (cooldowns) → #4 again.
         $again = $service->generatePlainText('سؤال آخر');
@@ -155,7 +180,7 @@ final class GeminiModelFallbackTest extends TestCase
     {
         foreach ($this->models() as $model) {
             for ($i = 0; $i < $model['rpm']; $i++) {
-                RateLimiter::hit('gemini_rpm:'.$model['name'], 60);
+                RateLimiter::hit($this->rpmKey($model['name']), 60);
             }
         }
 
@@ -175,7 +200,7 @@ final class GeminiModelFallbackTest extends TestCase
 
     public function test_local_rpd_exhaustion_skips_model_without_http(): void
     {
-        Cache::put('gemini_rpd:gemini-4-hydrogen:'.$this->ptDate(), 20, now('America/Los_Angeles')->endOfDay());
+        Cache::put($this->rpdKey('gemini-4-hydrogen'), 20, now('America/Los_Angeles')->endOfDay());
 
         Http::fake([
             '*gemini-3.8-flash*' => Http::response($this->textResponse('من الثاني'), 200),
@@ -217,8 +242,8 @@ final class GeminiModelFallbackTest extends TestCase
 
         $this->assertSame('من الثاني', $result);
         Http::assertSentCount(2);
-        $this->assertSame('unsupported', Cache::get('gemini_cooldown:gemini-4-hydrogen'));
-        $until = (int) Cache::get('gemini_cooldown_until:gemini-4-hydrogen', 0);
+        $this->assertSame('unsupported', Cache::get($this->cooldownKey('gemini-4-hydrogen')));
+        $until = (int) Cache::get($this->cooldownUntilKey('gemini-4-hydrogen'), 0);
         $this->assertGreaterThanOrEqual(time() + 21590, $until);
     }
 
