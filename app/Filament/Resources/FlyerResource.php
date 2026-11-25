@@ -9,13 +9,17 @@ use App\Filament\Actions\RegenerateContentAction;
 use App\Filament\Resources\FlyerResource\Pages;
 use App\Filament\Resources\FlyerResource\RelationManagers\ItemsRelationManager;
 use App\Jobs\PublishFlyerToTelegramJob;
+use App\Jobs\SendFlyerPushNotificationJob;
 use App\Models\Flyer;
 use App\Observers\FlyerObserver;
 use App\Services\ImageOptimizerService;
 use App\Services\TelegramPublisherService;
 use Filament\Forms;
 use Filament\Forms\Components\Actions\Action;
-use Filament\Forms\Components\Repeater;
+use Filament\Forms\Components\Placeholder;
+use Filament\Forms\Components\Radio;
+use Filament\Forms\Components\Section;
+use Filament\Forms\Components\Toggle;
 use Filament\Forms\Form;
 use Filament\Notifications\Notification;
 use Filament\Resources\Resource;
@@ -25,6 +29,7 @@ use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\HtmlString;
 use Illuminate\Support\Str;
 use Livewire\Features\SupportFileUploads\TemporaryUploadedFile;
 
@@ -343,7 +348,7 @@ final class FlyerResource extends Resource
 
                 Tables\Actions\ViewAction::make(),
 
-                RegenerateContentAction::make(),
+                RegenerateContentAction::forTable(),
 
                 Tables\Actions\Action::make('publishAndIndex')
                     ->label('Publish & Index')
@@ -389,6 +394,47 @@ final class FlyerResource extends Resource
                             ->success()
                             ->send();
                     }),
+
+                Tables\Actions\Action::make('sendPushNotification')
+                    ->label('إرسال إشعار للزوار (Push)')
+                    ->icon('heroicon-o-bell-alert')
+                    ->color('info')
+                    ->requiresConfirmation()
+                    ->modalHeading('إرسال إشعار Push للزوار')
+                    ->modalDescription(fn (Flyer $record): string => $record->push_sent_at
+                        ? '⚠️ تم إرسال إشعار لهذه المجلة بالفعل في ' . $record->push_sent_at->format('Y-m-d H:i') . '. الإرسال القسري سيتجاهل الفحص ويمنع الرسائل المكررة عبر التبريد العالمي (15 دقيقة).'
+                        : 'ستُرسل غنية بالصورة والخصم والرابط المباشر. يمكن الإرسال القسري لتجاوز التبريد العالمي.')
+                    ->modalSubmitActionLabel('إرسال الآن')
+                    ->modalCancelActionLabel('إلغاء')
+                    ->visible(fn (Flyer $record): bool => $record->status === FlyerStatus::Published && $record->items()->where('sale_price', '>', 0)->exists())
+                    ->action(function (Flyer $record, array $data): void {
+                        $force = $data['force'] ?? false;
+                        SendFlyerPushNotificationJob::dispatch($record->id, $force)->afterCommit();
+                        Notification::make()
+                            ->title($force ? 'إشعار قسري تمت جدولته' : 'إشعار تمت جدولته')
+                            ->body($force ? 'سيتم الإرسال فوراً متجاوزاً التبريد العالمي.' : 'سيتم الإرسال مع احترام التبريد العالمي (15 دقيقة) وعدم التكرار.')
+                            ->success()
+                            ->send();
+                    })
+                    ->form([
+                        Section::make('خيارات الإرسال')->schema([
+                            Placeholder::make('push_info')
+                                ->label('')
+                                ->content(fn (Flyer $record): HtmlString => new HtmlString(
+                                    '<div class="text-sm text-slate-600 space-y-1">'
+                                    . '<strong>المجلة:</strong> ' . e($record->title) . '<br>'
+                                    . '<strong>الحالة:</strong> ' . ($record->push_sent_at ? '✅ تم الإرسال في ' . $record->push_sent_at->format('Y-m-d H:i') : '⏳ لم يتم الإرسال بعد') . '<br>'
+                                    . '<strong>التبريد العالمي:</strong> ' . config('services.onesignal.cooldown_minutes', 15) . ' دقيقة<br>'
+                                    . '<strong>القسم المستهدف:</strong> ' . config('services.onesignal.segment', 'Total Subscriptions')
+                                    . '</div>'
+                                )),
+                            Toggle::make('force')
+                                ->label('إرسال قسري (تجاوز التبريد العالمي ومنع التكرار)')
+                                ->default(false)
+                                ->helperText('خطير: سيرسل الإشعار حتى لو تم إرسال واحد خلال الـ 15 دقيقة الماضية. استخدم فقط عند الضرورة.')
+                                ->inline(false),
+                        ])->columns(1),
+                    ]),
             ])
             ->bulkActions([
                 Tables\Actions\BulkActionGroup::make([

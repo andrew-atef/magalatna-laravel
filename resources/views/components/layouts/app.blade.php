@@ -26,6 +26,11 @@
 
     <link rel="icon" type="image/svg+xml" href="/favicon.svg">
     <meta name="theme-color" content="#023b55">
+    <link rel="manifest" href="/manifest.webmanifest">
+    <link rel="apple-touch-icon" href="/img/icon-192.png">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="default">
 
     @php
         $siteName = config('app.name', 'مجلاتنا');
@@ -342,6 +347,13 @@
         </a>
     </nav>
 
+    {{-- OneSignal Push Prompt --}}
+    @if (filled(config('services.onesignal.app_id')) && !request()->routeIs('filament*') && !str_starts_with(request()->path(), 'admin'))
+            {{-- Alpine.js for push prompt component (deferred, TBT=0) --}}
+    <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js"></script>
+@include('components.push-prompt')
+    @endif
+
     <!-- Lightweight inline JS for mobile header interactions (no heavy libs) -->
     <script>
     (function(){
@@ -385,6 +397,11 @@
         document.addEventListener('keydown', function(e){ if(e.key==='Escape'){ closeDrawer(); if(searchPanel && !searchPanel.classList.contains('hidden')) searchPanel.classList.add('hidden'); }});
     })();
     </script>
+
+    {{-- OneSignal Push Prompt --}}
+    @if (filled(config('services.onesignal.app_id')) && !request()->routeIs('filament*') && !str_starts_with(request()->path(), 'admin'))
+        @include('components.push-prompt')
+    @endif
 
     <!-- WebMCP Tool Registration لمحركات الذكاء الاصطناعي والمتصفحات الذكية -->
     <script>

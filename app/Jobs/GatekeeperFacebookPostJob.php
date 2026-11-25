@@ -769,7 +769,17 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
                 GenerateFlyerReelJob::dispatch($flyer->id)->afterCommit();
             }
 
-            // === 8. Telegram auto-publish ===
+            // === 8. OneSignal Push Notification (auto if configured) ===
+            // Only auto-push when config is enabled, flyer is newly published
+            // with verified items, and hasn't been pushed yet.
+            // The job handles its own idempotency (push_sent_at) and global cooldown.
+            if ((bool) config('services.onesignal.auto_push', false)
+                && $flyer->status === \App\Enums\FlyerStatus::Published
+                && $flyer->push_sent_at === null) {
+                SendFlyerPushNotificationJob::dispatch($flyer->id)->afterCommit();
+            }
+
+            // === 9. Telegram auto-publish ===
             // Dispatched ONLY when auto-publish is enabled and bot is configured.
             // Uses afterCommit() to ensure the flyer is fully persisted.
             if (

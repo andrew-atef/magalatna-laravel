@@ -37,6 +37,7 @@ class Flyer extends Model
         'bluf_summary',
         'editorial_overview',
         'discover_image_path',
+        'push_sent_at',
     ];
 
     protected static function booted(): void
@@ -79,6 +80,7 @@ class Flyer extends Model
             'applicable_governorates' => 'array',
             'status' => FlyerStatus::class,
             'total_pages' => 'integer',
+            'push_sent_at' => 'datetime',
         ];
     }
 

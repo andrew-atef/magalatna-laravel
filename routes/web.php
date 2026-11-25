@@ -95,8 +95,25 @@ Route::get('/sitemap.xml', function () {
     return Response::make($xml, 200, ['Content-Type' => 'text/xml; charset=utf-8']);
 })->name('sitemap');
 
+// PWA Manifest & OneSignal Service Worker (static files, must precede catch-all)
+Route::get('/manifest.webmanifest', function () {
+    $manifest = file_get_contents(storage_path('app/manifest/manifest.webmanifest'));
+    return response($manifest, 200, [
+        'Content-Type' => 'application/manifest+json; charset=utf-8',
+        'Cache-Control' => 'public, max-age=31536000, immutable',
+        'X-Debug-Route' => 'hit',
+    ]);
+})->name('pwa.manifest');
+
+Route::get('/OneSignalSDKWorker.js', function () {
+    return response()->file(public_path('OneSignalSDKWorker.js'), [
+        'Content-Type' => 'application/javascript',
+        'Cache-Control' => 'public, max-age=31536000, immutable',
+    ]);
+})->name('onesignal.worker');
+
 // Retailer Hub — SEO-optimized dedicated pages /{retailer:slug}
 // MUST be last to avoid conflict with /offers/{slug}, /admin, /sitemap.xml, /about-us etc.
 Route::get('/{retailer:slug}', [RetailerController::class, 'show'])
-    ->where('retailer', '^(?!offers$|flyer$|flyers$|admin$|api$|storage$|up$|livewire$|build$|assets$|favicon\.ico$|sitemap\.xml$|llms\.txt$|about-us$|privacy-policy$|terms-of-use$|contact-us$).*')
+    ->where('retailer', '^(?!offers$|flyer$|flyers$|admin$|api$|storage$|up$|livewire$|build$|assets$|favicon\.ico$|sitemap\.xml$|llms\.txt$|about-us$|privacy-policy$|terms-of-use$|contact-us$|manifest\.webmanifest$|OneSignalSDKWorker\.js$).*')
     ->name('retailers.show');

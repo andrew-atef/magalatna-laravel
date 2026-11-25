@@ -16,6 +16,7 @@ use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
@@ -49,7 +50,7 @@ final class RegenerateFlyerContentJob implements ShouldQueue
     use Queueable;
     use SerializesModels;
 
-    public int $tries = 10;
+    public int $tries = 50;
 
     /**
      * Temporary waterfall release() loops never count toward permanent
@@ -102,15 +103,12 @@ final class RegenerateFlyerContentJob implements ShouldQueue
                 'items_count' => $flyer->items()->where('sale_price', '>', 0)->count(),
             ]);
         } catch (GeminiRateLimitedException $e) {
-            // Whole model waterfall temporarily throttled — free the worker
-            // and retry after the earliest RPM window.
-            Log::warning('[REGENERATE] Gemini waterfall rate limited, releasing job.', [
-                'flyer_id' => $flyer->id,
-                'mode' => $mode,
-                'retry_after_seconds' => $e->retryAfterSeconds,
-            ]);
+            // The waterfall's own 503 cooldown is 60s (TRANSIENT_COOLDOWN_SECONDS);
+            // releasing sooner would start the next attempt with every model
+            // still blocked, wasting a whole attempt. Always outwait it.
+            $wait = max(65, $e->retryAfterSeconds > 0 ? $e->retryAfterSeconds : 20);
 
-            $this->release($e->retryAfterSeconds > 0 ? $e->retryAfterSeconds : 20);
+            $this->release($wait);
         } catch (Throwable $e) {
             Log::error('[REGENERATE] Content regeneration failed.', [
                 'flyer_id' => $flyer->id,
@@ -126,14 +124,37 @@ final class RegenerateFlyerContentJob implements ShouldQueue
      * FULL mode: re-OCR from stored R2 page binaries with zero-data-loss
      * staging. Old items are deleted ONLY inside the swap transaction after
      * the new extraction proved it has priced items.
+     *
+     * Resumable staging: a page throttled by the Gemini waterfall must
+     * never discard the pages already OCR'd by earlier attempts. The
+     * checkpoint is keyed by the flyer AND its exact page set, so a
+     * re-ingested flyer (different pages) invalidates it automatically.
      */
     private function regenerateItemsFromR2(Flyer $flyer, GeminiVisionService $gemini): void
     {
+        // Resumable staging checkpoint
+        $pageIds = $flyer->pages->pluck('id')->map(static fn ($id): int => (int) $id)->all();
+        $checkpointKey = 'regen_stage:'.$flyer->id;
+        $checkpoint = Cache::get($checkpointKey);
+
+        if (
+            ! is_array($checkpoint)
+            || ($checkpoint['page_ids'] ?? null) !== $pageIds
+            || ! is_array($checkpoint['staged'] ?? null)
+        ) {
+            $checkpoint = ['page_ids' => $pageIds, 'staged' => [], 'total' => 0];
+        }
+
         /** @var array<int, list<array<string, mixed>>> $staged */
-        $staged = [];
-        $stagedTotal = 0;
+        $staged = $checkpoint['staged'];
+        $stagedTotal = (int) $checkpoint['total'];
 
         foreach ($flyer->pages as $page) {
+            // Already extracted by a previous (released) attempt.
+            if (array_key_exists((int) $page->id, $staged)) {
+                continue;
+            }
+
             $path = trim((string) $page->image_path);
 
             if ($path === '') {
@@ -171,9 +192,23 @@ final class RegenerateFlyerContentJob implements ShouldQueue
             }
 
             try {
-                // Ordered multi-model waterfall (gemini-4-hydrogen first).
-                // GeminiRateLimitedException propagates to handle() → release().
-                $items = $gemini->extractProductsFromPage($binary);
+                try {
+                    // Ordered multi-model waterfall.
+                    $items = $gemini->extractProductsFromPage($binary);
+                } catch (GeminiRateLimitedException $rateLimited) {
+                    // One short in-run retry rides out a brief model flap.
+                    // Progress is persisted first, so a second throttle
+                    // releases the job and the next attempt resumes HERE.
+                    Cache::put($checkpointKey, [
+                        'page_ids' => $pageIds,
+                        'staged' => $staged,
+                        'total' => $stagedTotal,
+                    ], now()->addHours(3));
+
+                    sleep(min(max(5, $rateLimited->retryAfterSeconds), 12));
+
+                    $items = $gemini->extractProductsFromPage($binary);
+                }
             } finally {
                 // 840MB RAM safety: free the page buffer before the next one.
                 unset($binary);
@@ -193,8 +228,49 @@ final class RegenerateFlyerContentJob implements ShouldQueue
             $staged[(int) $page->id] = $normalized;
             $stagedTotal += count($normalized);
 
+            // Durable progress: surviving a release is what makes a long
+            // re-OCR converge while the free-tier models flap.
+            Cache::put($checkpointKey, [
+                'page_ids' => $pageIds,
+                'staged' => $staged,
+                'total' => $stagedTotal,
+            ], now()->addHours(3));
+
             unset($items, $normalized);
             gc_collect_cycles();
+        }
+
+        // Coverage guard: a partial staging pass must NEVER swap. Every page
+        // needs a result (an empty array is a valid result), so a released /
+        // resumed run can only commit once the WHOLE flyer has been read.
+        if (count($staged) !== count($pageIds)) {
+            Log::warning('[REGENERATE_INCOMPLETE] Partial page coverage — existing items preserved.', [
+                'flyer_id' => $flyer->id,
+                'staged_pages' => count($staged),
+                'total_pages' => count($pageIds),
+            ]);
+
+            throw new RuntimeException(
+                'Full regeneration staged '.count($staged).'/'.count($pageIds)
+                .' pages for flyer #'.$flyer->id.' — existing items were preserved.'
+            );
+        }
+
+        // Volume guard: a throttled/degraded OCR pass must never replace a
+        // healthy item set with a materially smaller one.
+        $existingPriced = $flyer->items()->where('sale_price', '>', 0)->count();
+
+        if ($existingPriced > 0 && $stagedTotal < (int) floor($existingPriced * 0.8)) {
+            Log::warning('[REGENERATE_SHRINK_GUARD] New extraction materially smaller — existing items preserved.', [
+                'flyer_id' => $flyer->id,
+                'existing_priced' => $existingPriced,
+                'new_priced' => $stagedTotal,
+            ]);
+
+            throw new RuntimeException(
+                'Full regeneration would shrink priced items '.$existingPriced.' → '.$stagedTotal
+                .' for flyer #'.$flyer->id.' — existing items were preserved.'
+            );
         }
 
         if ($stagedTotal === 0) {
@@ -244,6 +320,10 @@ final class RegenerateFlyerContentJob implements ShouldQueue
 
         // The eager-loaded items collection is stale after the swap.
         $flyer->unsetRelation('items');
+
+        // Staging is complete and committed — drop the checkpoint so a later
+        // regeneration starts from a clean slate.
+        Cache::forget($checkpointKey);
     }
 
     /**

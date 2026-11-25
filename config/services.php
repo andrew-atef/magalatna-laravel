@@ -208,6 +208,14 @@ return [
         'timeout' => (int) env('TELEGRAM_TIMEOUT', 30),
     ],
 
+    'onesignal' => [
+        'app_id' => env('ONESIGNAL_APP_ID'),
+        'rest_api_key' => env('ONESIGNAL_REST_API_KEY'),
+        'auto_push' => env('ONESIGNAL_AUTO_PUSH', false),
+        'cooldown_minutes' => (int) env('ONESIGNAL_COOLDOWN_MINUTES', 15),
+        'segment' => env('ONESIGNAL_SEGMENT', 'Total Subscriptions'),
+    ],
+
     'google' => [
         'analytics_id' => env('GOOGLE_ANALYTICS_ID'),
     ],
