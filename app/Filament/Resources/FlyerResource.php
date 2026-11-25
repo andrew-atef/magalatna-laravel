@@ -8,9 +8,11 @@ use App\Enums\FlyerStatus;
 use App\Filament\Actions\RegenerateContentAction;
 use App\Filament\Resources\FlyerResource\Pages;
 use App\Filament\Resources\FlyerResource\RelationManagers\ItemsRelationManager;
+use App\Jobs\PublishFlyerToTelegramJob;
 use App\Models\Flyer;
 use App\Observers\FlyerObserver;
 use App\Services\ImageOptimizerService;
+use App\Services\TelegramPublisherService;
 use Filament\Forms;
 use Filament\Forms\Components\Actions\Action;
 use Filament\Forms\Components\Repeater;
@@ -361,6 +363,29 @@ final class FlyerResource extends Resource
                         Notification::make()
                             ->title('Flyer published')
                             ->body('"'.$record->title.'" is now published — IndexNow ping queued by the observer.')
+                            ->success()
+                            ->send();
+                    }),
+
+                Tables\Actions\Action::make('publishTelegram')
+                    ->label('نشر على تليجرام')
+                    ->color('info')
+                    ->icon('heroicon-o-paper-airplane')
+                    ->requiresConfirmation()
+                    ->modalHeading('نشر المجلة على تليجرام')
+                    ->modalDescription(function (Flyer $record): string {
+                        $publisher = app(TelegramPublisherService::class);
+                        $caption = $publisher->buildFlyerCaption($record);
+                        $photoCount = $record->pages()->count();
+                        return "سيتم نشر المجلة كاملة ({$photoCount} صور) مع الكابتون التالي:\n\n{$caption}";
+                    })
+                    ->visible(fn (Flyer $record): bool => $record->status === FlyerStatus::Published && filled(config('services.telegram.bot_token')))
+                    ->action(function (Flyer $record): void {
+                        PublishFlyerToTelegramJob::dispatchSync($record->id, force: true);
+
+                        Notification::make()
+                            ->title('تم النشر على تليجرام')
+                            ->body('تم نشر "'.$record->title.'" بنجاح على قناة/مجموعة تليجرام.')
                             ->success()
                             ->send();
                     }),

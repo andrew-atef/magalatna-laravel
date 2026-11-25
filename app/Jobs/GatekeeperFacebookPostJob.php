@@ -768,6 +768,18 @@ final class GatekeeperFacebookPostJob implements ShouldQueue
             if ((bool) config('services.reels.auto_generate', true)) {
                 GenerateFlyerReelJob::dispatch($flyer->id)->afterCommit();
             }
+
+            // === 8. Telegram auto-publish ===
+            // Dispatched ONLY when auto-publish is enabled and bot is configured.
+            // Uses afterCommit() to ensure the flyer is fully persisted.
+            if (
+                $autoPublish
+                && $flyer->status === \App\Enums\FlyerStatus::Published
+                && (bool) config('services.telegram.auto_publish', true)
+                && filled(config('services.telegram.bot_token'))
+            ) {
+                \App\Jobs\PublishFlyerToTelegramJob::dispatch($flyer->id)->afterCommit();
+            }
         } catch (Throwable $e) {
             Log::error('Failed in batch then() for flyer.', [
                 'flyer_id' => $flyerId,

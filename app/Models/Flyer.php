@@ -129,6 +129,17 @@ class Flyer extends Model
     }
 
     /**
+     * Telegram publishing record (one per flyer) — tracks message IDs,
+     * caption sent, and publish status for idempotency.
+     *
+     * @return HasOne<FlyerTelegramPost, $this>
+     */
+    public function telegramPost(): HasOne
+    {
+        return $this->hasOne(FlyerTelegramPost::class);
+    }
+
+    /**
      * Bulletproof Arabic Fallback Generator — يقبل أسماء البراندات اللاتينية
      * داخل نص عربي سليم، ويصلح HTML Entities وأخطاء عد الجمل العشرية.
      *

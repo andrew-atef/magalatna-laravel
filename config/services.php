@@ -201,6 +201,13 @@ return [
 
     'indexnow_key' => env('INDEXNOW_KEY'),
 
+    'telegram' => [
+        'bot_token' => env('TELEGRAM_BOT_TOKEN'),
+        'chat_id' => env('TELEGRAM_CHAT_ID'),
+        'auto_publish' => env('TELEGRAM_AUTO_PUBLISH', true),
+        'timeout' => (int) env('TELEGRAM_TIMEOUT', 30),
+    ],
+
     'google' => [
         'analytics_id' => env('GOOGLE_ANALYTICS_ID'),
     ],
