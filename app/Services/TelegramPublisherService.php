@@ -6,6 +6,7 @@ namespace App\Services;
 
 use App\Models\Flyer;
 use App\Models\FlyerPage;
+use App\Support\ArabicDateHelper;
 use App\Support\R2Url;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
@@ -26,71 +27,129 @@ final class TelegramPublisherService
 
     /**
      * Build clean, engaging Arabic caption formatted in HTML (Telegram parse_mode: HTML).
-     * STRICT 1024-CHAR LIMIT: Telegram rejects captions > 1024 chars!
-     * Enforce word-safe truncation so the final string (including HTML tags) is strictly <= 1000 characters.
-     * Escape user-generated text using htmlspecialchars($text, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8').
+     * STRICT 950-CHAR LIMIT (safe margin under Telegram's 1024).
+     * Enforce word-safe truncation so the final string (including HTML tags) is strictly <= 950 characters.
+     * Escape all user-generated text using htmlspecialchars($text, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8').
      */
     public function buildFlyerCaption(Flyer $flyer): string
     {
         // Load relations if not already loaded
         $flyer->loadMissing(['retailer', 'items', 'pages']);
 
-        $title = htmlspecialchars((string) ($flyer->title ?? 'العرض'), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
-        $retailerName = htmlspecialchars((string) ($flyer->retailer?->name ?? ''), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+        // Clean retailer name: strip Latin parentheticals like "(Kazyon)"
+        $retailerName = $flyer->retailer?->name ?? '';
+        $retailerClean = htmlspecialchars(
+            trim(preg_replace('/\s*\([^()]*[A-Za-z][^()]*\)/u', '', $retailerName)),
+            ENT_QUOTES | ENT_SUBSTITUTE,
+            'UTF-8'
+        );
 
-        // Format dates in Arabic (Cairo timezone)
-        $fromText = $this->formatArabicDate($flyer->valid_from);
-        $untilText = $this->formatArabicDate($flyer->valid_until);
+        // Format dates in Cairo timezone
+        $fromCarbon = $this->parseDateCarbon($flyer->valid_from);
+        $untilCarbon = $this->parseDateCarbon($flyer->valid_until);
+        $todayCarbon = now('Africa/Cairo')->startOfDay();
 
-        // Get max discount and top products
-        $items = $flyer->items;
-        $maxDiscount = $items->where('sale_price', '>', 0)->max('discount_percent');
-        $hasRealDiscount = $maxDiscount !== null && (float) $maxDiscount > 0;
-        $discount = (string) round((float) ($maxDiscount ?? 0));
+        $isSingleDay = $fromCarbon && $untilCarbon && $fromCarbon->isSameDay($untilCarbon);
 
-        $discountSentence = $hasRealDiscount
-            ? "بخصومات تصل إلى {$discount}%."
-            : 'بأسعار تنافسية مخفضة.';
-
-        $topProducts = $items->where('sale_price', '>', 0)
+        // Get items with prices
+        $items = $flyer->items
+            ->where('sale_price', '>', 0)
             ->sortByDesc('discount_percent')
-            ->take(5)
-            ->pluck('product_name')
-            ->filter()
-            ->map(fn ($name) => htmlspecialchars((string) $name, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'))
-            ->implode('، ');
-        $topProducts = $topProducts !== '' ? $topProducts : 'سلع متنوعة';
+            ->values();
 
-        // Determine if upcoming
-        $isUpcoming = false;
-        if ($flyer->valid_from) {
-            $fromCarbon = $flyer->valid_from instanceof \Carbon\Carbon
-                ? $flyer->valid_from->copy()->setTimezone('Africa/Cairo')
-                : \Carbon\Carbon::parse((string) $flyer->valid_from, 'Africa/Cairo');
-            $isUpcoming = now('Africa/Cairo')->startOfDay()->lt($fromCarbon->copy()->startOfDay());
-        }
+        $maxDiscount = $items->max('discount_percent');
+        $hasRealDiscount = $maxDiscount !== null && (float) $maxDiscount > 0;
+        $maxDiscountInt = $hasRealDiscount ? (string) round((float) $maxDiscount) : '';
 
-        // Build BLUF text
-        if ($isUpcoming) {
-            $blufText = "تصفح {$title} يبدأ في مصر يوم {$fromText} وحتى {$untilText}، {$discountSentence} يشمل العرض تخفيضات قوية على {$topProducts} بجميع الفروع وحتى نفاذ الكمية.";
-        } else {
-            $blufText = "تصفح {$title} الساري في مصر حتى {$untilText}، {$discountSentence} يشمل العرض تخفيضات قوية على {$topProducts} بجميع الفروع وحتى نفاذ الكمية.";
-        }
+        // Page count for CTA
+        $pagesCount = $flyer->pages->count();
+        $pagesCountAr = ArabicDateHelper::pluralizeCount($pagesCount, 'صفحة', 'صفحتان', 'صفحات', 'صفحة');
 
-        // Build canonical flyer URL
+        // Build canonical URL using route() - NEVER hardcode /flyers/
+        $baseUrl = rtrim((string) config('app.url'), '/');
         $canonicalUrl = $flyer->slug
-            ? config('app.url').'/flyers/'.$flyer->slug
-            : config('app.url');
+            ? $baseUrl . route('flyers.show', ['slug' => $flyer->slug], false)
+            : $baseUrl;
 
-        // Build full caption with HTML formatting
-        $caption = "<b>{$title}</b>\n\n";
-        $caption .= "📅 سارٍ من {$fromText} حتى {$untilText} بتوقيت القاهرة\n\n";
-        $caption .= "{$blufText}\n\n";
-        $caption .= "🔗 <b>تصفح أسعار السلع وقارنها بالكامل:</b>\n";
-        $caption .= "{$canonicalUrl}";
+        // Build caption parts
+        $parts = [];
 
-        // Enforce 1000 character limit (safe margin under Telegram's 1024)
-        return $this->truncateHtmlSafe($caption, 1000);
+        // --- HEADLINE ---
+        if ($isSingleDay) {
+            $headline = "🔥 <b>عروض {$retailerClean} — عرض اليوم الواحد</b>";
+        } else {
+            $headline = "🔥 <b>أحدث عروض {$retailerClean}</b>";
+        }
+        $parts[] = $headline;
+
+        // --- DATE LINE (ONCE ONLY) ---
+        if ($fromCarbon && $untilCarbon) {
+            if ($isSingleDay) {
+                $dayName = ArabicDateHelper::dayName($fromCarbon);
+                $dateAr = $fromCarbon->day . ' ' . ArabicDateHelper::monthName((int) $fromCarbon->month);
+
+                if ($fromCarbon->gt($todayCarbon)) {
+                    // Future
+                    $diffDays = $todayCarbon->diffInDays($fromCarbon, false);
+                    if ($diffDays === 1) {
+                        $dateLine = "📅 يبدأ غداً {$dayName} {$dateAr}";
+                    } else {
+                        $dateLine = "📅 يبدأ يوم {$dayName} {$dateAr}";
+                    }
+                } elseif ($fromCarbon->isSameDay($todayCarbon)) {
+                    // Today
+                    $dateLine = "📅 سارٍ اليوم {$dayName} {$dateAr} (حتى نفاذ الكمية)";
+                } else {
+                    // Past/active
+                    $dateLine = "📅 {$dayName} {$dateAr}";
+                }
+            } else {
+                // Multi-day
+                $fromAr = $this->formatArabicDateShort($fromCarbon);
+                $untilAr = $this->formatArabicDateShort($untilCarbon);
+                $dateLine = "📅 سارٍ من {$fromAr} حتى {$untilAr}";
+            }
+            $parts[] = $dateLine;
+        }
+
+        // --- TOP DEALS WITH REAL PRICES ---
+        if ($items->isNotEmpty()) {
+            $dealsHeader = $hasRealDiscount
+                ? "⭐ <b>أقوى العروض (خصومات تصل إلى {$maxDiscountInt}%):</b>"
+                : '⭐ <b>أبرز السلع والأسعار:</b>';
+            $parts[] = $dealsHeader;
+
+            $dealLines = [];
+            foreach ($items->take(5) as $item) {
+                $name = htmlspecialchars((string) $item->product_name, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+                $salePrice = $this->formatPrice((float) $item->sale_price);
+                $line = "• {$name}: <b>{$salePrice} ج.م</b>";
+
+                $oldPrice = $item->old_price ? (float) $item->old_price : 0;
+                if ($oldPrice > (float) $item->sale_price) {
+                    $oldFormatted = $this->formatPrice($oldPrice);
+                    $line .= " {$oldFormatted} ج.م";
+                }
+
+                $discount = $item->discount_percent ? round((float) $item->discount_percent) : 0;
+                if ($discount >= 5) {
+                    $line .= " (خصم {$discount}%)";
+                }
+
+                $dealLines[] = $line;
+            }
+
+            $parts[] = implode("\n", $dealLines);
+        }
+
+        // --- CTA WITH CANONICAL /offers/ LINK ---
+        $cta = "🔗 <b>شاهد الـ {$pagesCountAr} والأسعار كاملة:</b>\n{$canonicalUrl}";
+        $parts[] = $cta;
+
+        // Join and enforce 950 char limit
+        $caption = implode("\n\n", $parts);
+
+        return $this->truncateHtmlSafe($caption, 950);
     }
 
     /**
@@ -211,28 +270,38 @@ final class TelegramPublisherService
     }
 
     /**
-     * Format date to Arabic (Cairo timezone)
+     * Parse date to Carbon in Cairo timezone, or null if invalid.
      */
-    private function formatArabicDate($date): string
+    private function parseDateCarbon($date): ?\Carbon\Carbon
     {
         if ($date === null || (is_string($date) && trim($date) === '')) {
-            return 'إشعار لاحق';
+            return null;
         }
 
         try {
-            $carbon = $date instanceof \Carbon\Carbon
+            return $date instanceof \Carbon\Carbon
                 ? $date->copy()->setTimezone('Africa/Cairo')
                 : \Carbon\Carbon::parse((string) $date, 'Africa/Cairo');
-
-            $arabic = $carbon->locale('ar')->isoFormat('dddd D MMMM YYYY');
-            if (! preg_match('/[\x{0600}-\x{06FF}]/u', $arabic)) {
-                return \App\Support\ArabicDateHelper::formatArabicDate($carbon);
-            }
-
-            return $arabic;
         } catch (\Throwable $e) {
-            return (string) $date;
+            return null;
         }
+    }
+
+    /**
+     * Format date for multi-day range: "13 سبتمبر" (no weekday, no year)
+     */
+    private function formatArabicDateShort(\Carbon\Carbon $carbon): string
+    {
+        return $carbon->day . ' ' . ArabicDateHelper::monthName((int) $carbon->month);
+    }
+
+    /**
+     * Format price: trim trailing .00, .50 -> "12", "12.5"
+     */
+    private function formatPrice(float $price): string
+    {
+        $formatted = rtrim(rtrim(number_format($price, 2, '.', ''), '0'), '.');
+        return $formatted === '' ? '0' : $formatted;
     }
 
     /**
@@ -245,10 +314,6 @@ final class TelegramPublisherService
             return $html;
         }
 
-        // We need to truncate the HTML string while preserving valid tag structure
-        // Strategy: iterate through the HTML char by char, track tag stack,
-        // and stop when we reach maxLength, then close any open tags.
-        
         $result = '';
         $tagStack = [];
         $inTag = false;

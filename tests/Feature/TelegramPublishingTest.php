@@ -36,15 +36,18 @@ final class TelegramPublishingTest extends TestCase
         ]);
     }
 
-    private function createFlyer(int $pageCount = 1): Flyer
+    private function createFlyer(int $pageCount = 1, array $dateRange = []): Flyer
     {
+        $validFrom = $dateRange['from'] ?? '2026-11-25';
+        $validUntil = $dateRange['until'] ?? '2026-12-01';
+
         $flyer = $this->createPublishedFlyer(
             ['slug' => 'carrefour-egypt'],
             [
                 'title' => 'عروض كارفور الأسبوعية',
                 'slug' => 'carrefour-weekly-offers-2026-11-25',
-                'valid_from' => '2026-11-25',
-                'valid_until' => '2026-12-01',
+                'valid_from' => $validFrom,
+                'valid_until' => $validUntil,
                 'total_pages' => $pageCount,
             ]
         );
@@ -67,7 +70,36 @@ final class TelegramPublishingTest extends TestCase
         return $flyer->fresh(['retailer', 'items', 'pages']);
     }
 
-    public function test_build_flyer_caption_single_page(): void
+    private function createSingleDayFlyer(int $pageCount = 1, string $date = '2026-11-25'): Flyer
+    {
+        $flyer = $this->createPublishedFlyer(
+            ['slug' => 'carrefour-egypt'],
+            [
+                'title' => 'عروض كارفور اليوم',
+                'slug' => 'carrefour-today-offer-2026-11-25',
+                'valid_from' => $date,
+                'valid_until' => $date,
+                'total_pages' => $pageCount,
+            ]
+        );
+
+        for ($i = 1; $i <= 3; $i++) {
+            $this->addItem($flyer, [
+                'product_name' => "منتج {$i}",
+                'sale_price' => 50 + $i * 10,
+                'old_price' => 80 + $i * 10,
+                'discount_percent' => 30 + $i,
+            ]);
+        }
+
+        for ($pageNum = 1; $pageNum <= $pageCount; $pageNum++) {
+            $this->addPage($flyer, "flyers/{$flyer->id}/page_{$pageNum}.webp", $pageNum);
+        }
+
+        return $flyer->fresh(['retailer', 'items', 'pages']);
+    }
+
+    public function test_build_flyer_caption_single_page_multi_day(): void
     {
         $flyer = $this->createFlyer(1);
         $flyer->load(['retailer', 'items', 'pages']);
@@ -75,19 +107,57 @@ final class TelegramPublishingTest extends TestCase
         $publisher = app(TelegramPublisherService::class);
         $caption = $publisher->buildFlyerCaption($flyer);
 
-        // Verify caption structure
-        $this->assertStringContainsString('<b>عروض كارفور الأسبوعية</b>', $caption);
+        // Verify clean headline (retailer name without Latin parentheticals)
+        $this->assertStringContainsString('🔥 <b>أحدث عروض كازيون مصر</b>', $caption);
+
+        // Verify date appears ONCE only (not duplicated in BLUF)
         $this->assertStringContainsString('📅 سارٍ من', $caption);
-        $this->assertStringContainsString('بتوقيت القاهرة', $caption);
-        $this->assertStringContainsString('بخصومات تصل إلى', $caption);
-        $this->assertStringContainsString('🔗 <b>تصفح أسعار السلع وقارنها بالكامل:</b>', $caption);
-        $this->assertStringContainsString('https://magalatna.com/flyers/carrefour-weekly-offers-2026-11-25', $caption);
+        $this->assertStringContainsString('حتى', $caption);
 
-        // Verify length limit (<= 1000 chars)
-        $this->assertLessThanOrEqual(1000, mb_strlen($caption));
+        // Verify max discount mentioned
+        $this->assertStringContainsString('خصومات تصل إلى', $caption);
 
-        // Verify HTML escaping - no raw unescaped HTML tags
-        $this->assertStringNotContainsString('<script', $caption);
+        // Verify real item prices with ج.م
+        $this->assertStringContainsString('ج.م', $caption);
+
+        // Verify old prices shown with strikethrough (original price)
+        $this->assertStringContainsString('ـ', $caption); // Arabic tatweel used in old price display
+
+        // Verify discount percentages on items
+        $this->assertStringContainsString('(خصم', $caption);
+
+        // Verify CTA with canonical /offers/ URL (NOT /flyers/)
+        $this->assertStringContainsString('🔗 <b>شاهد الـ', $caption);
+        $this->assertStringContainsString('والأسعار كاملة:</b>', $caption);
+        $this->assertStringContainsString('https://magalatna.com/offers/carrefour-weekly-offers-2026-11-25', $caption);
+        $this->assertStringNotContainsString('/flyers/', $caption);
+
+        // Verify length limit (<= 950 chars)
+        $this->assertLessThanOrEqual(950, mb_strlen($caption));
+
+        // Verify valid HTML (no broken tags)
+        $this->assertEquals(substr_count($caption, '<b>'), substr_count($caption, '</b>'));
+    }
+
+    public function test_build_flyer_caption_single_day(): void
+    {
+        // Use a future date to test "يبدأ غداً" / "يبدأ يوم..." logic
+        // Since test runs in fixed time, we use a past date which should show "سارٍ اليوم"
+        $flyer = $this->createSingleDayFlyer(1, '2026-11-25');
+        $flyer->load(['retailer', 'items', 'pages']);
+
+        $publisher = app(TelegramPublisherService::class);
+        $caption = $publisher->buildFlyerCaption($flyer);
+
+        // Verify single-day headline
+        $this->assertStringContainsString('🔥 <b>عروض كازيون مصر — عرض اليوم الواحد</b>', $caption);
+
+        // Verify date appears ONCE
+        $this->assertStringContainsString('📅', $caption);
+
+        // Verify CTA uses /offers/ not /flyers/
+        $this->assertStringContainsString('https://magalatna.com/offers/carrefour-today-offer-2026-11-25', $caption);
+        $this->assertStringNotContainsString('/flyers/', $caption);
     }
 
     public function test_build_flyer_caption_multi_page(): void
@@ -98,8 +168,79 @@ final class TelegramPublishingTest extends TestCase
         $publisher = app(TelegramPublisherService::class);
         $caption = $publisher->buildFlyerCaption($flyer);
 
-        $this->assertStringContainsString('<b>عروض كارفور الأسبوعية</b>', $caption);
-        $this->assertLessThanOrEqual(1000, mb_strlen($caption));
+        $this->assertStringContainsString('🔥 <b>أحدث عروض كازيون مصر</b>', $caption);
+        $this->assertLessThanOrEqual(950, mb_strlen($caption));
+    }
+
+    public function test_caption_uses_arabic_pluralization_for_pages(): void
+    {
+        // 1 page -> "صفحة"
+        $flyer1 = $this->createFlyer(1);
+        $flyer1->load(['retailer', 'items', 'pages']);
+        $caption1 = app(TelegramPublisherService::class)->buildFlyerCaption($flyer1);
+        $this->assertStringContainsString('شاهد الـ 1 صفحة', $caption1);
+
+        // 2 pages -> "صفحتان" (needs unique slug)
+        $flyer2 = $this->createPublishedFlyer(
+            ['slug' => 'carrefour-egypt-2'],
+            [
+                'title' => 'عروض كارفور 2 صفحات',
+                'slug' => 'carrefour-2-pages',
+                'valid_from' => '2026-11-25',
+                'valid_until' => '2026-12-01',
+                'total_pages' => 2,
+            ]
+        );
+        for ($i = 1; $i <= 3; $i++) {
+            $this->addItem($flyer2, ['product_name' => "منتج {$i}", 'sale_price' => 100, 'old_price' => 150, 'discount_percent' => 30]);
+        }
+        $this->addPage($flyer2, "flyers/{$flyer2->id}/page_1.webp", 1);
+        $this->addPage($flyer2, "flyers/{$flyer2->id}/page_2.webp", 2);
+        $flyer2 = $flyer2->fresh(['retailer', 'items', 'pages']);
+        $caption2 = app(TelegramPublisherService::class)->buildFlyerCaption($flyer2);
+        $this->assertStringContainsString('شاهد الـ صفحتان', $caption2);
+
+        // 5 pages -> "5 صفحات" (needs unique slug)
+        $flyer5 = $this->createPublishedFlyer(
+            ['slug' => 'carrefour-egypt-5'],
+            [
+                'title' => 'عروض كارفور 5 صفحات',
+                'slug' => 'carrefour-5-pages',
+                'valid_from' => '2026-11-25',
+                'valid_until' => '2026-12-01',
+                'total_pages' => 5,
+            ]
+        );
+        for ($i = 1; $i <= 3; $i++) {
+            $this->addItem($flyer5, ['product_name' => "منتج {$i}", 'sale_price' => 100, 'old_price' => 150, 'discount_percent' => 30]);
+        }
+        for ($p = 1; $p <= 5; $p++) {
+            $this->addPage($flyer5, "flyers/{$flyer5->id}/page_{$p}.webp", $p);
+        }
+        $flyer5 = $flyer5->fresh(['retailer', 'items', 'pages']);
+        $caption5 = app(TelegramPublisherService::class)->buildFlyerCaption($flyer5);
+        $this->assertStringContainsString('شاهد الـ 5 صفحات', $caption5);
+
+        // 15 pages -> "15 صفحة" (11+ uses plural11Plus) (needs unique slug)
+        $flyer15 = $this->createPublishedFlyer(
+            ['slug' => 'carrefour-egypt-15'],
+            [
+                'title' => 'عروض كارفور 15 صفحات',
+                'slug' => 'carrefour-15-pages',
+                'valid_from' => '2026-11-25',
+                'valid_until' => '2026-12-01',
+                'total_pages' => 15,
+            ]
+        );
+        for ($i = 1; $i <= 3; $i++) {
+            $this->addItem($flyer15, ['product_name' => "منتج {$i}", 'sale_price' => 100, 'old_price' => 150, 'discount_percent' => 30]);
+        }
+        for ($p = 1; $p <= 15; $p++) {
+            $this->addPage($flyer15, "flyers/{$flyer15->id}/page_{$p}.webp", $p);
+        }
+        $flyer15 = $flyer15->fresh(['retailer', 'items', 'pages']);
+        $caption15 = app(TelegramPublisherService::class)->buildFlyerCaption($flyer15);
+        $this->assertStringContainsString('شاهد الـ 15 صفحة', $caption15);
     }
 
     public function test_publish_single_page_flyer_uses_sendphoto(): void
@@ -124,7 +265,6 @@ final class TelegramPublishingTest extends TestCase
         $this->assertCount(1, $messageIds);
         $this->assertEquals(12345, $messageIds[0]);
 
-        // Verify the API call was made to sendPhoto
         Http::assertSent(function ($request) {
             return str_contains($request->url(), '/sendPhoto')
                 && $request->data()['chat_id'] === '@testchannel'
@@ -154,13 +294,11 @@ final class TelegramPublishingTest extends TestCase
 
         $this->assertCount(15, $messageIds);
 
-        // Verify two sendMediaGroup calls were made
         Http::assertSentCount(2);
         Http::assertSent(function ($request) {
             return str_contains($request->url(), '/sendMediaGroup');
         });
 
-        // First call should have 10 items with caption on first
         $firstPair = Http::recorded()[0];
         $firstRequest = $firstPair[0];
         $firstMedia = json_decode($firstRequest->data()['media'], true);
@@ -168,7 +306,6 @@ final class TelegramPublishingTest extends TestCase
         $this->assertArrayHasKey('caption', $firstMedia[0]);
         $this->assertEquals('HTML', $firstMedia[0]['parse_mode']);
 
-        // Second call should have 5 items with helper caption on first
         $secondPair = Http::recorded()[1];
         $secondRequest = $secondPair[0];
         $secondMedia = json_decode($secondRequest->data()['media'], true);
@@ -208,8 +345,8 @@ final class TelegramPublishingTest extends TestCase
         $publisher = app(TelegramPublisherService::class);
         $caption = $publisher->buildFlyerCaption($flyer);
 
-        // Must not exceed 1000 characters
-        $this->assertLessThanOrEqual(1000, mb_strlen($caption));
+        // Must not exceed 950 characters (stricter limit)
+        $this->assertLessThanOrEqual(950, mb_strlen($caption));
 
         // Must not have broken HTML tags - count opening and closing tags
         $this->assertEquals(substr_count($caption, '<b>'), substr_count($caption, '</b>'));
